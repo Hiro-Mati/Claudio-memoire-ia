@@ -25,5 +25,5 @@ filters by the short `situation` snippet, then loads the full applicable experie
 
 ## Tools
 
-- `search_experience(situation, task_signature=None, limit=2)`: searches according to the configured Case ANN, Experience ANN, or hybrid recall strategy. In Case ANN mode, OpenViking retrieves and reranks ten Cases by their indexed Case content, then returns and expands the requested top Cases (two by default) with their linked Experiences. Each experience entry contains a `uri` and either full inline `content` or a `situation` snippet from its `## Situation` section. Inline `content` is already loaded; call `read_experience` only for entries that do not contain `content`.
+- `search_experience(situation, task_signature=None, limit=2)`: searches according to the configured Case ANN, Experience ANN, or hybrid recall strategy. Each experience entry contains a `uri` and either full inline `content` or a `situation` snippet from its `## Situation` section. Inline `content` is already loaded; call `read_experience` only for entries that do not contain `content`.
 - `read_experience(experience_uri)`: reads one OpenViking experience memory by full URI and returns Markdown.

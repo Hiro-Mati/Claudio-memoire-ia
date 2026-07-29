@@ -235,9 +235,7 @@ class VikingClient:
             return {
                 "uri": str(matched_context.get("uri", "") or ""),
                 "context_type": str(
-                    matched_context.get("context_type")
-                    or matched_context.get("type")
-                    or ""
+                    matched_context.get("context_type") or matched_context.get("type") or ""
                 ),
                 "is_leaf": bool(matched_context.get("is_leaf", False)),
                 "abstract": str(matched_context.get("abstract", "") or ""),
@@ -245,9 +243,9 @@ class VikingClient:
                 "category": str(matched_context.get("category", "") or ""),
                 "score": matched_context.get("score", 0.0),
                 "match_reason": str(matched_context.get("match_reason", "") or ""),
-                "relations": [
-                    self._relation_to_dict(r) for r in relations if r is not None
-                ] if isinstance(relations, list) else [],
+                "relations": [self._relation_to_dict(r) for r in relations if r is not None]
+                if isinstance(relations, list)
+                else [],
             }
         return {
             "uri": getattr(matched_context, "uri", ""),
@@ -655,6 +653,7 @@ class VikingClient:
         query: str,
         target_uri: str | list[str] | None = None,
         limit: int = 10,
+        score_threshold: Optional[float] = None,
         user_id: Optional[str] = None,
         peer_id: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -669,11 +668,13 @@ class VikingClient:
         try:
             if peer_id:
                 target_uri = target_uri or self._current_peer_memory_target_uri(peer_id)
-            result = await client.search(
-                query,
-                target_uri=target_uri,
-                limit=limit,
-            )
+            search_kwargs: Dict[str, Any] = {
+                "target_uri": target_uri,
+                "limit": limit,
+            }
+            if score_threshold is not None:
+                search_kwargs["score_threshold"] = score_threshold
+            result = await client.search(query, **search_kwargs)
         finally:
             if should_close:
                 await client.close()
