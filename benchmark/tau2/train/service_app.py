@@ -30,6 +30,7 @@ from benchmark.tau2.train.case_loader import Tau2CaseLoader
 from benchmark.tau2.train.rollout_executor import (
     DEFAULT_TAU2_EXPERIENCE_LOADER_MODE,
     DEFAULT_TAU2_EXPERIENCE_RECALL_MODE,
+    DEFAULT_TAU2_EXPERIENCE_RERANK_TOP_N,
     DEFAULT_TAU2_ROLLOUT_BACKEND,
     make_tau2_rollout_executor,
     normalize_tau2_experience_loader_mode,
@@ -59,6 +60,7 @@ def create_app(
     rollout_backend: str | None = None,
     loader_mode: str | None = None,
     experience_recall_mode: str | None = None,
+    experience_rerank_top_n: int | None = None,
     seed: int | None = None,
     first_user_cache: bool | None = None,
     first_user_cache_dir: str | None = None,
@@ -78,6 +80,16 @@ def create_app(
     default_experience_recall_mode = normalize_tau2_experience_recall_mode(
         experience_recall_mode or DEFAULT_TAU2_EXPERIENCE_RECALL_MODE
     )
+    default_experience_rerank_top_n = int(
+        experience_rerank_top_n
+        if experience_rerank_top_n is not None
+        else os.getenv(
+            "TAU2_EXPERIENCE_RERANK_TOP_N",
+            str(DEFAULT_TAU2_EXPERIENCE_RERANK_TOP_N),
+        )
+    )
+    if default_experience_rerank_top_n <= 0:
+        raise ValueError("experience_rerank_top_n must be > 0")
     default_seed = int(
         seed if seed is not None else os.getenv("TAU2_ROLLOUT_SEED", str(DEFAULT_ROLLOUT_SEED))
     )
@@ -114,6 +126,11 @@ def create_app(
             "loader_mode": options.get("loader_mode") or default_loader_mode,
             "experience_recall_mode": (
                 options.get("experience_recall_mode") or default_experience_recall_mode
+            ),
+            "experience_rerank_top_n": (
+                options.get("experience_rerank_top_n")
+                if options.get("experience_rerank_top_n") is not None
+                else default_experience_rerank_top_n
             ),
             "seed": options.get("seed") if options.get("seed") is not None else default_seed,
             "first_user_cache": options.get("first_user_cache", default_first_user_cache),
@@ -183,9 +200,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--experience-recall-mode",
-        choices=["case_ann", "exp_ann", "hybrid_ann"],
+        choices=["case_ann", "exp_ann", "hybrid_ann", "case_exp_rerank"],
         default=DEFAULT_TAU2_EXPERIENCE_RECALL_MODE,
-        help="Experience recall strategy for vikingbot rollouts (default: case_ann).",
+        help=(
+            "Experience recall strategy for vikingbot rollouts "
+            f"(default: {DEFAULT_TAU2_EXPERIENCE_RECALL_MODE})."
+        ),
+    )
+    parser.add_argument(
+        "--experience-rerank-top-n",
+        type=int,
+        default=int(
+            os.getenv(
+                "TAU2_EXPERIENCE_RERANK_TOP_N",
+                str(DEFAULT_TAU2_EXPERIENCE_RERANK_TOP_N),
+            )
+        ),
+        help=(
+            "Final Experience count after scoped rerank in case_exp_rerank mode "
+            f"(default: {DEFAULT_TAU2_EXPERIENCE_RERANK_TOP_N})."
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -274,6 +308,7 @@ def main() -> None:
         rollout_backend=args.rollout_backend,
         loader_mode=args.loader_mode,
         experience_recall_mode=args.experience_recall_mode,
+        experience_rerank_top_n=args.experience_rerank_top_n,
         seed=args.seed,
         first_user_cache=args.first_user_cache == "on",
         first_user_cache_dir=args.first_user_cache_dir,

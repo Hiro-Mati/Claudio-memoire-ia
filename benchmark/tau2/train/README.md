@@ -51,21 +51,25 @@ bash benchmark/tau2/train/restart_vikingbot_train_eval.sh \
   --skip-final-eval
 ```
 
-Experience recall defaults to `case_ann`. Use the launcher-only
-`--experience-recall-mode` argument to compare it with the Experience-only or
-hybrid paths:
+Experience recall defaults to `case_exp_rerank`. Use the launcher-only
+`--experience-recall-mode` argument to compare it with the Experience-only,
+hybrid, or cascaded Case-to-Experience rerank paths:
 
 ```bash
 bash benchmark/tau2/train/restart_vikingbot_train_eval.sh \
-  --experience-recall-mode hybrid_ann \
+  --experience-recall-mode case_exp_rerank \
+  --experience-rerank-top-n 3 \
   --epochs 0 \
   --eval-index 14 \
   --trials 8
 ```
 
-Accepted values are `case_ann`, `exp_ann`, and `hybrid_ann`. The launcher passes
-the selected value directly to the Tau2 rollout service; no environment variable
-is read for this setting.
+Accepted values are `case_ann`, `exp_ann`, `hybrid_ann`, and
+`case_exp_rerank`. In `case_exp_rerank`, one `search_experience` call first
+selects reranked Cases, then reranks the complete set of Experiences linked by
+those Cases within the shared Experience directory using an exact URI filter,
+and returns `--experience-rerank-top-n` results. The launcher passes the selected
+values directly to the Tau2 rollout service.
 
 Example: reuse the cached epoch-0/no-memory train rollout if it already exists;
 on cache miss, run the rollout normally and write the cache:
@@ -249,7 +253,8 @@ Service options:
 | `--config` | `~/.openviking/ov.conf` | ov.conf for VikingBot / OpenViking access |
 | `--rollout-language` | `default` | Rollout response language. Use `zh` for Chinese user-facing replies. |
 | `--rollout-backend` | `vikingbot` | Rollout implementation backend. `native` for fast Python executor, `vikingbot` for full VikingBot AgentLoop. |
-| `--experience-recall-mode` | `case_ann` | Experience recall strategy: `case_ann`, `exp_ann`, or `hybrid_ann`. |
+| `--experience-recall-mode` | `case_exp_rerank` | Experience recall strategy: `case_ann`, `exp_ann`, `hybrid_ann`, or `case_exp_rerank`. |
+| `--experience-rerank-top-n` | `3` | Final Experience count after rerank in `case_exp_rerank` mode. |
 | `--native-thread-workers` | `128` | Thread pool size for native rollout executor. |
 | `--rollout-thread-workers` | `200` | Worker threads used to host rollout executions off the uvicorn event loop. Use `0` to disable threaded hosting. |
 | `--max-rollout-concurrency` | `200` | Maximum concurrent rollout executions accepted by the service. |

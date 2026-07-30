@@ -43,7 +43,8 @@ KILL_EXISTING=1
 ROLLOUT_LANGUAGE="default"
 ROLLOUT_BACKEND="${TAU2_ROLLOUT_BACKEND:-vikingbot}"
 LOADER_MODE="${TAU2_EXPERIENCE_LOADER_MODE:-skill}"
-EXPERIENCE_RECALL_MODE="case_ann"
+EXPERIENCE_RECALL_MODE="case_exp_rerank"
+EXPERIENCE_RERANK_TOP_N="${TAU2_EXPERIENCE_RERANK_TOP_N:-3}"
 ROLLOUT_SEED="${TAU2_ROLLOUT_SEED:-300}"
 FIRST_USER_CACHE="${TAU2_FIRST_USER_CACHE:-on}"
 FIRST_USER_CACHE_DIR="${TAU2_FIRST_USER_CACHE_DIR:-}"
@@ -62,6 +63,7 @@ while [[ $# -gt 0 ]]; do
     --rollout-backend) ROLLOUT_BACKEND="$2"; shift 2 ;;
     --loader-mode) LOADER_MODE="$2"; shift 2 ;;
     --experience-recall-mode) EXPERIENCE_RECALL_MODE="$2"; shift 2 ;;
+    --experience-rerank-top-n) EXPERIENCE_RERANK_TOP_N="$2"; shift 2 ;;
     --seed) ROLLOUT_SEED="$2"; shift 2 ;;
     --first-user-cache) FIRST_USER_CACHE="$2"; shift 2 ;;
     --first-user-cache-dir) FIRST_USER_CACHE_DIR="$2"; shift 2 ;;
@@ -85,8 +87,11 @@ Options:
                      Rollout implementation backend. Default: vikingbot.
   --loader-mode skill|constraint|direct_experience
                      VikingBot experience loading mode. Default: skill.
-  --experience-recall-mode case_ann|exp_ann|hybrid_ann
-                     VikingBot experience recall strategy. Default: case_ann.
+  --experience-recall-mode case_ann|exp_ann|hybrid_ann|case_exp_rerank
+                     VikingBot experience recall strategy. Default: case_exp_rerank.
+  --experience-rerank-top-n N
+                     Final Experience count after rerank in case_exp_rerank mode.
+                     Default: 3.
   --seed N           Base rollout seed. Default: 300.
   --first-user-cache on|off
                      Cache and replay each task/trial's first user message.
@@ -128,8 +133,13 @@ if [[ "${LOADER_MODE}" != "skill" && "${LOADER_MODE}" != "constraint" && "${LOAD
   exit 1
 fi
 
-if [[ "${EXPERIENCE_RECALL_MODE}" != "case_ann" && "${EXPERIENCE_RECALL_MODE}" != "exp_ann" && "${EXPERIENCE_RECALL_MODE}" != "hybrid_ann" ]]; then
-  echo "[tau2-service] invalid --experience-recall-mode: ${EXPERIENCE_RECALL_MODE}. Expected case_ann, exp_ann, or hybrid_ann" >&2
+if [[ "${EXPERIENCE_RECALL_MODE}" != "case_ann" && "${EXPERIENCE_RECALL_MODE}" != "exp_ann" && "${EXPERIENCE_RECALL_MODE}" != "hybrid_ann" && "${EXPERIENCE_RECALL_MODE}" != "case_exp_rerank" ]]; then
+  echo "[tau2-service] invalid --experience-recall-mode: ${EXPERIENCE_RECALL_MODE}. Expected case_ann, exp_ann, hybrid_ann, or case_exp_rerank" >&2
+  exit 1
+fi
+
+if ! [[ "${EXPERIENCE_RERANK_TOP_N}" =~ ^[0-9]+$ ]] || [[ "${EXPERIENCE_RERANK_TOP_N}" -le 0 ]]; then
+  echo "[tau2-service] invalid --experience-rerank-top-n: ${EXPERIENCE_RERANK_TOP_N}. Expected positive integer" >&2
   exit 1
 fi
 
@@ -240,6 +250,7 @@ fi
 cd "${REPO_ROOT}"
 export TAU2_ROLLOUT_BACKEND="${ROLLOUT_BACKEND}"
 export TAU2_EXPERIENCE_LOADER_MODE="${LOADER_MODE}"
+export TAU2_EXPERIENCE_RERANK_TOP_N="${EXPERIENCE_RERANK_TOP_N}"
 export TAU2_ROLLOUT_SEED="${ROLLOUT_SEED}"
 export TAU2_FIRST_USER_CACHE="${FIRST_USER_CACHE}"
 if [[ -n "${FIRST_USER_CACHE_DIR}" ]]; then
@@ -248,7 +259,7 @@ fi
 export TAU2_NATIVE_THREAD_WORKERS="${NATIVE_THREAD_WORKERS}"
 export TAU2_MAX_ROLLOUT_CONCURRENCY="${MAX_ROLLOUT_CONCURRENCY}"
 export TAU2_ROLLOUT_THREAD_WORKERS="${ROLLOUT_THREAD_WORKERS}"
-echo "[tau2-service] host=${HOST} port=${PORT} data_root=${DATA_ROOT} config=${CONFIG} rollout_language=${ROLLOUT_LANGUAGE} rollout_backend=${ROLLOUT_BACKEND} loader_mode=${LOADER_MODE} experience_recall_mode=${EXPERIENCE_RECALL_MODE} seed=${ROLLOUT_SEED} first_user_cache=${FIRST_USER_CACHE} native_thread_workers=${NATIVE_THREAD_WORKERS} max_rollout_concurrency=${MAX_ROLLOUT_CONCURRENCY} rollout_thread_workers=${ROLLOUT_THREAD_WORKERS}"
+echo "[tau2-service] host=${HOST} port=${PORT} data_root=${DATA_ROOT} config=${CONFIG} rollout_language=${ROLLOUT_LANGUAGE} rollout_backend=${ROLLOUT_BACKEND} loader_mode=${LOADER_MODE} experience_recall_mode=${EXPERIENCE_RECALL_MODE} experience_rerank_top_n=${EXPERIENCE_RERANK_TOP_N} seed=${ROLLOUT_SEED} first_user_cache=${FIRST_USER_CACHE} native_thread_workers=${NATIVE_THREAD_WORKERS} max_rollout_concurrency=${MAX_ROLLOUT_CONCURRENCY} rollout_thread_workers=${ROLLOUT_THREAD_WORKERS}"
 if [[ "${KILL_EXISTING}" == "1" ]]; then
   EXISTING_PIDS="$(lsof -tiTCP:"${PORT}" -sTCP:LISTEN 2>/dev/null || true)"
   if [[ -n "${EXISTING_PIDS}" ]]; then
@@ -276,6 +287,7 @@ SERVICE_ARGS=(
   --rollout-backend "${ROLLOUT_BACKEND}"
   --loader-mode "${LOADER_MODE}"
   --experience-recall-mode "${EXPERIENCE_RECALL_MODE}"
+  --experience-rerank-top-n "${EXPERIENCE_RERANK_TOP_N}"
   --seed "${ROLLOUT_SEED}"
   --first-user-cache "${FIRST_USER_CACHE}"
   --native-thread-workers "${NATIVE_THREAD_WORKERS}"

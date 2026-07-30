@@ -17,6 +17,7 @@ from benchmark.tau2.train.rollout_executor_vikingbot import (  # re-export vikin
     DEFAULT_SYSTEM_PROMPT_PROFILE,
     DEFAULT_TAU2_EXPERIENCE_LOADER_MODE,
     DEFAULT_TAU2_EXPERIENCE_RECALL_MODE,
+    DEFAULT_TAU2_EXPERIENCE_RERANK_TOP_N,
     _append_final_answer_for_tau2_evaluation,
     _build_rollout_messages,
     _configure_tools,
@@ -64,6 +65,11 @@ def make_tau2_rollout_executor(
             ),
             experience_recall_mode=normalize_tau2_experience_recall_mode(
                 opts.get("experience_recall_mode") or DEFAULT_TAU2_EXPERIENCE_RECALL_MODE
+            ),
+            experience_rerank_top_n=int(
+                opts.get("experience_rerank_top_n")
+                if opts.get("experience_rerank_top_n") is not None
+                else DEFAULT_TAU2_EXPERIENCE_RERANK_TOP_N
             ),
             system_prompt_profile=normalize_system_prompt_profile(
                 opts.get("system_prompt_profile") or DEFAULT_SYSTEM_PROMPT_PROFILE

@@ -654,6 +654,7 @@ class VikingClient:
         target_uri: str | list[str] | None = None,
         limit: int = 10,
         score_threshold: Optional[float] = None,
+        filter: Optional[Dict[str, Any]] = None,
         user_id: Optional[str] = None,
         peer_id: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -674,6 +675,8 @@ class VikingClient:
             }
             if score_threshold is not None:
                 search_kwargs["score_threshold"] = score_threshold
+            if filter is not None:
+                search_kwargs["filter"] = filter
             result = await client.search(query, **search_kwargs)
         finally:
             if should_close:

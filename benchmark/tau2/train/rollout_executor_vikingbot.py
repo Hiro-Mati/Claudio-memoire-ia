@@ -41,10 +41,16 @@ from openviking_cli.utils import get_logger
 logger = get_logger(__name__)
 
 Tau2ExperienceLoaderMode = Literal["skill", "constraint", "direct_experience"]
-Tau2ExperienceRecallMode = Literal["case_ann", "exp_ann", "hybrid_ann"]
+Tau2ExperienceRecallMode = Literal[
+    "case_ann",
+    "exp_ann",
+    "hybrid_ann",
+    "case_exp_rerank",
+]
 VikingBotSystemPromptProfile = Literal["full", "minimal"]
 DEFAULT_TAU2_EXPERIENCE_LOADER_MODE: Tau2ExperienceLoaderMode = "skill"
-DEFAULT_TAU2_EXPERIENCE_RECALL_MODE: Tau2ExperienceRecallMode = "case_ann"
+DEFAULT_TAU2_EXPERIENCE_RECALL_MODE: Tau2ExperienceRecallMode = "case_exp_rerank"
+DEFAULT_TAU2_EXPERIENCE_RERANK_TOP_N = 3
 _TAU2_CASE_SEARCH_LIMIT = 10
 DEFAULT_SYSTEM_PROMPT_PROFILE: VikingBotSystemPromptProfile = "minimal"
 _EXPERIENCE_RECALL_RRF_K = 60
@@ -76,8 +82,11 @@ def normalize_tau2_experience_loader_mode(value: Any) -> Tau2ExperienceLoaderMod
 
 def normalize_tau2_experience_recall_mode(value: Any) -> Tau2ExperienceRecallMode:
     mode = str(value or DEFAULT_TAU2_EXPERIENCE_RECALL_MODE).strip().lower()
-    if mode not in {"case_ann", "exp_ann", "hybrid_ann"}:
-        raise ValueError("experience_recall_mode must be 'case_ann', 'exp_ann', or 'hybrid_ann'")
+    if mode not in {"case_ann", "exp_ann", "hybrid_ann", "case_exp_rerank"}:
+        raise ValueError(
+            "experience_recall_mode must be 'case_ann', 'exp_ann', 'hybrid_ann', "
+            "or 'case_exp_rerank'"
+        )
     return mode  # type: ignore[return-value]
 
 
@@ -245,9 +254,13 @@ def _make_search_experience_tool(
     case_lookup: dict[str, Any] | None = None,
     *,
     experience_recall_mode: Tau2ExperienceRecallMode = DEFAULT_TAU2_EXPERIENCE_RECALL_MODE,
+    experience_rerank_top_n: int = DEFAULT_TAU2_EXPERIENCE_RERANK_TOP_N,
 ):
     Tool = _vikingbot_imports()["Tool"]
     recall_mode = normalize_tau2_experience_recall_mode(experience_recall_mode)
+    normalized_experience_top_n = int(experience_rerank_top_n)
+    if normalized_experience_top_n <= 0:
+        raise ValueError("experience_rerank_top_n must be > 0")
 
     class SearchExperienceTool(Tool):
         @property
@@ -352,6 +365,87 @@ def _make_search_experience_tool(
                     task_signature=task_signature,
                     cases_root_uri=cases_uri,
                 )
+                if recall_mode == "case_exp_rerank":
+                    exact_case = exact_item is not None
+                    if exact_case:
+                        selected_cases = [exact_item]
+                    else:
+                        result = await client.search(
+                            situation,
+                            target_uri=cases_uri,
+                            limit=_TAU2_CASE_SEARCH_LIMIT,
+                            score_threshold=0.0,
+                        )
+                        memories = result.get("memories", []) if isinstance(result, dict) else []
+                        selected_cases = memories[:normalized_limit]
+
+                    experience_uris = await _linked_experience_scope(client, selected_cases)
+                    fallback_reason = (
+                        "task_signature_not_found"
+                        if str(task_signature or "").strip() and not exact_case
+                        else None
+                    )
+                    if not experience_uris:
+                        _trace_experience_recall(
+                            match_type="case_exp_rerank",
+                            task_signature=task_signature,
+                            candidates=[],
+                            fallback_reason=fallback_reason,
+                            exact_case_found=exact_case,
+                            selected_case_count=len(selected_cases),
+                            scoped_experience_count=0,
+                        )
+                        return _format_search_experience_response(
+                            situation=situation,
+                            task_signature=task_signature,
+                            match_type="case_exp_rerank",
+                            fallback_reason=fallback_reason,
+                            candidates=[],
+                        )
+
+                    experience_result = await client.search(
+                        situation,
+                        target_uri=experiences_uri,
+                        limit=len(experience_uris),
+                        score_threshold=0.0,
+                        filter={
+                            "op": "must",
+                            "field": "uri",
+                            "conds": experience_uris,
+                        },
+                    )
+                    experience_memories = (
+                        experience_result.get("memories", [])
+                        if isinstance(experience_result, dict)
+                        else []
+                    )
+                    entries = await asyncio.gather(
+                        *(
+                            _experience_ann_entry(client, item)
+                            for item in experience_memories[:normalized_experience_top_n]
+                        )
+                    )
+                    candidates = _single_experience_candidate(
+                        "case_exp_rerank",
+                        [entry for entry in entries if entry],
+                    )
+                    _trace_experience_recall(
+                        match_type="case_exp_rerank",
+                        task_signature=task_signature,
+                        candidates=candidates,
+                        fallback_reason=fallback_reason,
+                        exact_case_found=exact_case,
+                        selected_case_count=len(selected_cases),
+                        scoped_experience_count=len(experience_uris),
+                    )
+                    return _format_search_experience_response(
+                        situation=situation,
+                        task_signature=task_signature,
+                        match_type="case_exp_rerank",
+                        fallback_reason=fallback_reason,
+                        candidates=candidates,
+                    )
+
                 if recall_mode == "case_ann" and exact_item is not None:
                     candidate = await _exact_case_experience_summary(client, exact_item, rank=1)
                     candidates = _deduplicate_candidate_experiences([candidate])
@@ -608,6 +702,8 @@ def _trace_experience_recall(
     candidates: list[dict[str, Any]],
     fallback_reason: str | None = None,
     exact_case_found: bool | None = None,
+    selected_case_count: int | None = None,
+    scoped_experience_count: int | None = None,
 ) -> None:
     payload: dict[str, Any] = {
         "event": "experience_recall",
@@ -619,11 +715,16 @@ def _trace_experience_recall(
     }
     if task_signature:
         payload["task_signature"] = task_signature
-        payload["exact_case_found"] = (
-            match_type == "exact_case" if exact_case_found is None else exact_case_found
-        )
+    if exact_case_found is not None:
+        payload["exact_case_found"] = exact_case_found
+    elif task_signature:
+        payload["exact_case_found"] = match_type == "exact_case"
     if fallback_reason:
         payload["fallback_reason"] = fallback_reason
+    if selected_case_count is not None:
+        payload["selected_case_count"] = selected_case_count
+    if scoped_experience_count is not None:
+        payload["scoped_experience_count"] = scoped_experience_count
     tracer.info(json.dumps(payload, ensure_ascii=False))
 
 
@@ -808,6 +909,29 @@ async def _experience_ann_entry(client: Any, item: Any) -> dict[str, Any] | None
     }
 
 
+async def _linked_experience_scope(client: Any, case_items: list[Any]) -> list[str]:
+    async def read_links(item: Any) -> list[str]:
+        case_uri = _case_uri(item)
+        if not case_uri:
+            return []
+        try:
+            content = await client.read_content(case_uri, level="read")
+        except Exception:
+            return []
+        return _linked_experience_uris(content, source_uri=case_uri)
+
+    linked_groups = await asyncio.gather(*(read_links(item) for item in case_items))
+    experience_uris: list[str] = []
+    seen: set[str] = set()
+    for group in linked_groups:
+        for uri in group:
+            if uri in seen:
+                continue
+            seen.add(uri)
+            experience_uris.append(uri)
+    return experience_uris
+
+
 async def _exact_case_experience_summary(
     client: Any,
     item: Any,
@@ -969,6 +1093,7 @@ class VikingBotTau2RolloutExecutor:
     rollout_language: str = "default"
     loader_mode: Tau2ExperienceLoaderMode = DEFAULT_TAU2_EXPERIENCE_LOADER_MODE
     experience_recall_mode: Tau2ExperienceRecallMode = DEFAULT_TAU2_EXPERIENCE_RECALL_MODE
+    experience_rerank_top_n: int = DEFAULT_TAU2_EXPERIENCE_RERANK_TOP_N
     system_prompt_profile: VikingBotSystemPromptProfile = DEFAULT_SYSTEM_PROMPT_PROFILE
     direct_experience_content: str | None = None
     direct_experience_name: str | None = None
@@ -983,6 +1108,9 @@ class VikingBotTau2RolloutExecutor:
         self.experience_recall_mode = normalize_tau2_experience_recall_mode(
             self.experience_recall_mode
         )
+        self.experience_rerank_top_n = int(self.experience_rerank_top_n)
+        if self.experience_rerank_top_n <= 0:
+            raise ValueError("experience_rerank_top_n must be > 0")
         self.system_prompt_profile = normalize_system_prompt_profile(self.system_prompt_profile)
         if (
             self.loader_mode == "direct_experience"
@@ -1059,6 +1187,7 @@ class VikingBotTau2RolloutExecutor:
             keep_default_tools=self.keep_default_tools,
             loader_mode=self.loader_mode,
             experience_recall_mode=self.experience_recall_mode,
+            experience_rerank_top_n=self.experience_rerank_top_n,
             record_tool_timing=timings.record_tool,
             task_id=task_id,
             task_no=task_no,
@@ -1184,6 +1313,7 @@ class VikingBotTau2RolloutExecutor:
                 "experience_recall_enable": self.keep_default_tools,
                 "experience_loader_mode": self.loader_mode,
                 "experience_recall_mode": self.experience_recall_mode,
+                "experience_rerank_top_n": self.experience_rerank_top_n,
                 "system_prompt_profile": self.system_prompt_profile,
                 "experience_loader_skill": experience_loader_skill,
                 "direct_experience": _direct_experience_metadata(
@@ -1443,6 +1573,7 @@ def _configure_tools(
     keep_default_tools: bool,
     loader_mode: Tau2ExperienceLoaderMode = DEFAULT_TAU2_EXPERIENCE_LOADER_MODE,
     experience_recall_mode: Tau2ExperienceRecallMode = DEFAULT_TAU2_EXPERIENCE_RECALL_MODE,
+    experience_rerank_top_n: int = DEFAULT_TAU2_EXPERIENCE_RERANK_TOP_N,
     record_tool_timing: Callable[[str, float], None] | None = None,
     task_id: str | None = None,
     task_no: int | None = None,
@@ -1463,6 +1594,7 @@ def _configure_tools(
             _make_search_experience_tool(
                 case_lookup=case_lookup,
                 experience_recall_mode=experience_recall_mode,
+                experience_rerank_top_n=experience_rerank_top_n,
             )
         )
         agent.tools.register(_make_read_experience_tool())

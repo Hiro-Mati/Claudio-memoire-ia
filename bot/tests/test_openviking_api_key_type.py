@@ -41,6 +41,7 @@ class _DummyHTTPClient:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.find_calls = []
+        self.search_calls = []
         self.ls_calls = []
         self.read_calls = []
         self.closed = False
@@ -83,6 +84,7 @@ class _DummyHTTPClient:
         return []
 
     async def search(self, *_args, **_kwargs):
+        self.search_calls.append((_args, _kwargs))
         return {"memories": [], "resources": [], "skills": []}
 
     async def abstract(self, uri):
@@ -2317,6 +2319,41 @@ async def test_openviking_search_uses_user_namespace(monkeypatch):
         ("viking://resources/", None),
         ("viking://user/sender-1/memories/", "sender-1"),
         ("viking://user/sender-1/skills/", "sender-1"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_viking_client_search_forwards_filter(monkeypatch):
+    monkeypatch.setattr(ov_server_module, "load_config", lambda: _make_config("user"))
+    client = VikingClient()
+    experience_uris = [
+        "viking://user/memories/experiences/a.md",
+        "viking://user/memories/experiences/b.md",
+    ]
+    uri_filter = {
+        "op": "must",
+        "field": "uri",
+        "conds": experience_uris,
+    }
+
+    await client.search(
+        "airline change",
+        target_uri="viking://user/memories/experiences",
+        limit=2,
+        score_threshold=0.0,
+        filter=uri_filter,
+    )
+
+    assert client.client.search_calls == [
+        (
+            ("airline change",),
+            {
+                "target_uri": "viking://user/memories/experiences",
+                "limit": 2,
+                "score_threshold": 0.0,
+                "filter": uri_filter,
+            },
+        )
     ]
 
 

@@ -741,21 +741,62 @@ def test_tau2_configure_tools_removes_only_openviking_tools():
     assert normalize_tau2_experience_loader_mode("direct_experience") == "direct_experience"
 
 
-def test_tau2_experience_recall_mode_defaults_to_case_ann_and_validates():
+def test_tau2_experience_recall_mode_defaults_to_case_exp_rerank_and_validates():
     from benchmark.tau2.train.rollout_executor_vikingbot import (
         DEFAULT_TAU2_EXPERIENCE_RECALL_MODE,
+        DEFAULT_TAU2_EXPERIENCE_RERANK_TOP_N,
         VikingBotTau2RolloutExecutor,
         normalize_tau2_experience_recall_mode,
     )
 
-    assert DEFAULT_TAU2_EXPERIENCE_RECALL_MODE == "case_ann"
-    assert VikingBotTau2RolloutExecutor().experience_recall_mode == "case_ann"
+    assert DEFAULT_TAU2_EXPERIENCE_RECALL_MODE == "case_exp_rerank"
+    assert DEFAULT_TAU2_EXPERIENCE_RERANK_TOP_N == 3
+    assert VikingBotTau2RolloutExecutor().experience_recall_mode == "case_exp_rerank"
+    assert VikingBotTau2RolloutExecutor().experience_rerank_top_n == 3
     assert normalize_tau2_experience_recall_mode(" CASE_ANN ") == "case_ann"
     assert normalize_tau2_experience_recall_mode("exp_ann") == "exp_ann"
-    assert normalize_tau2_experience_recall_mode(None) == "case_ann"
+    assert normalize_tau2_experience_recall_mode(None) == "case_exp_rerank"
     assert normalize_tau2_experience_recall_mode("hybrid_ann") == "hybrid_ann"
+    assert normalize_tau2_experience_recall_mode("case_exp_rerank") == "case_exp_rerank"
     with pytest.raises(ValueError, match="experience_recall_mode"):
         normalize_tau2_experience_recall_mode("semantic")
+    with pytest.raises(ValueError, match="experience_rerank_top_n"):
+        VikingBotTau2RolloutExecutor(experience_rerank_top_n=0)
+
+
+def test_tau2_case_exp_rerank_trace_records_scope_counts(monkeypatch):
+    import json
+
+    import benchmark.tau2.train.rollout_executor_vikingbot as module
+
+    messages = []
+    monkeypatch.setattr(module.tracer, "info", messages.append)
+
+    module._trace_experience_recall(
+        match_type="case_exp_rerank",
+        task_signature=None,
+        candidates=[
+            {
+                "experiences": [
+                    {"uri": "viking://user/memories/experiences/a.md"},
+                    {"uri": "viking://user/memories/experiences/b.md"},
+                ]
+            }
+        ],
+        exact_case_found=False,
+        selected_case_count=2,
+        scoped_experience_count=5,
+    )
+
+    assert json.loads(messages[0]) == {
+        "event": "experience_recall",
+        "match_type": "case_exp_rerank",
+        "candidate_count": 1,
+        "experience_count": 2,
+        "exact_case_found": False,
+        "selected_case_count": 2,
+        "scoped_experience_count": 5,
+    }
 
 
 def test_tau2_configure_tools_binds_case_lookup_to_search_experience(monkeypatch):
@@ -769,9 +810,11 @@ def test_tau2_configure_tools_binds_case_lookup_to_search_experience(monkeypatch
     def fake_make_search_experience_tool(
         case_lookup=None,
         experience_recall_mode=None,
+        experience_rerank_top_n=None,
     ):
         observed["case_lookup"] = case_lookup
         observed["experience_recall_mode"] = experience_recall_mode
+        observed["experience_rerank_top_n"] = experience_rerank_top_n
         return FakeTool()
 
     monkeypatch.setattr(module, "_make_search_experience_tool", fake_make_search_experience_tool)
@@ -799,11 +842,13 @@ def test_tau2_configure_tools_binds_case_lookup_to_search_experience(monkeypatch
         keep_default_tools=True,
         case_lookup=case_lookup,
         experience_recall_mode="exp_ann",
+        experience_rerank_top_n=5,
     )
 
     assert observed == {
         "case_lookup": case_lookup,
         "experience_recall_mode": "exp_ann",
+        "experience_rerank_top_n": 5,
     }
 
 
@@ -1079,6 +1124,304 @@ async def test_tau2_search_experience_case_ann_searches_ten_and_expands_default_
     ]
     assert case_uris[2] not in FakeClient.read_uris
     assert exp_uris[2] not in FakeClient.read_uris
+
+
+@pytest.mark.asyncio
+async def test_tau2_search_experience_case_exp_rerank_reranks_all_linked_experiences(
+    monkeypatch,
+):
+    import json
+
+    import vikingbot.openviking_mount.ov_server as ov_server
+
+    from benchmark.tau2.train.rollout_executor_vikingbot import _make_search_experience_tool
+
+    situation = "The user needs a multi-step airline change."
+    cases_uri = "viking://user/u/memories/cases"
+    case_a_uri = f"{cases_uri}/case_a.md"
+    case_b_uri = f"{cases_uri}/case_b.md"
+    exp_a_uri = "viking://user/u/memories/experiences/exp_a.md"
+    exp_shared_uri = "viking://user/u/memories/experiences/exp_shared.md"
+    exp_b_uri = "viking://user/u/memories/experiences/exp_b.md"
+
+    class FakeClient:
+        search_calls = []
+        read_uris = []
+
+        @classmethod
+        async def create(cls):
+            return cls()
+
+        def _memory_target_uri(self, uri):
+            assert uri is None
+            return "viking://user/u/memories"
+
+        async def search(
+            self,
+            query,
+            *,
+            target_uri,
+            limit,
+            score_threshold=None,
+            filter=None,
+        ):
+            self.search_calls.append((query, target_uri, limit, score_threshold, filter))
+            if target_uri == cases_uri:
+                return {"memories": [{"uri": case_a_uri}, {"uri": case_b_uri}]}
+            assert target_uri == "viking://user/u/memories/experiences"
+            return {
+                "memories": [
+                    {"uri": exp_b_uri},
+                    {"uri": exp_a_uri},
+                    {"uri": exp_shared_uri},
+                ]
+            }
+
+        async def read_content(self, uri, level="read"):
+            assert level == "read"
+            self.read_uris.append(uri)
+            if uri == case_a_uri:
+                return (
+                    "# case_a\n\n"
+                    "## Linked Experiences\n"
+                    f"- [exp_a]({exp_a_uri})\n"
+                    f"- [exp_shared]({exp_shared_uri})\n"
+                )
+            if uri == case_b_uri:
+                return (
+                    "# case_b\n\n"
+                    "## Linked Experiences\n"
+                    f"- [exp_shared]({exp_shared_uri})\n"
+                    f"- [exp_b]({exp_b_uri})\n"
+                )
+            if uri == exp_a_uri:
+                return "## Situation\n- Applies to exp A\n"
+            if uri == exp_b_uri:
+                return "## Situation\n- Applies to exp B\n"
+            if uri == exp_shared_uri:
+                return "## Situation\n- Applies to shared exp\n"
+            raise AssertionError(f"unexpected uri: {uri}")
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(ov_server, "VikingClient", FakeClient)
+    tool = _make_search_experience_tool(
+        experience_recall_mode="case_exp_rerank",
+        experience_rerank_top_n=2,
+    )
+
+    payload = json.loads(await tool.execute(None, situation=situation, limit=2))
+
+    assert FakeClient.search_calls == [
+        (situation, cases_uri, 10, 0.0, None),
+        (
+            situation,
+            "viking://user/u/memories/experiences",
+            3,
+            0.0,
+            {
+                "op": "must",
+                "field": "uri",
+                "conds": [exp_a_uri, exp_shared_uri, exp_b_uri],
+            },
+        ),
+    ]
+    assert payload == {
+        "match_type": "case_exp_rerank",
+        "situation": situation,
+        "candidates": [
+            {
+                "rank": 1,
+                "case_name": "case_exp_rerank",
+                "experiences": [
+                    {"uri": exp_b_uri, "situation": "- Applies to exp B"},
+                    {"uri": exp_a_uri, "situation": "- Applies to exp A"},
+                ],
+            }
+        ],
+    }
+    assert exp_shared_uri not in FakeClient.read_uris
+
+
+@pytest.mark.asyncio
+async def test_tau2_search_experience_case_exp_rerank_exact_case_only_searches_linked_scope(
+    monkeypatch,
+):
+    import json
+
+    import vikingbot.openviking_mount.ov_server as ov_server
+
+    import benchmark.tau2.train.rollout_executor_vikingbot as module
+
+    situation = "The current train task has an exact Case."
+    case_uri = "viking://user/u/memories/cases/tau2_airline_train_22.md"
+    exp_a_uri = "viking://user/u/memories/experiences/exp_a.md"
+    exp_b_uri = "viking://user/u/memories/experiences/exp_b.md"
+
+    class FakeClient:
+        search_calls = []
+
+        @classmethod
+        async def create(cls):
+            return cls()
+
+        def _memory_target_uri(self, uri):
+            assert uri is None
+            return "viking://user/u/memories"
+
+        async def search(
+            self,
+            query,
+            *,
+            target_uri,
+            limit,
+            score_threshold=None,
+            filter=None,
+        ):
+            self.search_calls.append((query, target_uri, limit, score_threshold, filter))
+            assert target_uri == "viking://user/u/memories/experiences"
+            return {"memories": [{"uri": exp_b_uri}, {"uri": exp_a_uri}]}
+
+        async def read_content(self, uri, level="read"):
+            assert level == "read"
+            if uri == case_uri:
+                return _tau2_exact_case_content_with_links([exp_a_uri, exp_b_uri])
+            if uri == exp_a_uri:
+                return "## Situation\n- Exact exp A\n"
+            if uri == exp_b_uri:
+                return "## Situation\n- Exact exp B\n"
+            return ""
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(ov_server, "VikingClient", FakeClient)
+    tool = module._make_search_experience_tool(
+        case_lookup=_tau2_exact_case_lookup(),
+        experience_recall_mode="case_exp_rerank",
+        experience_rerank_top_n=1,
+    )
+
+    payload = json.loads(
+        await tool.execute(
+            None,
+            situation=situation,
+            task_signature="tau2:airline:train:39",
+            limit=2,
+        )
+    )
+
+    assert FakeClient.search_calls == [
+        (
+            situation,
+            "viking://user/u/memories/experiences",
+            2,
+            0.0,
+            {
+                "op": "must",
+                "field": "uri",
+                "conds": [exp_a_uri, exp_b_uri],
+            },
+        ),
+    ]
+    assert payload["match_type"] == "case_exp_rerank"
+    assert payload["candidates"][0]["experiences"] == [
+        {"uri": exp_b_uri, "situation": "- Exact exp B"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tau2_search_experience_case_exp_rerank_skips_empty_experience_scope(monkeypatch):
+    import json
+
+    import vikingbot.openviking_mount.ov_server as ov_server
+
+    from benchmark.tau2.train.rollout_executor_vikingbot import _make_search_experience_tool
+
+    case_uri = "viking://user/u/memories/cases/no_experience.md"
+
+    class FakeClient:
+        search_calls = []
+
+        @classmethod
+        async def create(cls):
+            return cls()
+
+        def _memory_target_uri(self, uri):
+            assert uri is None
+            return "viking://user/u/memories"
+
+        async def search(self, query, *, target_uri, limit, score_threshold=None):
+            self.search_calls.append((query, target_uri, limit, score_threshold))
+            return {"memories": [{"uri": case_uri}]}
+
+        async def read_content(self, uri, level="read"):
+            assert uri == case_uri
+            assert level == "read"
+            return "# no_experience\n\n## Linked Experiences\n"
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(ov_server, "VikingClient", FakeClient)
+    tool = _make_search_experience_tool(experience_recall_mode="case_exp_rerank")
+
+    payload = json.loads(await tool.execute(None, situation="A task without linked experience"))
+
+    assert len(FakeClient.search_calls) == 1
+    assert payload == {
+        "match_type": "case_exp_rerank",
+        "situation": "A task without linked experience",
+        "candidates": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_tau2_search_experience_case_exp_rerank_surfaces_scoped_search_error(monkeypatch):
+    import vikingbot.openviking_mount.ov_server as ov_server
+
+    from benchmark.tau2.train.rollout_executor_vikingbot import _make_search_experience_tool
+
+    case_uri = "viking://user/u/memories/cases/case_a.md"
+    exp_uri = "viking://user/u/memories/experiences/exp_a.md"
+
+    class FakeClient:
+        @classmethod
+        async def create(cls):
+            return cls()
+
+        def _memory_target_uri(self, uri):
+            assert uri is None
+            return "viking://user/u/memories"
+
+        async def search(
+            self,
+            query,
+            *,
+            target_uri,
+            limit,
+            score_threshold=None,
+            filter=None,
+        ):
+            if filter is not None:
+                raise RuntimeError("scoped search unavailable")
+            return {"memories": [{"uri": case_uri}]}
+
+        async def read_content(self, uri, level="read"):
+            assert uri == case_uri
+            assert level == "read"
+            return f"# case_a\n\n## Linked Experiences\n- [exp_a]({exp_uri})\n"
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(ov_server, "VikingClient", FakeClient)
+    tool = _make_search_experience_tool(experience_recall_mode="case_exp_rerank")
+
+    result = await tool.execute(None, situation="A task whose scoped search fails")
+
+    assert result == "Error searching experience candidates: scoped search unavailable"
 
 
 @pytest.mark.asyncio
@@ -1775,7 +2118,8 @@ def test_tau2_rollout_backend_factory_selects_vikingbot(monkeypatch):
         "seed": 300,
         "rollout_language": "zh",
         "loader_mode": "skill",
-        "experience_recall_mode": "case_ann",
+        "experience_recall_mode": "case_exp_rerank",
+        "experience_rerank_top_n": 3,
         "system_prompt_profile": "minimal",
         "direct_experience_content": None,
         "direct_experience_name": None,
@@ -1793,6 +2137,16 @@ def test_tau2_rollout_backend_factory_selects_vikingbot(monkeypatch):
         concurrency=1,
     )
     assert created["system_prompt_profile"] == "minimal"
+
+    module.make_tau2_rollout_executor(
+        backend="vikingbot",
+        options={
+            "config_path": "/tmp/ov.conf",
+            "experience_rerank_top_n": 5,
+        },
+        concurrency=1,
+    )
+    assert created["experience_rerank_top_n"] == 5
 
 
 def test_tau2_vikingbot_seed_is_stable_for_task_and_trial():
@@ -1868,6 +2222,7 @@ def test_tau2_service_rollout_backend_option_overrides_default(monkeypatch):
     app = service_app.create_app(
         rollout_backend="native",
         experience_recall_mode="case_ann",
+        experience_rerank_top_n=4,
         first_user_cache=False,
     )
     executor = app["make_rollout_executor"]({"rollout_backend": "vikingbot", "max_iterations": 5})
@@ -1878,14 +2233,23 @@ def test_tau2_service_rollout_backend_option_overrides_default(monkeypatch):
     assert calls[-1]["factory"]["options"]["show_progress"] is False
     assert calls[-1]["factory"]["options"]["first_user_cache"] is False
     assert calls[-1]["factory"]["options"]["experience_recall_mode"] == "case_ann"
+    assert calls[-1]["factory"]["options"]["experience_rerank_top_n"] == 4
 
-    app["make_rollout_executor"]({"rollout_backend": "native", "show_progress": True})
+    app["make_rollout_executor"](
+        {
+            "rollout_backend": "native",
+            "show_progress": True,
+            "experience_rerank_top_n": 5,
+        }
+    )
     assert calls[-1]["factory"]["options"]["show_progress"] is True
+    assert calls[-1]["factory"]["options"]["experience_rerank_top_n"] == 5
 
     default_app = service_app.create_app(rollout_backend="native")
     default_app["make_rollout_executor"]({})
     assert calls[-1]["factory"]["options"]["first_user_cache"] is True
-    assert calls[-1]["factory"]["options"]["experience_recall_mode"] == "case_ann"
+    assert calls[-1]["factory"]["options"]["experience_recall_mode"] == "case_exp_rerank"
+    assert calls[-1]["factory"]["options"]["experience_rerank_top_n"] == 3
 
 
 def test_tau2_service_cli_recall_mode_default_ignores_environment(monkeypatch):
@@ -1894,14 +2258,23 @@ def test_tau2_service_cli_recall_mode_default_ignores_environment(monkeypatch):
     monkeypatch.setenv("TAU2_EXPERIENCE_RECALL_MODE", "case_ann")
     monkeypatch.setattr(sys, "argv", ["service_app.py"])
 
-    assert service_app.parse_args().experience_recall_mode == "case_ann"
+    assert service_app.parse_args().experience_recall_mode == "case_exp_rerank"
+    assert service_app.parse_args().experience_rerank_top_n == 3
 
     monkeypatch.setattr(
         sys,
         "argv",
-        ["service_app.py", "--experience-recall-mode", "exp_ann"],
+        [
+            "service_app.py",
+            "--experience-recall-mode",
+            "case_ann",
+            "--experience-rerank-top-n",
+            "5",
+        ],
     )
-    assert service_app.parse_args().experience_recall_mode == "exp_ann"
+    args = service_app.parse_args()
+    assert args.experience_recall_mode == "case_ann"
+    assert args.experience_rerank_top_n == 5
 
 
 @pytest.mark.asyncio
