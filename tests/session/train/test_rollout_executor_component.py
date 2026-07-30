@@ -1245,7 +1245,7 @@ async def test_tau2_search_experience_case_exp_rerank_reranks_all_linked_experie
 
 
 @pytest.mark.asyncio
-async def test_tau2_search_experience_case_exp_rerank_exact_case_only_searches_linked_scope(
+async def test_tau2_search_experience_case_exp_rerank_exact_case_returns_all_linked_content(
     monkeypatch,
 ):
     import json
@@ -1260,8 +1260,6 @@ async def test_tau2_search_experience_case_exp_rerank_exact_case_only_searches_l
     exp_b_uri = "viking://user/u/memories/experiences/exp_b.md"
 
     class FakeClient:
-        search_calls = []
-
         @classmethod
         async def create(cls):
             return cls()
@@ -1279,14 +1277,14 @@ async def test_tau2_search_experience_case_exp_rerank_exact_case_only_searches_l
             score_threshold=None,
             filter=None,
         ):
-            self.search_calls.append((query, target_uri, limit, score_threshold, filter))
-            assert target_uri == "viking://user/u/memories/experiences"
-            return {"memories": [{"uri": exp_b_uri}, {"uri": exp_a_uri}]}
+            raise AssertionError(
+                "deterministic exact Case must not run Case or Experience search/rerank"
+            )
 
         async def read_content(self, uri, level="read"):
             assert level == "read"
             if uri == case_uri:
-                return _tau2_exact_case_content_with_links([exp_a_uri, exp_b_uri])
+                return _tau2_exact_case_content_with_links([exp_b_uri, exp_a_uri])
             if uri == exp_a_uri:
                 return "## Situation\n- Exact exp A\n"
             if uri == exp_b_uri:
@@ -1312,22 +1310,10 @@ async def test_tau2_search_experience_case_exp_rerank_exact_case_only_searches_l
         )
     )
 
-    assert FakeClient.search_calls == [
-        (
-            situation,
-            "viking://user/u/memories/experiences",
-            2,
-            0.0,
-            {
-                "op": "must",
-                "field": "uri",
-                "conds": [exp_a_uri, exp_b_uri],
-            },
-        ),
-    ]
-    assert payload["match_type"] == "case_exp_rerank"
+    assert payload["match_type"] == "exact_case"
     assert payload["candidates"][0]["experiences"] == [
-        {"uri": exp_b_uri, "situation": "- Exact exp B"},
+        {"uri": exp_a_uri, "content": "## Situation\n- Exact exp A"},
+        {"uri": exp_b_uri, "content": "## Situation\n- Exact exp B"},
     ]
 
 

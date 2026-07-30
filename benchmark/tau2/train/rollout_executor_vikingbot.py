@@ -366,24 +366,42 @@ def _make_search_experience_tool(
                     cases_root_uri=cases_uri,
                 )
                 if recall_mode == "case_exp_rerank":
-                    exact_case = exact_item is not None
-                    if exact_case:
-                        selected_cases = [exact_item]
-                    else:
-                        result = await client.search(
-                            situation,
-                            target_uri=cases_uri,
-                            limit=_TAU2_CASE_SEARCH_LIMIT,
-                            score_threshold=0.0,
+                    if exact_item is not None:
+                        candidate = await _exact_case_experience_summary(
+                            client,
+                            exact_item,
+                            rank=1,
                         )
-                        memories = result.get("memories", []) if isinstance(result, dict) else []
-                        selected_cases = memories[:normalized_limit]
+                        candidates = _deduplicate_candidate_experiences([candidate])
+                        _trace_experience_recall(
+                            match_type="exact_case",
+                            task_signature=task_signature,
+                            candidates=candidates,
+                            exact_case_found=True,
+                            selected_case_count=1,
+                            scoped_experience_count=sum(
+                                len(item.get("experiences") or []) for item in candidates
+                            ),
+                        )
+                        return _format_search_experience_response(
+                            situation=situation,
+                            task_signature=task_signature,
+                            match_type="exact_case",
+                            candidates=candidates,
+                        )
+
+                    result = await client.search(
+                        situation,
+                        target_uri=cases_uri,
+                        limit=_TAU2_CASE_SEARCH_LIMIT,
+                        score_threshold=0.0,
+                    )
+                    memories = result.get("memories", []) if isinstance(result, dict) else []
+                    selected_cases = memories[:normalized_limit]
 
                     experience_uris = await _linked_experience_scope(client, selected_cases)
                     fallback_reason = (
-                        "task_signature_not_found"
-                        if str(task_signature or "").strip() and not exact_case
-                        else None
+                        "task_signature_not_found" if str(task_signature or "").strip() else None
                     )
                     if not experience_uris:
                         _trace_experience_recall(
@@ -391,7 +409,7 @@ def _make_search_experience_tool(
                             task_signature=task_signature,
                             candidates=[],
                             fallback_reason=fallback_reason,
-                            exact_case_found=exact_case,
+                            exact_case_found=False,
                             selected_case_count=len(selected_cases),
                             scoped_experience_count=0,
                         )
@@ -434,7 +452,7 @@ def _make_search_experience_tool(
                         task_signature=task_signature,
                         candidates=candidates,
                         fallback_reason=fallback_reason,
-                        exact_case_found=exact_case,
+                        exact_case_found=False,
                         selected_case_count=len(selected_cases),
                         scoped_experience_count=len(experience_uris),
                     )
