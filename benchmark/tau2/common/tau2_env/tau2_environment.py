@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import time
 from collections.abc import Callable
 from functools import wraps
 from typing import Any
@@ -17,6 +18,8 @@ logger = get_logger(__name__)
 
 DEFAULT_TAU2_USER_LLM = "openai/doubao-seed-2-0-code-preview-260215"
 _TAU2_MODEL_MAX_RETRIES = 3
+_GYM_INITIAL_OBSERVATION_TIMEOUT_SECONDS = 30.0
+_GYM_INITIAL_OBSERVATION_POLL_SECONDS = 0.01
 
 _TAU2_GENERATE_REFERENCE_MODULES = (
     "tau2.agent.llm_agent",
@@ -249,6 +252,7 @@ class _GymTau2BenchEnv:
         if fixed_first_user_message is not None:
             self._install_fixed_first_user(fixed_first_user_message)
         user_query, info_dict = self.env.reset(seed=seed)
+        user_query = _wait_for_gym_initial_observation(self.env, user_query)
         self.user_query = user_query.lstrip("user: ")
         self.task = info_dict["task"]
         self.simulation_run = info_dict["simulation_run"]
@@ -321,6 +325,40 @@ class _GymTau2BenchEnv:
             return SimulationRun.model_validate_json(simulation_run_json)
         except Exception:
             return None
+
+
+def _wait_for_gym_initial_observation(env: Any, observation: Any) -> str:
+    initial = str(observation or "")
+    if initial.strip():
+        return initial
+
+    agent = getattr(env, "_agent", None)
+    agent_lock = getattr(agent, "_lock", None)
+    format_observation = getattr(env, "_format_observation", None)
+    simulation_done = getattr(env, "_simulation_done", None)
+    if agent is None or agent_lock is None or not callable(format_observation):
+        raise RuntimeError("Tau2 AgentGymEnv returned an empty initial observation")
+
+    deadline = time.monotonic() + _GYM_INITIAL_OBSERVATION_TIMEOUT_SECONDS
+    while True:
+        if simulation_done is not None and simulation_done.is_set():
+            raise RuntimeError("Tau2 AgentGymEnv ended before publishing its initial observation")
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("Tau2 AgentGymEnv timed out waiting for its initial observation")
+
+        acquired = agent_lock.acquire(timeout=remaining)
+        if not acquired:
+            raise RuntimeError("Tau2 AgentGymEnv timed out waiting for its initial observation")
+        try:
+            candidate = str(format_observation(list(agent.observation)) or "")
+        finally:
+            agent_lock.release()
+        if candidate.strip():
+            return candidate
+
+        time.sleep(min(_GYM_INITIAL_OBSERVATION_POLL_SECONDS, remaining))
 
 
 class _NativeTau2BenchEnv:

@@ -544,6 +544,100 @@ def test_tau2_gym_env_passes_seed_to_user_llm_before_reset(monkeypatch):
     assert calls["reset_seed"] == 1234
 
 
+def test_tau2_gym_env_waits_for_initial_observation_after_agent_turn(monkeypatch):
+    import benchmark.tau2.common.tau2_env.tau2_environment as tau2_environment
+
+    task = SimpleNamespace(evaluation_criteria=[], user_scenario="scenario")
+
+    class FakeAgent:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._observation = ["published after reset"]
+
+        @property
+        def observation(self):
+            return self._observation
+
+    class FakeAgentGymEnv:
+        def __init__(self, **_kwargs):
+            self._agent = FakeAgent()
+            self._simulation_done = threading.Event()
+
+        def reset(self, *, seed=None):
+            del seed
+            return "", {
+                "task": task,
+                "simulation_run": None,
+                "policy": "policy",
+                "tools": [],
+            }
+
+        @staticmethod
+        def _format_observation(messages):
+            return "user: hello" if messages else ""
+
+    monkeypatch.setattr(tau2_environment, "AgentGymEnv", FakeAgentGymEnv)
+    monkeypatch.setattr(tau2_environment, "_install_tau2_litellm_rate_limit_retry", lambda: None)
+    monkeypatch.setattr(
+        tau2_environment,
+        "_install_tau2_litellm_unknown_cost_suppression",
+        lambda: None,
+    )
+
+    env = tau2_environment._GymTau2BenchEnv("airline", "1")
+    env.reset(seed=1234)
+
+    assert env.user_query == "hello"
+
+
+def test_tau2_gym_env_bounds_wait_for_missing_initial_observation(monkeypatch):
+    import benchmark.tau2.common.tau2_env.tau2_environment as tau2_environment
+
+    task = SimpleNamespace(evaluation_criteria=[], user_scenario="scenario")
+
+    class FakeAgent:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._observation = []
+
+        @property
+        def observation(self):
+            return self._observation
+
+    class FakeAgentGymEnv:
+        def __init__(self, **_kwargs):
+            self._agent = FakeAgent()
+            self._simulation_done = threading.Event()
+
+        def reset(self, *, seed=None):
+            del seed
+            return "", {
+                "task": task,
+                "simulation_run": None,
+                "policy": "policy",
+                "tools": [],
+            }
+
+        @staticmethod
+        def _format_observation(messages):
+            del messages
+            return ""
+
+    monkeypatch.setattr(tau2_environment, "AgentGymEnv", FakeAgentGymEnv)
+    monkeypatch.setattr(tau2_environment, "_GYM_INITIAL_OBSERVATION_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(tau2_environment, "_install_tau2_litellm_rate_limit_retry", lambda: None)
+    monkeypatch.setattr(
+        tau2_environment,
+        "_install_tau2_litellm_unknown_cost_suppression",
+        lambda: None,
+    )
+
+    env = tau2_environment._GymTau2BenchEnv("airline", "1")
+
+    with pytest.raises(RuntimeError, match="initial observation"):
+        env.reset(seed=1234)
+
+
 def test_tau2_fixed_first_user_simulator_uses_fixture_only_for_first_turn(monkeypatch):
     from tau2.data_model.message import AssistantMessage, UserMessage
     from tau2.user.user_simulator import UserSimulator
