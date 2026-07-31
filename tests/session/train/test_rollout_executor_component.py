@@ -21,6 +21,7 @@ from openviking.session.train import (
     SingleTurnLLMRolloutExecutor,
     default_single_turn_prompt,
 )
+from openviking_cli.exceptions import NotFoundError
 
 
 class FakeVLM:
@@ -1260,6 +1261,8 @@ async def test_tau2_search_experience_case_exp_rerank_exact_case_returns_all_lin
     exp_b_uri = "viking://user/u/memories/experiences/exp_b.md"
 
     class FakeClient:
+        read_uris = []
+
         @classmethod
         async def create(cls):
             return cls()
@@ -1283,6 +1286,7 @@ async def test_tau2_search_experience_case_exp_rerank_exact_case_returns_all_lin
 
         async def read_content(self, uri, level="read"):
             assert level == "read"
+            self.read_uris.append(uri)
             if uri == case_uri:
                 return _tau2_exact_case_content_with_links([exp_b_uri, exp_a_uri])
             if uri == exp_a_uri:
@@ -1314,6 +1318,184 @@ async def test_tau2_search_experience_case_exp_rerank_exact_case_returns_all_lin
     assert payload["candidates"][0]["experiences"] == [
         {"uri": exp_a_uri, "content": "## Situation\n- Exact exp A"},
         {"uri": exp_b_uri, "content": "## Situation\n- Exact exp B"},
+    ]
+    assert FakeClient.read_uris.count(case_uri) == 1
+
+
+@pytest.mark.asyncio
+async def test_tau2_search_experience_exact_case_retries_empty_linked_experience_read(
+    monkeypatch,
+):
+    import json
+
+    import vikingbot.openviking_mount.ov_server as ov_server
+
+    import benchmark.tau2.train.rollout_executor_vikingbot as module
+
+    case_uri = "viking://user/u/memories/cases/tau2_airline_train_22.md"
+    exp_uri = "viking://user/u/memories/experiences/exp.md"
+
+    class FakeClient:
+        read_counts = {}
+
+        @classmethod
+        async def create(cls):
+            return cls()
+
+        def _memory_target_uri(self, uri):
+            assert uri is None
+            return "viking://user/u/memories"
+
+        async def search(self, *args, **kwargs):
+            raise AssertionError("exact Case must not search")
+
+        async def read_content(self, uri, level="read"):
+            assert level == "read"
+            self.read_counts[uri] = self.read_counts.get(uri, 0) + 1
+            if uri == case_uri:
+                return _tau2_exact_case_content_with_links([exp_uri])
+            if uri == exp_uri and self.read_counts[uri] == 1:
+                return ""
+            if uri == exp_uri:
+                return "## Situation\n- Available after retry\n"
+            raise AssertionError(f"unexpected uri: {uri}")
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(ov_server, "VikingClient", FakeClient)
+    tool = module._make_search_experience_tool(
+        case_lookup=_tau2_exact_case_lookup(),
+        experience_recall_mode="case_exp_rerank",
+    )
+
+    payload = json.loads(
+        await tool.execute(
+            None,
+            situation="The current train task has an exact Case.",
+            task_signature="tau2:airline:train:39",
+        )
+    )
+
+    assert payload["candidates"][0]["experiences"] == [
+        {"uri": exp_uri, "content": "## Situation\n- Available after retry"}
+    ]
+    assert FakeClient.read_counts == {case_uri: 1, exp_uri: 2}
+
+
+@pytest.mark.asyncio
+async def test_tau2_search_experience_exact_case_traces_persistent_empty_experience_read(
+    monkeypatch,
+):
+    import json
+
+    import vikingbot.openviking_mount.ov_server as ov_server
+
+    import benchmark.tau2.train.rollout_executor_vikingbot as module
+
+    case_uri = "viking://user/u/memories/cases/tau2_airline_train_22.md"
+    exp_uri = "viking://user/u/memories/experiences/missing.md"
+    trace_messages = []
+
+    class FakeClient:
+        read_counts = {}
+
+        @classmethod
+        async def create(cls):
+            return cls()
+
+        def _memory_target_uri(self, uri):
+            assert uri is None
+            return "viking://user/u/memories"
+
+        async def search(self, *args, **kwargs):
+            raise AssertionError("exact Case must not search")
+
+        async def read_content(self, uri, level="read"):
+            assert level == "read"
+            self.read_counts[uri] = self.read_counts.get(uri, 0) + 1
+            if uri == case_uri:
+                return _tau2_exact_case_content_with_links([exp_uri])
+            if uri == exp_uri:
+                return ""
+            raise AssertionError(f"unexpected uri: {uri}")
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(ov_server, "VikingClient", FakeClient)
+    monkeypatch.setattr(module.tracer, "info", trace_messages.append)
+    tool = module._make_search_experience_tool(
+        case_lookup=_tau2_exact_case_lookup(),
+        experience_recall_mode="case_exp_rerank",
+    )
+
+    payload = json.loads(
+        await tool.execute(
+            None,
+            situation="The current train task has an exact Case.",
+            task_signature="tau2:airline:train:39",
+        )
+    )
+
+    diagnostics = [
+        json.loads(message)
+        for message in trace_messages
+        if json.loads(message).get("event") == "exact_case_experience_read"
+    ]
+    assert payload["candidates"][0]["experiences"] == []
+    assert FakeClient.read_counts == {case_uri: 1, exp_uri: 2}
+    assert diagnostics == [
+        {
+            "event": "exact_case_experience_read",
+            "case_uri": case_uri,
+            "experience_uri": exp_uri,
+            "attempts": 2,
+            "outcome": "empty",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "outcome"),
+    [
+        (FileNotFoundError("missing"), "not_found"),
+        (NotFoundError("missing.md", "file"), "not_found"),
+        (RuntimeError("backend unavailable"), "exception"),
+    ],
+)
+async def test_viking_client_read_content_traces_failure_kind(monkeypatch, error, outcome):
+    import json
+
+    import vikingbot.openviking_mount.ov_server as ov_server
+
+    uri = "viking://user/u/memories/experiences/missing.md"
+    warnings = []
+
+    class FakeReadClient:
+        async def read(self, read_uri):
+            assert read_uri == uri
+            raise error
+
+    fake_client = SimpleNamespace(
+        client=FakeReadClient(),
+        _owner_user_id_for_uri=lambda _uri: None,
+    )
+    monkeypatch.setattr(ov_server, "logger", SimpleNamespace(warning=warnings.append))
+
+    content = await ov_server.VikingClient.read_content(fake_client, uri, level="read")
+
+    assert content == ""
+    assert [json.loads(message) for message in warnings] == [
+        {
+            "event": "viking_read_content_failed",
+            "uri": uri,
+            "level": "read",
+            "outcome": outcome,
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
     ]
 
 
@@ -2090,6 +2272,7 @@ def test_tau2_rollout_backend_factory_selects_vikingbot(monkeypatch):
         options={
             "config_path": "/tmp/ov.conf",
             "max_iterations": 9,
+            "session_log_root": "/tmp/tau2-session-logs",
         },
         concurrency=2,
         rollout_language="zh",
@@ -2112,6 +2295,7 @@ def test_tau2_rollout_backend_factory_selects_vikingbot(monkeypatch):
         "direct_experience_uri": None,
         "first_user_cache": True,
         "first_user_cache_dir": None,
+        "session_log_root": "/tmp/tau2-session-logs",
     }
 
     module.make_tau2_rollout_executor(
@@ -2289,6 +2473,64 @@ async def test_tau2_vikingbot_rollout_runs_on_current_event_loop():
     assert result == "case-1"
     assert observed["loop"] is expected_loop
     assert observed["thread"] == expected_thread
+
+
+@pytest.mark.asyncio
+async def test_tau2_vikingbot_rollout_writes_run_local_session_log(tmp_path):
+    from loguru import logger as loguru_logger
+
+    import benchmark.tau2.train.rollout_executor_vikingbot as module
+    from benchmark.tau2.train.rollout_executor_vikingbot import VikingBotTau2RolloutExecutor
+    from openviking.session.train import Rollout
+
+    class FakeVikingBotExecutor(VikingBotTau2RolloutExecutor):
+        async def _execute_one_async(self, case, context):
+            module.logger.warning("python-inside-rollout case=%s", case.name)
+            loguru_logger.warning("loguru-inside-rollout case={}", case.name)
+            return Rollout(
+                case=case,
+                messages=[],
+                policy_snapshot_id=context.policy_snapshot_id,
+                metadata={},
+            )
+
+    executor = FakeVikingBotExecutor(session_log_root=str(tmp_path))
+    context = ExecutionContext(
+        policy_snapshot_id="snapshot",
+        metadata={"epoch": 2, "rollout_stage": "epoch_test_rollout"},
+    )
+
+    rollout = await executor._execute_one(_case(), context)
+
+    expected = tmp_path / "epoch_test_rollout" / "epoch_2" / "case-1.log"
+    assert rollout.metadata["vikingbot_log_path"] == str(expected.resolve())
+    content = expected.read_text(encoding="utf-8")
+    assert "tau2 vikingbot rollout start" in content
+    assert "python-inside-rollout case=case-1" in content
+    assert "loguru-inside-rollout case=case-1" in content
+    assert "tau2 vikingbot rollout success" in content
+
+
+@pytest.mark.asyncio
+async def test_tau2_vikingbot_rollout_without_log_root_keeps_metadata_unchanged():
+    from benchmark.tau2.train.rollout_executor_vikingbot import VikingBotTau2RolloutExecutor
+    from openviking.session.train import Rollout
+
+    class FakeVikingBotExecutor(VikingBotTau2RolloutExecutor):
+        async def _execute_one_async(self, case, context):
+            return Rollout(
+                case=case,
+                messages=[],
+                policy_snapshot_id=context.policy_snapshot_id,
+                metadata={"existing": True},
+            )
+
+    rollout = await FakeVikingBotExecutor()._execute_one(
+        _case(),
+        ExecutionContext(policy_snapshot_id="snapshot", metadata={}),
+    )
+
+    assert rollout.metadata == {"existing": True}
 
 
 @pytest.mark.asyncio

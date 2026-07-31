@@ -9,6 +9,7 @@ from loguru import logger
 import openviking as ov
 from openviking.core.namespace import uri_parts
 from openviking.core.peer_id import normalize_peer_id
+from openviking_cli.exceptions import NotFoundError
 from vikingbot.config.loader import load_config
 
 viking_resource_prefix = "viking://resources/"
@@ -621,10 +622,35 @@ class VikingClient:
                     return await client.read(uri)
             else:
                 raise ValueError(f"Unsupported level: {level}")
-        except FileNotFoundError:
+        except (FileNotFoundError, NotFoundError) as exc:
+            logger.warning(
+                json.dumps(
+                    {
+                        "event": "viking_read_content_failed",
+                        "uri": uri,
+                        "level": level,
+                        "outcome": "not_found",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                    ensure_ascii=False,
+                )
+            )
             return ""
-        except Exception as e:
-            logger.warning(f"Failed to read content from {uri}: {e}")
+        except Exception as exc:
+            logger.warning(
+                json.dumps(
+                    {
+                        "event": "viking_read_content_failed",
+                        "uri": uri,
+                        "level": level,
+                        "outcome": "exception",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                    ensure_ascii=False,
+                )
+            )
             return ""
         finally:
             if should_close:

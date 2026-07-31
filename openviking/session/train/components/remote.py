@@ -19,6 +19,7 @@ from openviking.session.train.components.dataset_service import (
     rollout_from_dict,
 )
 from openviking.session.train.components.progress import run_with_progress
+from openviking.session.train.components.rollout_log_path import rollout_session_log_path
 from openviking.session.train.context import ExecutionContext
 from openviking.session.train.domain import (
     Case,
@@ -156,17 +157,17 @@ class RemoteRolloutExecutor:
         ) as client:
 
             async def _execute(case: Case, index: int) -> Rollout:
+                session_log_path = rollout_session_log_path(
+                    self.options.get("session_log_root"),
+                    case_name=case.name,
+                    metadata=context.metadata,
+                )
                 try:
                     # The polling loop has its own deadline, but an outer timeout
                     # guarantees a stalled await cannot keep a whole batch open.
                     rollout = await asyncio.wait_for(
-                        self._execute_with_handshake_retry(
-                            client, case, policy_set, context
-                        ),
-                        timeout=(
-                            self.execution_timeout_seconds
-                            + self.request_timeout_seconds
-                        ),
+                        self._execute_with_handshake_retry(client, case, policy_set, context),
+                        timeout=(self.execution_timeout_seconds + self.request_timeout_seconds),
                     )
                 except Exception as exc:
                     if not self.continue_on_rollout_failure:
@@ -179,6 +180,11 @@ class RemoteRolloutExecutor:
                             "code": type(exc).__name__,
                             "message": str(exc),
                         },
+                    )
+                if session_log_path is not None:
+                    rollout.metadata.setdefault(
+                        "vikingbot_log_path",
+                        str(session_log_path),
                     )
                 await self._emit_rollout_complete(
                     rollout=rollout,
@@ -340,8 +346,7 @@ class RemoteRolloutExecutor:
                         error=error,
                     )
                 raise RuntimeError(
-                    f"rollout execution {execution_id} failed for case {case.name}: "
-                    f"{error}"
+                    f"rollout execution {execution_id} failed for case {case.name}: {error}"
                 )
             if asyncio.get_running_loop().time() >= deadline:
                 last_error_text = (

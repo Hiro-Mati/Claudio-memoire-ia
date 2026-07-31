@@ -2134,6 +2134,9 @@ async def test_rollout_artifact_recorder_writes_train_rollouts_before_commit(tmp
         metadata={
             "memory": "remember airline seat-change rules",
             "task_case_experience_skill": "# task_case_experience\nlinked exp content",
+            "vikingbot_log_path": str(
+                tmp_path / "vikingbot_logs" / "train_rollout" / "epoch_0" / "task.log"
+            ),
         },
     )
 
@@ -2166,8 +2169,13 @@ async def test_rollout_artifact_recorder_writes_train_rollouts_before_commit(tmp
     assert status["artifact_state"] == "rollout_done"
     assert status["has_task_case_experience_skill"] is True
     assert status["task_case_experience_skill_path"] == "task_case_experience_skill.md"
+    assert status["vikingbot_log_path"] == rollout.metadata["vikingbot_log_path"]
     index = json.loads((tmp_path / "rollouts_index.json").read_text())
     assert index["case_groups"][0]["rollouts"][0]["artifact_state"] == "rollout_done"
+    assert (
+        index["case_groups"][0]["rollouts"][0]["vikingbot_log_path"]
+        == rollout.metadata["vikingbot_log_path"]
+    )
 
 
 def test_rollout_artifact_recorder_includes_pre_tool_experience_reminders_in_memory_context(

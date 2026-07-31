@@ -9,10 +9,12 @@ from openviking.session.train.batch_runner import (
     BatchTrainEvalConfig,
     CachedEpochZeroTrainRolloutExecutor,
     _baseline_cache_key,
+    _build_pipeline,
     _clean_result_dir,
     _load_baseline_cache,
     _print_baseline_cache_hit,
     _result_base_dir,
+    _run_output_dir,
     _write_baseline_cache,
 )
 
@@ -370,6 +372,24 @@ def test_result_dir_name_selects_result_subdirectory(tmp_path: Path, monkeypatch
     assert _result_base_dir(config) == tmp_path / "result" / "tau2" / "train_1"
 
 
+def test_build_pipeline_enables_run_local_vikingbot_session_logs(tmp_path: Path, monkeypatch):
+    import openviking.session.train.batch_runner as batch_runner
+
+    monkeypatch.setattr(batch_runner, "_repo_root", lambda: tmp_path)
+    config = BatchTrainEvalConfig(
+        dataset="tau2",
+        domain="airline",
+        benchmark_service_url="http://127.0.0.1:1944",
+        reuse_train_rollout_cache=False,
+    )
+
+    pipeline = _build_pipeline(config, object())
+
+    assert pipeline.rollout_executor.options["session_log_root"] == str(
+        _run_output_dir(config) / "vikingbot_logs"
+    )
+
+
 def test_result_dir_name_must_not_be_empty():
     import pytest
 
@@ -545,17 +565,20 @@ def test_report_builder_counts_proxy_memory_tool_names():
     from openviking.session.train.components.report_builder import PipelineReportBuilder
 
     builder = PipelineReportBuilder()
-    assert builder.memory_tool_call_count(
-        [
-            {"tool_name": "openviking_search"},
-            {"tool_name": "memsearch"},
-            {"tool_name": "memread"},
-            {"tool_name": "tool_server_memsubmit"},
-            {"tool_name": "mcp__tool_server__memsearch"},
-            {"tool_name": "bash"},
-            {"tool_name": ""},
-        ]
-    ) == 5
+    assert (
+        builder.memory_tool_call_count(
+            [
+                {"tool_name": "openviking_search"},
+                {"tool_name": "memsearch"},
+                {"tool_name": "memread"},
+                {"tool_name": "tool_server_memsubmit"},
+                {"tool_name": "mcp__tool_server__memsearch"},
+                {"tool_name": "bash"},
+                {"tool_name": ""},
+            ]
+        )
+        == 5
+    )
 
 
 async def test_cached_epoch_zero_train_rollout_executor_does_not_reuse_later_epochs(tmp_path: Path):

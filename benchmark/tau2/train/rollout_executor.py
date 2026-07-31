@@ -79,6 +79,7 @@ def make_tau2_rollout_executor(
             direct_experience_uri=_optional_str(opts.get("direct_experience_uri")),
             first_user_cache=_bool_option(opts.get("first_user_cache"), default=True),
             first_user_cache_dir=_optional_str(opts.get("first_user_cache_dir")),
+            session_log_root=_optional_str(opts.get("session_log_root")),
         )
     loader_mode = normalize_tau2_experience_loader_mode(
         opts.get("loader_mode") or DEFAULT_TAU2_EXPERIENCE_LOADER_MODE

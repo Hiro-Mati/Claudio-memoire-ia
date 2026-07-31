@@ -16,6 +16,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal
 
+from loguru import logger as loguru_logger
+
 from benchmark.tau2.train._rollout_helpers import (
     _as_tool_input,
     _case_trial,
@@ -27,6 +29,10 @@ from benchmark.tau2.train._rollout_helpers import (
     _tau2_evaluation as _tau2_evaluation_helper,
 )
 from benchmark.tau2.train.first_user_cache import FirstUserMessageCache
+from benchmark.tau2.train.session_logging import (
+    install_session_log_routing,
+    rollout_log_session,
+)
 from openviking.message import Message, TextPart, ToolPart
 from openviking.session.train import (
     Case,
@@ -35,6 +41,7 @@ from openviking.session.train import (
     Rollout,
     RubricEvaluation,
 )
+from openviking.session.train.components.rollout_log_path import rollout_session_log_path
 from openviking.telemetry import tracer
 from openviking_cli.utils import get_logger
 
@@ -52,6 +59,7 @@ DEFAULT_TAU2_EXPERIENCE_LOADER_MODE: Tau2ExperienceLoaderMode = "skill"
 DEFAULT_TAU2_EXPERIENCE_RECALL_MODE: Tau2ExperienceRecallMode = "case_exp_rerank"
 DEFAULT_TAU2_EXPERIENCE_RERANK_TOP_N = 3
 _TAU2_CASE_SEARCH_LIMIT = 10
+_EXACT_CASE_EXPERIENCE_READ_ATTEMPTS = 2
 DEFAULT_SYSTEM_PROMPT_PROFILE: VikingBotSystemPromptProfile = "minimal"
 _EXPERIENCE_RECALL_RRF_K = 60
 _SEMANTIC_CASE_PRIOR_WEIGHT = 0.25
@@ -842,6 +850,7 @@ async def _find_exact_case_item(
             "uri": case_uri,
             "score": 1.0,
             "abstract": "",
+            "content": content,
         }
     return None
 
@@ -950,6 +959,15 @@ async def _linked_experience_scope(client: Any, case_items: list[Any]) -> list[s
     return experience_uris
 
 
+def _trace_exact_case_experience_event(event: str, case_uri: str, **fields: Any) -> None:
+    tracer.info(
+        json.dumps(
+            {"event": event, "case_uri": case_uri, **fields},
+            ensure_ascii=False,
+        )
+    )
+
+
 async def _exact_case_experience_summary(
     client: Any,
     item: Any,
@@ -965,22 +983,86 @@ async def _exact_case_experience_summary(
     }
     if not case_uri:
         return summary
-    try:
-        case_content = await client.read_content(case_uri, level="read")
-    except Exception:
+    case_content = str(item.get("content") or "") if isinstance(item, dict) else ""
+    if not case_content:
+        _trace_exact_case_experience_event(
+            "exact_case_experience_scope",
+            case_uri,
+            linked_count=0,
+            loaded_count=0,
+            outcome="missing_case_content",
+        )
         return summary
 
     experiences: list[dict[str, str]] = []
-    for exp_uri in sorted(_linked_experience_uris(case_content, source_uri=case_uri)):
-        try:
-            exp_content = str(await client.read_content(exp_uri, level="read") or "").strip()
-        except Exception:
-            exp_content = ""
+    exp_uris = sorted(_linked_experience_uris(case_content, source_uri=case_uri))
+    if not exp_uris:
+        _trace_exact_case_experience_event(
+            "exact_case_experience_scope",
+            case_uri,
+            linked_count=0,
+            loaded_count=0,
+            outcome="no_links",
+        )
+    for exp_uri in exp_uris:
+        exp_content = await _read_exact_case_experience_content(
+            client,
+            case_uri=case_uri,
+            experience_uri=exp_uri,
+        )
         if not exp_content:
             continue
         experiences.append({"uri": exp_uri, "content": exp_content})
     summary["experiences"] = experiences
+    if len(experiences) != len(exp_uris):
+        _trace_exact_case_experience_event(
+            "exact_case_experience_scope",
+            case_uri,
+            linked_count=len(exp_uris),
+            loaded_count=len(experiences),
+            outcome="partial",
+        )
     return summary
+
+
+async def _read_exact_case_experience_content(
+    client: Any,
+    *,
+    case_uri: str,
+    experience_uri: str,
+) -> str:
+    for attempt in range(1, _EXACT_CASE_EXPERIENCE_READ_ATTEMPTS + 1):
+        try:
+            content = str(await client.read_content(experience_uri, level="read") or "").strip()
+        except Exception as exc:
+            _trace_exact_case_experience_event(
+                "exact_case_experience_read",
+                case_uri,
+                experience_uri=experience_uri,
+                attempt=attempt,
+                outcome="exception",
+                error_type=type(exc).__name__,
+            )
+            content = ""
+        if content:
+            if attempt > 1:
+                _trace_exact_case_experience_event(
+                    "exact_case_experience_read",
+                    case_uri,
+                    experience_uri=experience_uri,
+                    attempts=attempt,
+                    outcome="retry_success",
+                )
+            return content
+
+    _trace_exact_case_experience_event(
+        "exact_case_experience_read",
+        case_uri,
+        experience_uri=experience_uri,
+        attempts=_EXACT_CASE_EXPERIENCE_READ_ATTEMPTS,
+        outcome="empty",
+    )
+    return ""
 
 
 def _linked_experience_uris(content: str, *, source_uri: str) -> list[str]:
@@ -1118,6 +1200,7 @@ class VikingBotTau2RolloutExecutor:
     direct_experience_uri: str | None = None
     first_user_cache: bool = True
     first_user_cache_dir: str | None = None
+    session_log_root: str | None = None
 
     def __post_init__(self) -> None:
         if self.rollout_language not in {"default", "zh"}:
@@ -1156,7 +1239,41 @@ class VikingBotTau2RolloutExecutor:
         return list(await asyncio.gather(*(run_one(case) for case in cases)))
 
     async def _execute_one(self, case: Case, context: ExecutionContext) -> Rollout:
-        return await self._execute_one_async(case, context)
+        log_path = rollout_session_log_path(
+            self.session_log_root,
+            case_name=case.name,
+            metadata=context.metadata,
+        )
+        if log_path is None:
+            return await self._execute_one_async(case, context)
+
+        install_session_log_routing(logger)
+        with rollout_log_session(log_path) as active_log_path:
+            if active_log_path is None:
+                return await self._execute_one_async(case, context)
+            loguru_logger.info(
+                "tau2 vikingbot rollout start case={} stage={} epoch={} log_path={}",
+                case.name,
+                context.metadata.get("rollout_stage") or context.metadata.get("stage"),
+                context.metadata.get("epoch", 0),
+                active_log_path,
+            )
+            try:
+                rollout = await self._execute_one_async(case, context)
+            except Exception:
+                loguru_logger.exception(
+                    "tau2 vikingbot rollout failure case={} log_path={}",
+                    case.name,
+                    active_log_path,
+                )
+                raise
+            rollout.metadata["vikingbot_log_path"] = active_log_path
+            loguru_logger.info(
+                "tau2 vikingbot rollout success case={} log_path={}",
+                case.name,
+                active_log_path,
+            )
+            return rollout
 
     async def _execute_one_async(self, case: Case, context: ExecutionContext) -> Rollout:
         domain = str(case.input["domain"])

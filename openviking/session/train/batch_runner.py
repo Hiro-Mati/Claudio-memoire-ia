@@ -859,6 +859,8 @@ def _build_pipeline(
         "loader_mode": config.loader_mode,
         "max_iterations": config.max_iterations,
     }
+    if config.dataset == "tau2":
+        rollout_options["session_log_root"] = str(_run_output_dir(config) / "vikingbot_logs")
     if config.loader_mode == "direct_experience":
         rollout_options.update(
             {

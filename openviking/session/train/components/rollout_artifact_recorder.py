@@ -631,7 +631,7 @@ def _stage_from_execution_metadata(metadata: dict[str, Any]) -> str:
 
 def _status_payload(record: _RolloutRecord) -> dict[str, Any]:
     rollout = record.rollout
-    return {
+    payload = {
         "stage": record.stage,
         "epoch": record.epoch,
         "rollout_name": _rollout_name(record),
@@ -657,6 +657,9 @@ def _status_payload(record: _RolloutRecord) -> dict[str, Any]:
         ),
         "archive_uri": record.commit_result.get("archive_uri") if record.commit_result else None,
     }
+    if log_path := _vikingbot_log_path(rollout):
+        payload["vikingbot_log_path"] = log_path
+    return payload
 
 
 def _rollout_payload(record: _RolloutRecord) -> dict[str, Any]:
@@ -670,7 +673,7 @@ def _rollout_payload(record: _RolloutRecord) -> dict[str, Any]:
 
 
 def _rollout_index(record: _RolloutRecord, rollout_dir: Path) -> dict[str, Any]:
-    return {
+    payload = {
         "rollout_name": _rollout_name(record),
         "stage": record.stage,
         "epoch": record.epoch,
@@ -685,6 +688,16 @@ def _rollout_index(record: _RolloutRecord, rollout_dir: Path) -> dict[str, Any]:
             record.commit_result.get("task_status") if record.commit_result else None
         ),
     }
+    if log_path := _vikingbot_log_path(record.rollout):
+        payload["vikingbot_log_path"] = log_path
+    return payload
+
+
+def _vikingbot_log_path(rollout: Rollout) -> str | None:
+    value = rollout.metadata.get("vikingbot_log_path")
+    if value is None or not str(value).strip():
+        return None
+    return str(value)
 
 
 def _tool_calls(rollout: Rollout) -> list[dict[str, Any]]:
