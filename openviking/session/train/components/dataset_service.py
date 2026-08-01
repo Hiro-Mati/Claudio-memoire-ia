@@ -345,12 +345,26 @@ def create_dataset_service_app(
         if rollout_thread_workers is not None
         else None
     )
+    # Hosted worker loops need a separate shared executor for asyncio.to_thread().
+    # Per-loop defaults multiply the thread count, while reusing the outer pool can
+    # deadlock when every outer worker is occupied by a rollout awaiting inner work.
+    app.state.rollout_inner_thread_pool = (
+        ThreadPoolExecutor(
+            max_workers=rollout_thread_workers,
+            thread_name_prefix=f"{service_name}-rollout-inner",
+        )
+        if rollout_thread_workers is not None
+        else None
+    )
 
     @app.on_event("shutdown")
     async def shutdown_rollout_thread_pool() -> None:
-        pool = app.state.rollout_thread_pool
-        if pool is not None:
-            pool.shutdown(wait=False, cancel_futures=True)
+        for pool in (
+            app.state.rollout_thread_pool,
+            app.state.rollout_inner_thread_pool,
+        ):
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -471,6 +485,7 @@ def _execute_rollout_request_in_thread(
     loop = getattr(_rollout_worker_state, "loop", None)
     if loop is None or loop.is_closed():
         loop = asyncio.new_event_loop()
+        loop.set_default_executor(app.state.rollout_inner_thread_pool)
         _rollout_worker_state.loop = loop
         asyncio.set_event_loop(loop)
     # Keep the worker-thread event loop alive across rollout executions.  Some
