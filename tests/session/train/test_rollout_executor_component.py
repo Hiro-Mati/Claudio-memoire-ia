@@ -638,6 +638,12 @@ def test_tau2_gym_env_bounds_wait_for_missing_initial_observation(monkeypatch):
         env.reset(seed=1234)
 
 
+def test_tau2_gym_env_allows_slow_initial_observation_startup() -> None:
+    import benchmark.tau2.common.tau2_env.tau2_environment as tau2_environment
+
+    assert tau2_environment._GYM_INITIAL_OBSERVATION_TIMEOUT_SECONDS == 120.0
+
+
 def test_tau2_fixed_first_user_simulator_uses_fixture_only_for_first_turn(monkeypatch):
     from tau2.data_model.message import AssistantMessage, UserMessage
     from tau2.user.user_simulator import UserSimulator

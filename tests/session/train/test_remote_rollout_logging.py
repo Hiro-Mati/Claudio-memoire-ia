@@ -19,7 +19,7 @@ async def test_failed_remote_rollout_retains_deterministic_vikingbot_log_path(
 
     monkeypatch.setattr(
         RemoteRolloutExecutor,
-        "_execute_with_handshake_retry",
+        "_execute_with_retry",
         fail_execution,
     )
     executor = RemoteRolloutExecutor(

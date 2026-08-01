@@ -93,3 +93,31 @@ def test_rollout_log_session_close_failure_does_not_fail_rollout(
 
     with rollout_log_session(tmp_path / "session.log") as active_path:
         assert active_path is not None
+
+
+def test_rollout_log_session_flushes_on_close_instead_of_every_record(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class RecordingStream:
+        def __init__(self) -> None:
+            self.flush_count = 0
+
+        def write(self, message: str) -> int:
+            return len(message)
+
+        def flush(self) -> None:
+            self.flush_count += 1
+
+        def close(self) -> None:
+            return None
+
+    stream = RecordingStream()
+    monkeypatch.setattr(Path, "open", lambda self, *args, **kwargs: stream)
+    install_session_log_routing()
+
+    with rollout_log_session(tmp_path / "session.log"):
+        loguru_logger.info("buffer this record")
+        assert stream.flush_count == 0
+
+    assert stream.flush_count == 1

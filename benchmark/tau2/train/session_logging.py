@@ -71,7 +71,6 @@ class _SessionLogRouter:
                 opened.stream.write(message)
                 if message and not message.endswith("\n"):
                     opened.stream.write("\n")
-                opened.stream.flush()
             except OSError as exc:
                 _report_router_error(path, exc)
 

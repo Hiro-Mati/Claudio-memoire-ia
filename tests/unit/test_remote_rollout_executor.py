@@ -292,7 +292,9 @@ def test_remote_rollout_executor_retries_confirmed_main_agent_handshake_failure(
         nonlocal post_count
         if request.method == "POST" and request.url.path == "/v1/rollouts/execute":
             post_count += 1
-            return httpx.Response(200, json={"execution_id": f"exec-{post_count}", "status": "running"})
+            return httpx.Response(
+                200, json={"execution_id": f"exec-{post_count}", "status": "running"}
+            )
         if request.method == "GET" and request.url.path.endswith("exec-1"):
             return httpx.Response(
                 200,
@@ -337,6 +339,79 @@ def test_remote_rollout_executor_retries_confirmed_main_agent_handshake_failure(
     assert rollouts[0].case.name == "case-1"
 
 
+def test_remote_rollout_executor_retries_tau2_initial_observation_timeout(monkeypatch):
+    post_count = 0
+
+    def completed_rollout(execution_id: str) -> dict:
+        return {
+            "execution_id": execution_id,
+            "status": "completed",
+            "rollout": {
+                "case": {
+                    "name": "case-1",
+                    "task_signature": "booking_duplicate",
+                    "input": {"user_request": "cancel duplicate booking"},
+                    "rubric": {
+                        "name": "booking_rubric",
+                        "description": "Cancel only the verified duplicate booking.",
+                        "criteria": [],
+                        "metadata": {},
+                    },
+                    "metadata": {},
+                },
+                "messages": [],
+                "policy_snapshot_id": "snapshot-1",
+                "evaluation": None,
+                "metadata": {},
+            },
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_count
+        if request.method == "POST" and request.url.path == "/v1/rollouts/execute":
+            post_count += 1
+            return httpx.Response(200, json={"execution_id": f"exec-{post_count}"})
+        if request.method == "GET" and request.url.path.endswith("exec-1"):
+            return httpx.Response(
+                200,
+                json={
+                    "execution_id": "exec-1",
+                    "status": "failed",
+                    "error": "Tau2 AgentGymEnv timed out waiting for its initial observation",
+                },
+            )
+        if request.method == "GET" and request.url.path.endswith("exec-2"):
+            return httpx.Response(200, json=completed_rollout("exec-2"))
+        return httpx.Response(500, json={"error": "unexpected request"})
+
+    original_async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: original_async_client(
+            transport=httpx.MockTransport(handler),
+            base_url=kwargs.get("base_url"),
+            timeout=kwargs.get("timeout"),
+        ),
+    )
+
+    executor = RemoteRolloutExecutor(
+        service_url="http://rollout-service",
+        poll_interval_seconds=0.01,
+    )
+    rollouts = asyncio.run(
+        executor.execute(
+            [_case()],
+            _policy_set(),
+            ExecutionContext(policy_snapshot_id="snapshot-1"),
+        )
+    )
+
+    assert post_count == 2
+    assert len(rollouts) == 1
+    assert rollouts[0].case.name == "case-1"
+
+
 def test_remote_rollout_executor_bounds_a_stalled_execution(monkeypatch):
     async def stalled_execute(self, *args, **kwargs):
         await asyncio.sleep(60)
@@ -347,9 +422,7 @@ def test_remote_rollout_executor_bounds_a_stalled_execution(monkeypatch):
         execution_timeout_seconds=0.01,
         continue_on_rollout_failure=True,
     )
-    monkeypatch.setattr(
-        RemoteRolloutExecutor, "_execute_with_handshake_retry", stalled_execute
-    )
+    monkeypatch.setattr(RemoteRolloutExecutor, "_execute_with_retry", stalled_execute)
 
     rollouts = asyncio.run(
         executor.execute(
