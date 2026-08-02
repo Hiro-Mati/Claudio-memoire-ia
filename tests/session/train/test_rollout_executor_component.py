@@ -870,8 +870,12 @@ def test_tau2_case_exp_rerank_trace_records_scope_counts(monkeypatch):
 
     import benchmark.tau2.train.rollout_executor_vikingbot as module
 
-    messages = []
-    monkeypatch.setattr(module.tracer, "info", messages.append)
+    trace_calls = []
+    monkeypatch.setattr(
+        module.tracer,
+        "info",
+        lambda message, console=False: trace_calls.append((message, console)),
+    )
 
     module._trace_experience_recall(
         match_type="case_exp_rerank",
@@ -889,7 +893,9 @@ def test_tau2_case_exp_rerank_trace_records_scope_counts(monkeypatch):
         scoped_experience_count=5,
     )
 
-    assert json.loads(messages[0]) == {
+    message, console = trace_calls[0]
+    assert console is True
+    assert json.loads(message) == {
         "event": "experience_recall",
         "match_type": "case_exp_rerank",
         "candidate_count": 1,
@@ -897,6 +903,34 @@ def test_tau2_case_exp_rerank_trace_records_scope_counts(monkeypatch):
         "exact_case_found": False,
         "selected_case_count": 2,
         "scoped_experience_count": 5,
+    }
+
+
+def test_tau2_openviking_search_trace_records_server_trace_id(monkeypatch):
+    import json
+
+    import benchmark.tau2.train.rollout_executor_vikingbot as module
+
+    trace_calls = []
+    monkeypatch.setattr(
+        module.tracer,
+        "info",
+        lambda message, console=False: trace_calls.append((message, console)),
+    )
+
+    module._trace_openviking_search(
+        recall_stage="case_search",
+        target_uri="viking://user/u/memories/cases",
+        result={"server_trace_id": "1" * 32},
+    )
+
+    message, console = trace_calls[0]
+    assert console is True
+    assert json.loads(message) == {
+        "event": "openviking_search_trace",
+        "recall_stage": "case_search",
+        "server_trace_id": "1" * 32,
+        "target_uri": "viking://user/u/memories/cases",
     }
 
 
@@ -1268,14 +1302,18 @@ async def test_tau2_search_experience_case_exp_rerank_reranks_all_linked_experie
         ):
             self.search_calls.append((query, target_uri, limit, score_threshold, filter))
             if target_uri == cases_uri:
-                return {"memories": [{"uri": case_a_uri}, {"uri": case_b_uri}]}
+                return {
+                    "memories": [{"uri": case_a_uri}, {"uri": case_b_uri}],
+                    "server_trace_id": "1" * 32,
+                }
             assert target_uri == "viking://user/u/memories/experiences"
             return {
                 "memories": [
                     {"uri": exp_b_uri},
                     {"uri": exp_a_uri},
                     {"uri": exp_shared_uri},
-                ]
+                ],
+                "server_trace_id": "2" * 32,
             }
 
         async def read_content(self, uri, level="read"):
@@ -1306,7 +1344,15 @@ async def test_tau2_search_experience_case_exp_rerank_reranks_all_linked_experie
         async def close(self):
             return None
 
+    import benchmark.tau2.train.rollout_executor_vikingbot as module
+
+    trace_messages = []
     monkeypatch.setattr(ov_server, "VikingClient", FakeClient)
+    monkeypatch.setattr(
+        module.tracer,
+        "info",
+        lambda message, console=False: trace_messages.append(message),
+    )
     tool = _make_search_experience_tool(
         experience_recall_mode="case_exp_rerank",
         experience_rerank_top_n=2,
@@ -1343,6 +1389,25 @@ async def test_tau2_search_experience_case_exp_rerank_reranks_all_linked_experie
         ],
     }
     assert exp_shared_uri not in FakeClient.read_uris
+    search_trace_events = [
+        event
+        for message in trace_messages
+        if (event := json.loads(message)).get("event") == "openviking_search_trace"
+    ]
+    assert search_trace_events == [
+        {
+            "event": "openviking_search_trace",
+            "recall_stage": "case_search",
+            "server_trace_id": "1" * 32,
+            "target_uri": cases_uri,
+        },
+        {
+            "event": "openviking_search_trace",
+            "recall_stage": "experience_search",
+            "server_trace_id": "2" * 32,
+            "target_uri": "viking://user/u/memories/experiences",
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -1524,7 +1589,11 @@ async def test_tau2_search_experience_exact_case_traces_persistent_empty_experie
             return None
 
     monkeypatch.setattr(ov_server, "VikingClient", FakeClient)
-    monkeypatch.setattr(module.tracer, "info", trace_messages.append)
+    monkeypatch.setattr(
+        module.tracer,
+        "info",
+        lambda message, console=False: trace_messages.append(message),
+    )
     tool = module._make_search_experience_tool(
         case_lookup=_tau2_exact_case_lookup(),
         experience_recall_mode="case_exp_rerank",
@@ -1836,7 +1905,9 @@ async def test_tau2_search_experience_hybrid_ann_exact_case_boosts_linked_experi
     monkeypatch.setattr(
         module,
         "tracer",
-        SimpleNamespace(info=lambda message: trace_messages.append(json.loads(message))),
+        SimpleNamespace(
+            info=lambda message, console=False: trace_messages.append(json.loads(message))
+        ),
         raising=False,
     )
 
@@ -1954,7 +2025,7 @@ async def test_tau2_search_experience_returns_exact_case_without_semantic_search
     monkeypatch.setattr(
         module,
         "tracer",
-        SimpleNamespace(info=lambda message: trace_messages.append(message)),
+        SimpleNamespace(info=lambda message, console=False: trace_messages.append(message)),
         raising=False,
     )
 

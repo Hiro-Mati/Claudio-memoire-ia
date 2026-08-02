@@ -404,6 +404,11 @@ def _make_search_experience_tool(
                         limit=_TAU2_CASE_SEARCH_LIMIT,
                         score_threshold=0.0,
                     )
+                    _trace_openviking_search(
+                        recall_stage="case_search",
+                        target_uri=cases_uri,
+                        result=result,
+                    )
                     memories = result.get("memories", []) if isinstance(result, dict) else []
                     selected_cases = memories[:normalized_limit]
 
@@ -439,6 +444,11 @@ def _make_search_experience_tool(
                             "field": "uri",
                             "conds": experience_uris,
                         },
+                    )
+                    _trace_openviking_search(
+                        recall_stage="experience_search",
+                        target_uri=experiences_uri,
+                        result=experience_result,
                     )
                     experience_memories = (
                         experience_result.get("memories", [])
@@ -751,7 +761,32 @@ def _trace_experience_recall(
         payload["selected_case_count"] = selected_case_count
     if scoped_experience_count is not None:
         payload["scoped_experience_count"] = scoped_experience_count
-    tracer.info(json.dumps(payload, ensure_ascii=False))
+    tracer.info(json.dumps(payload, ensure_ascii=False), console=True)
+
+
+def _trace_openviking_search(
+    *,
+    recall_stage: str,
+    target_uri: str,
+    result: Any,
+) -> None:
+    if not isinstance(result, dict):
+        return
+    server_trace_id = str(result.get("server_trace_id") or "").strip()
+    if not server_trace_id:
+        return
+    tracer.info(
+        json.dumps(
+            {
+                "event": "openviking_search_trace",
+                "recall_stage": recall_stage,
+                "server_trace_id": server_trace_id,
+                "target_uri": target_uri,
+            },
+            ensure_ascii=False,
+        ),
+        console=True,
+    )
 
 
 def _make_read_experience_tool():

@@ -4,6 +4,7 @@
 """Tests for search endpoints: find, search, grep, glob."""
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -53,6 +54,34 @@ async def test_find_basic(client_with_resource):
     assert body["result"] is not None
     assert "usage" not in body
     assert "telemetry" not in body
+
+
+async def test_search_includes_active_server_trace_id(
+    client: httpx.AsyncClient,
+    service,
+    monkeypatch,
+):
+    import openviking.server.routers.search as search_router
+
+    async def fake_search(**kwargs):
+        del kwargs
+        return {"memories": [], "resources": [], "skills": [], "total": 0}
+
+    monkeypatch.setattr(service.search, "search", fake_search)
+    monkeypatch.setattr(
+        search_router,
+        "tracer",
+        SimpleNamespace(get_trace_id=lambda: "1" * 32),
+        raising=False,
+    )
+
+    resp = await client.post(
+        "/api/v1/search/search",
+        json={"query": "sample"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["result"]["server_trace_id"] == "1" * 32
 
 
 @pytest.mark.parametrize("endpoint", ["/api/v1/search/find", "/api/v1/search/search"])

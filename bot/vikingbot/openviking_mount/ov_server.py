@@ -712,7 +712,7 @@ class VikingClient:
         memories = self._matched_context_group_to_dicts(result, "memories")
         resources = self._matched_context_group_to_dicts(result, "resources")
         skills = self._matched_context_group_to_dicts(result, "skills")
-        return {
+        normalized_result = {
             "memories": memories,
             "resources": resources,
             "skills": skills,
@@ -720,6 +720,11 @@ class VikingClient:
             "query": query,
             "target_uri": target_uri,
         }
+        if isinstance(result, dict):
+            server_trace_id = str(result.get("server_trace_id") or "").strip()
+            if server_trace_id:
+                normalized_result["server_trace_id"] = server_trace_id
+        return normalized_result
 
     async def search_user_memory(self, query: str, user_id: str) -> list[Any]:
         effective_user_id = self._effective_user_id(user_id)

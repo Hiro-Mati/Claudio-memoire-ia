@@ -16,7 +16,7 @@ from openviking.server.error_mapping import map_exception
 from openviking.server.identity import RequestContext
 from openviking.server.models import Response
 from openviking.server.telemetry import run_operation
-from openviking.telemetry import TelemetryRequest
+from openviking.telemetry import TelemetryRequest, tracer
 from openviking.utils.search_filters import (
     SearchContextTypeInput,
     _resolve_levels,
@@ -185,6 +185,9 @@ async def find(
     result = execution.result
     if hasattr(result, "to_dict"):
         result = result.to_dict(include_provenance=request.include_provenance)
+    server_trace_id = tracer.get_trace_id()
+    if server_trace_id and isinstance(result, dict):
+        result["server_trace_id"] = server_trace_id
     result = _sanitize_floats(result)
     return Response(
         status="ok",
@@ -235,6 +238,9 @@ async def search(
     result = execution.result
     if hasattr(result, "to_dict"):
         result = result.to_dict(include_provenance=request.include_provenance)
+    server_trace_id = tracer.get_trace_id()
+    if server_trace_id and isinstance(result, dict):
+        result["server_trace_id"] = server_trace_id
     result = _sanitize_floats(result)
     return Response(
         status="ok",

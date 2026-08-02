@@ -248,6 +248,7 @@ async def test_viking_client_search_preserves_serialized_group_results(monkeypat
                 }
             ],
             "total": 3,
+            "server_trace_id": "1" * 32,
         }
 
     monkeypatch.setattr(client.client, "search", _search)
@@ -257,6 +258,7 @@ async def test_viking_client_search_preserves_serialized_group_results(monkeypat
     assert result["total"] == 3
     assert result["query"] == "解释信"
     assert result["target_uri"] == ""
+    assert result["server_trace_id"] == "1" * 32
     assert [item["uri"] for item in result["memories"]] == [
         "viking://user/default/memories/profile.md"
     ]

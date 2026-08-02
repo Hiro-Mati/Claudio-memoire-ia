@@ -12,6 +12,7 @@ import heapq
 import logging
 import math
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,7 +24,7 @@ from openviking.retrieve.retrieval_stats import get_stats_collector
 from openviking.server.identity import RequestContext
 from openviking.storage import VikingDBManager, VikingDBManagerProxy
 from openviking.storage.expr import FilterExpr
-from openviking.telemetry import get_current_telemetry
+from openviking.telemetry import get_current_telemetry, start_current_span, tracer
 from openviking.utils.time_utils import parse_iso_datetime
 from openviking_cli.retrieve.types import (
     ContextType,
@@ -35,6 +36,13 @@ from openviking_cli.utils.config import RerankConfig, RetrievalConfig
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass(slots=True)
+class _RerankDiagnostics:
+    attempted: int = 0
+    succeeded: int = 0
+    fallback: int = 0
 
 
 class RetrieverMode(str):
@@ -116,6 +124,7 @@ class HierarchicalRetriever:
         effective_threshold = self._resolve_threshold(score_threshold)
         if mode is None:
             mode = RetrieverMode.QUICK if not self._rerank_client else RetrieverMode.THINKING
+        rerank_diagnostics = _RerankDiagnostics()
 
         # 创建 proxy 包装器，绑定当前 ctx
         vector_proxy = VikingDBManagerProxy(self.vector_store, ctx)
@@ -230,6 +239,8 @@ class HierarchicalRetriever:
                     query.query,
                     [str(r.get("abstract", "")) for r in global_results],
                     directory_scores,
+                    stage="global_candidates",
+                    diagnostics=rerank_diagnostics,
                 )
 
             starting_points = []
@@ -273,9 +284,12 @@ class HierarchicalRetriever:
                     scope_dsl=scope_dsl,
                     initial_candidates=initial_candidates,
                     level=level,
+                    rerank_diagnostics=rerank_diagnostics,
                 )
             apply_hotness = True
-            rerank_used = self._rerank_client is not None and mode == RetrieverMode.THINKING
+
+        rerank_used = rerank_diagnostics.succeeded > 0
+        rerank_fallback = rerank_diagnostics.fallback > 0
 
         # Step 6: Convert results
         matched = await self._convert_to_matched_contexts(
@@ -292,6 +306,7 @@ class HierarchicalRetriever:
             scores=[m.score for m in final],
             latency_ms=elapsed_ms,
             rerank_used=rerank_used,
+            rerank_fallback=rerank_fallback,
         )
 
         return QueryResult(
@@ -323,29 +338,64 @@ class HierarchicalRetriever:
         query: str,
         documents: List[str],
         fallback_scores: List[float],
+        *,
+        stage: str,
+        diagnostics: _RerankDiagnostics,
     ) -> List[float]:
         """Return rerank scores or fall back to vector scores."""
         if not self._rerank_client or not documents:
             return fallback_scores
 
-        try:
-            scores = self._rerank_client.rerank_batch(query, documents)
-        except Exception as e:
-            logger.warning(
-                "[HierarchicalRetriever] Rerank failed, fallback to vector scores: %s", e
-            )
-            return fallback_scores
+        diagnostics.attempted += 1
+        provider = getattr(self._rerank_client, "provider", None)
+        if not provider and self.rerank_config is not None:
+            provider = self.rerank_config._effective_provider()
+        provider = str(provider or type(self._rerank_client).__name__)
+        started = time.monotonic()
 
-        if not scores or len(scores) != len(documents):
-            logger.warning(
-                "[HierarchicalRetriever] Invalid rerank result, fallback to vector scores"
-            )
-            return fallback_scores
+        with start_current_span(f"search.rerank.{stage}"):
+            tracer.set("rerank.provider", provider)
+            tracer.set("rerank.stage", stage)
+            tracer.set("rerank.candidate_count", len(documents))
+            tracer.set("rerank.attempted", True)
+            try:
+                scores = self._rerank_client.rerank_batch(query, documents)
+            except Exception as exc:
+                diagnostics.fallback += 1
+                tracer.set("rerank.duration_ms", round((time.monotonic() - started) * 1000, 3))
+                tracer.set("rerank.returned_count", 0)
+                tracer.set("rerank.outcome", "fallback")
+                tracer.set("rerank.error_type", type(exc).__name__)
+                tracer.set("rerank.error_message", str(exc)[:500])
+                tracer.error("rerank provider failed", e=exc, console=False)
+                logger.warning(
+                    "[HierarchicalRetriever] Rerank failed, fallback to vector scores: %s", exc
+                )
+                return fallback_scores
 
-        normalized_scores: List[float] = []
-        for score, fallback in zip(scores, fallback_scores, strict=True):
-            normalized_scores.append(self._finite_score(score, fallback))
-        return normalized_scores
+            tracer.set("rerank.duration_ms", round((time.monotonic() - started) * 1000, 3))
+            returned_count = len(scores) if scores is not None else 0
+            tracer.set("rerank.returned_count", returned_count)
+            if not scores or returned_count != len(documents):
+                diagnostics.fallback += 1
+                tracer.set("rerank.outcome", "fallback")
+                tracer.set("rerank.error_type", "InvalidRerankResult")
+                tracer.set(
+                    "rerank.error_message",
+                    f"expected {len(documents)} scores, received {returned_count}",
+                )
+                tracer.error("invalid rerank result", console=False)
+                logger.warning(
+                    "[HierarchicalRetriever] Invalid rerank result, fallback to vector scores"
+                )
+                return fallback_scores
+
+            diagnostics.succeeded += 1
+            tracer.set("rerank.outcome", "success")
+            normalized_scores: List[float] = []
+            for score, fallback in zip(scores, fallback_scores, strict=True):
+                normalized_scores.append(self._finite_score(score, fallback))
+            return normalized_scores
 
     async def _recursive_search(
         self,
@@ -363,6 +413,7 @@ class HierarchicalRetriever:
         scope_dsl: Optional[FilterExpr | Dict[str, Any]] = None,
         initial_candidates: Optional[List[Dict[str, Any]]] = None,
         level: Optional[List[int]] = None,
+        rerank_diagnostics: Optional[_RerankDiagnostics] = None,
     ) -> List[Dict[str, Any]]:
         """
         Recursive search with directory priority return and score propagation.
@@ -374,6 +425,7 @@ class HierarchicalRetriever:
             scope_dsl: Additional scope constraints from public find/search filter
         """
         effective_threshold = self._resolve_threshold(threshold)
+        rerank_diagnostics = rerank_diagnostics or _RerankDiagnostics()
 
         sparse_query_vector = sparse_query_vector or None
 
@@ -453,7 +505,13 @@ class HierarchicalRetriever:
                 query_scores = [self._finite_score(r.get("_score", 0.0)) for r in results]
                 if self._rerank_client and mode == RetrieverMode.THINKING:
                     documents = [str(r.get("abstract", "")) for r in results]
-                    query_scores = self._rerank_scores(query, documents, query_scores)
+                    query_scores = self._rerank_scores(
+                        query,
+                        documents,
+                        query_scores,
+                        stage="child_candidates",
+                        diagnostics=rerank_diagnostics,
+                    )
 
                 for r, score in zip(results, query_scores, strict=True):
                     uri = r.get("uri", "")

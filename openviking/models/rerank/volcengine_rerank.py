@@ -18,6 +18,7 @@ from volcengine.base.Request import Request
 from volcengine.Credentials import Credentials
 
 from openviking.models.rerank.base import RerankBase
+from openviking.telemetry.tracer import record_exception
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
@@ -185,6 +186,7 @@ class RerankClient(RerankBase):
             return scores
 
         except Exception as e:
+            record_exception(e)
             logger.error(f"[RerankClient] Rerank failed: {e}")
             return None
 

@@ -3,6 +3,9 @@
 
 """Hierarchical retriever rerank behavior tests."""
 
+from contextlib import contextmanager
+from types import SimpleNamespace
+
 import pytest
 
 from openviking.retrieve.hierarchical_retriever import HierarchicalRetriever, RetrieverMode
@@ -236,6 +239,8 @@ def test_retriever_initializes_rerank_client(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_retrieve_uses_rerank_scores_in_thinking_mode(monkeypatch):
+    import openviking.retrieve.hierarchical_retriever as module
+
     fake_client = FakeRerankClient([0.95, 0.05, 0.11, 0.95])
     monkeypatch.setattr(
         "openviking.retrieve.hierarchical_retriever.RerankClient.from_config",
@@ -249,6 +254,25 @@ async def test_retrieve_uses_rerank_scores_in_thinking_mode(monkeypatch):
         rerank_config=_config(),
     )
 
+    span_names = []
+    attributes = []
+
+    @contextmanager
+    def fake_start_current_span(name):
+        span_names.append(name)
+        yield object()
+
+    monkeypatch.setattr(module, "start_current_span", fake_start_current_span, raising=False)
+    monkeypatch.setattr(
+        module,
+        "tracer",
+        SimpleNamespace(
+            set=lambda key, value: attributes.append((key, value)),
+            error=lambda message, **kwargs: None,
+        ),
+        raising=False,
+    )
+
     result = await retriever.retrieve(_query(), ctx=_ctx(), limit=2, mode=RetrieverMode.THINKING)
 
     assert [ctx.uri for ctx in result.matched_contexts] == [
@@ -258,10 +282,21 @@ async def test_retrieve_uses_rerank_scores_in_thinking_mode(monkeypatch):
     assert fake_client.calls[0] == ("hello", ["root A", "root B"])
     assert fake_client.calls[1] == ("hello", ["child A", "child B"])
     assert storage.search_calls[0]["level"] == [0, 1]
+    assert span_names == [
+        "search.rerank.global_candidates",
+        "search.rerank.child_candidates",
+    ]
+    assert ("rerank.provider", "vikingdb") in attributes
+    assert ("rerank.stage", "global_candidates") in attributes
+    assert ("rerank.candidate_count", 2) in attributes
+    assert ("rerank.returned_count", 2) in attributes
+    assert ("rerank.outcome", "success") in attributes
 
 
 @pytest.mark.asyncio
 async def test_retrieve_falls_back_to_vector_scores_when_rerank_returns_none(monkeypatch):
+    import openviking.retrieve.hierarchical_retriever as module
+
     class NoneRerankClient(FakeRerankClient):
         def rerank_batch(self, query: str, documents: list[str]):
             self.calls.append((query, list(documents)))
@@ -279,6 +314,24 @@ async def test_retrieve_falls_back_to_vector_scores_when_rerank_returns_none(mon
         rerank_config=_config(),
     )
 
+    stats_calls = []
+    trace_errors = []
+
+    class FakeStatsCollector:
+        def record_query(self, **kwargs):
+            stats_calls.append(kwargs)
+
+    monkeypatch.setattr(module, "get_stats_collector", lambda: FakeStatsCollector())
+    monkeypatch.setattr(
+        module,
+        "tracer",
+        SimpleNamespace(
+            set=lambda key, value: None,
+            error=lambda message, **kwargs: trace_errors.append((message, kwargs)),
+        ),
+        raising=False,
+    )
+
     result = await retriever.retrieve(_query(), ctx=_ctx(), limit=2, mode=RetrieverMode.THINKING)
 
     assert [ctx.uri for ctx in result.matched_contexts] == [
@@ -286,6 +339,9 @@ async def test_retrieve_falls_back_to_vector_scores_when_rerank_returns_none(mon
         "viking://resources/file-a",
     ]
     assert fake_client.calls
+    assert stats_calls[-1]["rerank_used"] is False
+    assert stats_calls[-1]["rerank_fallback"] is True
+    assert trace_errors
 
 
 @pytest.mark.asyncio
