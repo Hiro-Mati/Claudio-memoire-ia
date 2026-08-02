@@ -10,7 +10,7 @@ import posixpath
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
@@ -263,8 +263,10 @@ def _make_search_experience_tool(
     *,
     experience_recall_mode: Tau2ExperienceRecallMode = DEFAULT_TAU2_EXPERIENCE_RECALL_MODE,
     experience_rerank_top_n: int = DEFAULT_TAU2_EXPERIENCE_RERANK_TOP_N,
+    client: Any | None = None,
 ):
     Tool = _vikingbot_imports()["Tool"]
+    injected_client = client
     recall_mode = normalize_tau2_experience_recall_mode(experience_recall_mode)
     normalized_experience_top_n = int(experience_rerank_top_n)
     if normalized_experience_top_n <= 0:
@@ -328,11 +330,13 @@ def _make_search_experience_tool(
             **kwargs: Any,
         ) -> str:
             del tool_context, kwargs
-            client = None
+            client = injected_client
+            owns_client = client is None
             try:
-                from vikingbot.openviking_mount.ov_server import VikingClient
+                if owns_client:
+                    from vikingbot.openviking_mount.ov_server import VikingClient
 
-                client = await VikingClient.create()
+                    client = await VikingClient.create()
                 cases_uri = _current_cases_uri(client)
                 experiences_uri = _current_experiences_uri(client)
                 normalized_limit = min(10, max(1, int(limit)))
@@ -607,7 +611,7 @@ def _make_search_experience_tool(
                 logger.warning("search_experience failed: %s", exc)
                 return f"Error searching experience candidates: {exc}"
             finally:
-                if client is not None:
+                if owns_client and client is not None:
                     await client.close()
 
     return SearchExperienceTool()
@@ -789,8 +793,9 @@ def _trace_openviking_search(
     )
 
 
-def _make_read_experience_tool():
+def _make_read_experience_tool(*, client: Any | None = None):
     Tool = _vikingbot_imports()["Tool"]
+    injected_client = client
 
     class ReadExperienceTool(Tool):
         @property
@@ -816,11 +821,13 @@ def _make_read_experience_tool():
 
         async def execute(self, tool_context: Any, experience_uri: str, **kwargs: Any) -> str:
             del tool_context, kwargs
-            client = None
+            client = injected_client
+            owns_client = client is None
             try:
-                from vikingbot.openviking_mount.ov_server import VikingClient
+                if owns_client:
+                    from vikingbot.openviking_mount.ov_server import VikingClient
 
-                client = await VikingClient.create()
+                    client = await VikingClient.create()
                 experience_uri = str(experience_uri or "").strip()
                 if "/memories/experiences/" not in experience_uri:
                     return f"Error: URI is not an experience memory: {experience_uri}"
@@ -844,7 +851,7 @@ def _make_read_experience_tool():
                 logger.warning("read_experience failed: %s", exc)
                 return f"Error reading experience memory: {exc}"
             finally:
-                if client is not None:
+                if owns_client and client is not None:
                     await client.close()
 
     return ReadExperienceTool()
@@ -1350,40 +1357,63 @@ class VikingBotTau2RolloutExecutor:
         )
         timings.record("build_agent", stage_started_at)
 
-        stage_started_at = time.perf_counter()
-        _configure_tools(
-            agent,
-            provider,
-            keep_default_tools=self.keep_default_tools,
-            loader_mode=self.loader_mode,
-            experience_recall_mode=self.experience_recall_mode,
-            experience_rerank_top_n=self.experience_rerank_top_n,
-            record_tool_timing=timings.record_tool,
-            task_id=task_id,
-            task_no=task_no,
-            data_split=data_split,
-            case_lookup=case_lookup,
-        )
-        timings.record("configure_tools", stage_started_at)
+        async def run_agent_with_experience_client(experience_client: Any | None):
+            stage_started_at = time.perf_counter()
+            _configure_tools(
+                agent,
+                provider,
+                keep_default_tools=self.keep_default_tools,
+                loader_mode=self.loader_mode,
+                experience_recall_mode=self.experience_recall_mode,
+                experience_rerank_top_n=self.experience_rerank_top_n,
+                record_tool_timing=timings.record_tool,
+                task_id=task_id,
+                task_no=task_no,
+                data_split=data_split,
+                case_lookup=case_lookup,
+                experience_client=experience_client,
+            )
+            timings.record("configure_tools", stage_started_at)
 
-        stage_started_at = time.perf_counter()
-        system_prompt = _build_system_prompt(
-            provider.policy,
-            keep_default_tools=self.keep_default_tools,
-            rollout_language=self.rollout_language,
-            loader_mode=self.loader_mode,
-        )
-        user_prompt = provider.user_query
-        SessionKey = _vikingbot_imports()["SessionKey"]
-        trial_suffix = "" if trial is None else f"_r{int(trial)}"
-        stage = _safe_session_fragment(str(context.metadata.get("stage") or "rollout"))
-        session_key = SessionKey(
-            type="cli",
-            channel_id="tau2",
-            chat_id=f"tau2_{stage}_{data_split}_{task_no}{trial_suffix}",
-        )
-        timings.record("prepare_prompt", stage_started_at)
+            stage_started_at = time.perf_counter()
+            system_prompt = _build_system_prompt(
+                provider.policy,
+                keep_default_tools=self.keep_default_tools,
+                rollout_language=self.rollout_language,
+                loader_mode=self.loader_mode,
+            )
+            user_prompt = provider.user_query
+            SessionKey = _vikingbot_imports()["SessionKey"]
+            trial_suffix = "" if trial is None else f"_r{int(trial)}"
+            stage = _safe_session_fragment(str(context.metadata.get("stage") or "rollout"))
+            session_key = SessionKey(
+                type="cli",
+                channel_id="tau2",
+                chat_id=f"tau2_{stage}_{data_split}_{task_no}{trial_suffix}",
+            )
+            timings.record("prepare_prompt", stage_started_at)
 
+            agent_result = await _run_agent(
+                agent=agent,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                session_key=session_key,
+                sender_id="tau2_user",
+                keep_default_tools=self.keep_default_tools,
+                loader_mode=self.loader_mode,
+                system_prompt_profile=self.system_prompt_profile,
+                direct_experience_content=self.direct_experience_content,
+                direct_experience_name=self.direct_experience_name,
+                direct_experience_uri=self.direct_experience_uri,
+                timings=timings,
+                case_lookup=case_lookup,
+            )
+            return system_prompt, user_prompt, agent_result
+
+        system_prompt, user_prompt, agent_result = await _run_with_rollout_experience_client(
+            loader_mode=self.loader_mode,
+            operation=run_agent_with_experience_client,
+        )
         (
             final_content,
             final_reasoning_content,
@@ -1394,21 +1424,7 @@ class VikingBotTau2RolloutExecutor:
             experience_reminder,
             experience_loader_skill,
             runtime_messages,
-        ) = await _run_agent(
-            agent=agent,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            session_key=session_key,
-            sender_id="tau2_user",
-            keep_default_tools=self.keep_default_tools,
-            loader_mode=self.loader_mode,
-            system_prompt_profile=self.system_prompt_profile,
-            direct_experience_content=self.direct_experience_content,
-            direct_experience_name=self.direct_experience_name,
-            direct_experience_uri=self.direct_experience_uri,
-            timings=timings,
-            case_lookup=case_lookup,
-        )
+        ) = agent_result
 
         reward = None
         evaluation_result = None
@@ -1736,6 +1752,26 @@ def _build_agent(config_path: str | None, *, max_iterations: int):
     )
 
 
+async def _run_with_rollout_experience_client(
+    *,
+    loader_mode: Tau2ExperienceLoaderMode,
+    operation: Callable[[Any | None], Awaitable[Any]],
+) -> Any:
+    client = None
+    if normalize_tau2_experience_loader_mode(loader_mode) == "skill":
+        from vikingbot.openviking_mount.ov_server import VikingClient
+
+        client = await VikingClient.create()
+    try:
+        return await operation(client)
+    finally:
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                logger.exception("failed to close rollout-scoped VikingClient")
+
+
 def _configure_tools(
     agent: Any,
     provider: Any,
@@ -1749,6 +1785,7 @@ def _configure_tools(
     task_no: int | None = None,
     data_split: str | None = None,
     case_lookup: dict[str, Any] | None = None,
+    experience_client: Any | None = None,
 ) -> None:
     # Tau2 rollout may keep generic VikingBot tools, but OpenViking access is
     # restricted to automatic experience recall during prompt construction.
@@ -1765,9 +1802,10 @@ def _configure_tools(
                 case_lookup=case_lookup,
                 experience_recall_mode=experience_recall_mode,
                 experience_rerank_top_n=experience_rerank_top_n,
+                client=experience_client,
             )
         )
-        agent.tools.register(_make_read_experience_tool())
+        agent.tools.register(_make_read_experience_tool(client=experience_client))
     tool_lock = _AsyncRWLock()
     write_tool_names = _classify_write_tools(provider)
     for schema in provider.list_openai_tools():

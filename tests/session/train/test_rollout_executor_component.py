@@ -940,19 +940,27 @@ def test_tau2_configure_tools_binds_case_lookup_to_search_experience(monkeypatch
     observed = {}
 
     class FakeTool:
-        name = "search_experience"
+        def __init__(self, name):
+            self.name = name
 
     def fake_make_search_experience_tool(
         case_lookup=None,
         experience_recall_mode=None,
         experience_rerank_top_n=None,
+        client=None,
     ):
         observed["case_lookup"] = case_lookup
         observed["experience_recall_mode"] = experience_recall_mode
         observed["experience_rerank_top_n"] = experience_rerank_top_n
-        return FakeTool()
+        observed["search_client"] = client
+        return FakeTool("search_experience")
+
+    def fake_make_read_experience_tool(*, client=None):
+        observed["read_client"] = client
+        return FakeTool("read_experience")
 
     monkeypatch.setattr(module, "_make_search_experience_tool", fake_make_search_experience_tool)
+    monkeypatch.setattr(module, "_make_read_experience_tool", fake_make_read_experience_tool)
 
     class FakeTools:
         tool_names = []
@@ -971,6 +979,7 @@ def test_tau2_configure_tools_binds_case_lookup_to_search_experience(monkeypatch
             return []
 
     case_lookup = _tau2_exact_case_lookup()
+    experience_client = object()
     module._configure_tools(
         FakeAgent(),
         FakeProvider(),
@@ -978,13 +987,152 @@ def test_tau2_configure_tools_binds_case_lookup_to_search_experience(monkeypatch
         case_lookup=case_lookup,
         experience_recall_mode="exp_ann",
         experience_rerank_top_n=5,
+        experience_client=experience_client,
     )
 
     assert observed == {
         "case_lookup": case_lookup,
         "experience_recall_mode": "exp_ann",
         "experience_rerank_top_n": 5,
+        "search_client": experience_client,
+        "read_client": experience_client,
     }
+
+
+@pytest.mark.asyncio
+async def test_tau2_experience_tools_reuse_injected_client(monkeypatch):
+    import json
+
+    import vikingbot.openviking_mount.ov_server as ov_server
+
+    from benchmark.tau2.train.rollout_executor_vikingbot import (
+        _make_read_experience_tool,
+        _make_search_experience_tool,
+    )
+
+    case_uri = "viking://user/u/memories/cases/case.md"
+    experience_uri = "viking://user/u/memories/experiences/experience.md"
+
+    class SharedClient:
+        def __init__(self):
+            self.close_calls = 0
+
+        def _memory_target_uri(self, user_id):
+            assert user_id is None
+            return "viking://user/u/memories"
+
+        async def search(self, situation, *, target_uri, limit, score_threshold=None):
+            assert situation == "Cancel a reservation"
+            assert target_uri == "viking://user/u/memories/cases"
+            assert limit == 10
+            assert score_threshold == 0.0
+            return {"memories": [{"uri": case_uri, "score": 0.9}]}
+
+        async def read_content(self, uri, level="read"):
+            assert level == "read"
+            if uri == case_uri:
+                return f"# Case\n\n## Linked Experiences\n- [experience]({experience_uri})\n"
+            if uri == experience_uri:
+                return "## Situation\n- Applies to reservation cancellation\n"
+            return ""
+
+        async def close(self):
+            self.close_calls += 1
+
+    class ForbiddenClientFactory:
+        @classmethod
+        async def create(cls):
+            raise AssertionError("injected tools must not create another VikingClient")
+
+    monkeypatch.setattr(ov_server, "VikingClient", ForbiddenClientFactory)
+    shared_client = SharedClient()
+
+    search_result = json.loads(
+        await _make_search_experience_tool(
+            experience_recall_mode="case_ann",
+            client=shared_client,
+        ).execute(None, situation="Cancel a reservation", limit=2)
+    )
+    read_result = await _make_read_experience_tool(client=shared_client).execute(
+        None,
+        experience_uri=experience_uri,
+    )
+
+    assert search_result["candidates"][0]["experiences"] == [
+        {
+            "uri": experience_uri,
+            "situation": "- Applies to reservation cancellation",
+        }
+    ]
+    assert "Applies to reservation cancellation" in read_result
+    assert shared_client.close_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_tau2_rollout_experience_client_closes_once_after_success(monkeypatch):
+    import vikingbot.openviking_mount.ov_server as ov_server
+
+    import benchmark.tau2.train.rollout_executor_vikingbot as module
+
+    client = SimpleNamespace(close_calls=0)
+
+    async def close():
+        client.close_calls += 1
+
+    client.close = close
+
+    class FakeClientFactory:
+        @classmethod
+        async def create(cls):
+            return client
+
+    monkeypatch.setattr(ov_server, "VikingClient", FakeClientFactory)
+
+    async def operation(active_client):
+        assert active_client is client
+        assert client.close_calls == 0
+        return "agent result"
+
+    result = await module._run_with_rollout_experience_client(
+        loader_mode="skill",
+        operation=operation,
+    )
+
+    assert result == "agent result"
+    assert client.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_tau2_rollout_experience_client_closes_once_after_failure(monkeypatch):
+    import vikingbot.openviking_mount.ov_server as ov_server
+
+    import benchmark.tau2.train.rollout_executor_vikingbot as module
+
+    client = SimpleNamespace(close_calls=0)
+
+    async def close():
+        client.close_calls += 1
+
+    client.close = close
+
+    class FakeClientFactory:
+        @classmethod
+        async def create(cls):
+            return client
+
+    monkeypatch.setattr(ov_server, "VikingClient", FakeClientFactory)
+
+    async def operation(active_client):
+        assert active_client is client
+        raise RuntimeError("agent failed")
+
+    with pytest.raises(RuntimeError, match="agent failed"):
+        await module._run_with_rollout_experience_client(
+            loader_mode="skill",
+            operation=operation,
+        )
+
+    assert client.close_calls == 1
 
 
 @pytest.mark.asyncio

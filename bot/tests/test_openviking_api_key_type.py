@@ -1,7 +1,10 @@
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from vikingbot.agent.context import ContextBuilder
 from vikingbot.agent.loop import _is_tool_result_success
@@ -1715,6 +1718,145 @@ async def test_read_content_trusted_owner_uri_uses_owner_identity(monkeypatch):
     assert scoped.kwargs["user"] == "sender-1"
     assert scoped.read_calls == [("read", "viking://user/sender-1/memories/profile.md")]
     assert scoped.closed is True
+
+
+@pytest.mark.asyncio
+async def test_read_content_retries_transient_transport_error(monkeypatch):
+    monkeypatch.setattr(ov_server_module, "load_config", lambda: _make_config("user"))
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    client = VikingClient()
+    attempts = 0
+
+    async def flaky_read(uri):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ReadError("connection reset")
+        return "experience body"
+
+    monkeypatch.setattr(client.client, "read", flaky_read)
+
+    content = await client.read_content(
+        "viking://user/memories/experiences/x.md",
+        level="read",
+    )
+
+    assert content == "experience body"
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_read_content_returns_empty_after_retry_attempts_are_exhausted(monkeypatch):
+    monkeypatch.setattr(ov_server_module, "load_config", lambda: _make_config("user"))
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    client = VikingClient()
+    attempts = 0
+
+    async def failing_read(uri):
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ReadError("connection reset")
+
+    monkeypatch.setattr(client.client, "read", failing_read)
+
+    content = await client.read_content(
+        "viking://user/memories/experiences/x.md",
+        level="read",
+    )
+
+    assert content == ""
+    assert attempts == 5
+
+
+@pytest.mark.asyncio
+async def test_read_content_does_not_retry_not_found(monkeypatch):
+    monkeypatch.setattr(ov_server_module, "load_config", lambda: _make_config("user"))
+    client = VikingClient()
+    attempts = 0
+
+    async def missing_read(uri):
+        nonlocal attempts
+        attempts += 1
+        raise ov_server_module.NotFoundError(uri)
+
+    monkeypatch.setattr(client.client, "read", missing_read)
+
+    content = await client.read_content(
+        "viking://user/memories/experiences/missing.md",
+        level="read",
+    )
+
+    assert content == ""
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_search_retries_transient_transport_error(monkeypatch):
+    monkeypatch.setattr(ov_server_module, "load_config", lambda: _make_config("user"))
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    client = VikingClient()
+    attempts = 0
+
+    async def flaky_search(query, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.RemoteProtocolError("server disconnected")
+        return {
+            "memories": [
+                {
+                    "uri": "viking://user/memories/cases/case.md",
+                    "context_type": "memory",
+                    "is_leaf": True,
+                    "abstract": "case",
+                    "overview": None,
+                    "category": "case",
+                    "score": 0.9,
+                    "match_reason": "semantic",
+                    "relations": [],
+                }
+            ],
+            "resources": [],
+            "skills": [],
+            "total": 1,
+            "server_trace_id": "1" * 32,
+        }
+
+    monkeypatch.setattr(client.client, "search", flaky_search)
+
+    result = await client.search(
+        "cancel reservation",
+        target_uri="viking://user/memories/cases",
+        limit=10,
+    )
+
+    assert attempts == 2
+    assert result["total"] == 1
+    assert result["memories"][0]["uri"] == "viking://user/memories/cases/case.md"
+    assert result["server_trace_id"] == "1" * 32
+
+
+@pytest.mark.asyncio
+async def test_search_does_not_retry_non_transport_error(monkeypatch):
+    monkeypatch.setattr(ov_server_module, "load_config", lambda: _make_config("user"))
+    client = VikingClient()
+    attempts = 0
+
+    async def failing_search(query, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("invalid search request")
+
+    monkeypatch.setattr(client.client, "search", failing_search)
+
+    with pytest.raises(RuntimeError, match="invalid search request"):
+        await client.search(
+            "cancel reservation",
+            target_uri="viking://user/memories/cases",
+            limit=10,
+        )
+
+    assert attempts == 1
 
 
 @pytest.mark.asyncio

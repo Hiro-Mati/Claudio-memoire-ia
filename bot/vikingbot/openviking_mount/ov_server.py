@@ -1,9 +1,13 @@
+import asyncio
 import base64
 import json
+import random
 import re
+import time
 import uuid
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
 
+import httpx
 from loguru import logger
 
 import openviking as ov
@@ -13,6 +17,70 @@ from openviking_cli.exceptions import NotFoundError
 from vikingbot.config.loader import load_config
 
 viking_resource_prefix = "viking://resources/"
+
+_TRANSIENT_HTTP_ERRORS = (
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+    httpx.ConnectError,
+    httpx.TimeoutException,
+)
+_READ_MAX_ATTEMPTS = 5
+_READ_RETRY_BUDGET_SECONDS = 15.0
+_SEARCH_MAX_ATTEMPTS = 2
+_SEARCH_RETRY_BUDGET_SECONDS = 240.0
+_RETRY_BACKOFF_SECONDS = (0.1, 0.3, 1.0, 2.0)
+
+
+async def _call_idempotent_with_retry(
+    operation: Callable[[], Awaitable[Any]],
+    *,
+    operation_name: str,
+    max_attempts: int,
+    retry_budget_seconds: float,
+) -> Any:
+    started_at = time.monotonic()
+    deadline = started_at + retry_budget_seconds
+
+    for attempt in range(1, max_attempts + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"{operation_name} exceeded retry budget of {retry_budget_seconds:.1f}s"
+            )
+        try:
+            async with asyncio.timeout(remaining):
+                return await operation()
+        except asyncio.CancelledError:
+            raise
+        except _TRANSIENT_HTTP_ERRORS as exc:
+            remaining = deadline - time.monotonic()
+            will_retry = attempt < max_attempts and remaining > 0
+            logger.warning(
+                json.dumps(
+                    {
+                        "event": "viking_http_retry",
+                        "operation": operation_name,
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "elapsed_ms": round((time.monotonic() - started_at) * 1000, 3),
+                        "remaining_budget_ms": round(max(0.0, remaining) * 1000, 3),
+                        "error_type": type(exc).__name__,
+                        "error_repr": repr(exc),
+                        "cause_repr": repr(exc.__cause__),
+                        "will_retry": will_retry,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            if not will_retry:
+                raise
+            base_delay = _RETRY_BACKOFF_SECONDS[min(attempt - 1, len(_RETRY_BACKOFF_SECONDS) - 1)]
+            delay = min(base_delay * random.uniform(0.75, 1.25), remaining)
+            if delay <= 0:
+                raise
+            await asyncio.sleep(delay)
+
+    raise RuntimeError(f"unreachable retry state for {operation_name}")
 
 
 def _is_session_key(agent_id: Optional[str]) -> bool:
@@ -605,14 +673,14 @@ class VikingClient:
         if scoped_user_id:
             client, should_close = await self._get_user_scoped_client(scoped_user_id)
 
-        try:
+        async def read_selected_level() -> str:
             if level == "abstract":
                 return await client.abstract(uri)
-            elif level == "overview":
+            if level == "overview":
                 return await client.overview(uri)
-            elif level == "read":
+            if level == "read":
                 return await client.read(uri)
-            elif level == "raw":
+            if level == "raw":
                 read_raw = getattr(client, "read_raw", None)
                 if read_raw is not None:
                     return await read_raw(uri)
@@ -620,8 +688,15 @@ class VikingClient:
                     return await client.read(uri, raw=True)
                 except TypeError:
                     return await client.read(uri)
-            else:
-                raise ValueError(f"Unsupported level: {level}")
+            raise ValueError(f"Unsupported level: {level}")
+
+        try:
+            return await _call_idempotent_with_retry(
+                read_selected_level,
+                operation_name=f"read_content:{level}",
+                max_attempts=_READ_MAX_ATTEMPTS,
+                retry_budget_seconds=_READ_RETRY_BUDGET_SECONDS,
+            )
         except (FileNotFoundError, NotFoundError) as exc:
             logger.warning(
                 json.dumps(
@@ -703,7 +778,12 @@ class VikingClient:
                 search_kwargs["score_threshold"] = score_threshold
             if filter is not None:
                 search_kwargs["filter"] = filter
-            result = await client.search(query, **search_kwargs)
+            result = await _call_idempotent_with_retry(
+                lambda: client.search(query, **search_kwargs),
+                operation_name="search",
+                max_attempts=_SEARCH_MAX_ATTEMPTS,
+                retry_budget_seconds=_SEARCH_RETRY_BUDGET_SECONDS,
+            )
         finally:
             if should_close:
                 await client.close()
