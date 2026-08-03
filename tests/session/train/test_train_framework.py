@@ -2178,7 +2178,7 @@ async def test_rollout_artifact_recorder_writes_train_rollouts_before_commit(tmp
     )
 
 
-def test_rollout_artifact_recorder_includes_pre_tool_experience_reminders_in_memory_context(
+def test_rollout_artifact_recorder_ignores_legacy_pre_tool_experience_reminders(
     tmp_path,
 ):
     from openviking.session.train import RolloutArtifactRecorder
@@ -2230,13 +2230,10 @@ def test_rollout_artifact_recorder_includes_pre_tool_experience_reminders_in_mem
         / "trial_0"
         / "memory_context.md"
     ).read_text()
-    assert "remember airline rules" in memory_context
-    assert "# Pre-tool Experience Reminders" in memory_context
-    assert "<triggered_before_tool>cancel_reservation</triggered_before_tool>" in memory_context
-    assert "Check refund eligibility before cancellation." in memory_context
+    assert memory_context == "remember airline rules"
 
 
-def test_report_builder_counts_pre_tool_experience_reminders_as_memory_usage():
+def test_report_builder_ignores_legacy_pre_tool_experience_reminders():
     from openviking.session.train import PipelineReportBuilder
 
     case = Case(
@@ -2269,13 +2266,11 @@ def test_report_builder_counts_pre_tool_experience_reminders_as_memory_usage():
 
     usage = PipelineReportBuilder().memory_usage_from_analyses([analysis])
 
-    assert usage["memory_context_count"] == 1
-    assert usage["memory_context_ratio"] == 1.0
-    assert usage["memory_tool_call_rollout_count"] == 1
-    assert usage["memory_tool_call_total"] == 1
+    assert usage["memory_context_count"] == 0
+    assert usage["memory_context_ratio"] == 0.0
+    assert usage["memory_tool_call_rollout_count"] == 0
+    assert usage["memory_tool_call_total"] == 0
     assert usage["memory_recall_tool_call_total"] == 0
-    assert usage["pre_tool_experience_reminder_rollout_count"] == 1
-    assert usage["pre_tool_experience_reminder_total"] == 1
 
 
 def test_rollout_artifact_recorder_separates_epoch_eval_dirs(tmp_path):

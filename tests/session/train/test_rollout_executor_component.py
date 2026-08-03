@@ -3597,7 +3597,7 @@ async def test_tau2_run_agent_direct_experience_injects_reminder_without_skill()
     assert result[7] is None
 
 
-def test_tau2_rollout_messages_preserve_runtime_user_constraint_reminder():
+def test_tau2_rollout_messages_preserve_runtime_user_messages():
     from benchmark.tau2.train.rollout_executor import _build_rollout_messages
     from openviking.message import TextPart, ToolPart
 
@@ -3643,11 +3643,6 @@ def test_tau2_rollout_messages_preserve_runtime_user_constraint_reminder():
         if isinstance(part, TextPart)
     ]
     assert "## Situation\n- Check cancellation eligibility." in user_texts
-    assert not any(
-        isinstance(part, ToolPart) and part.tool_name == "experience_constraint_reminder"
-        for message in rollout_messages
-        for part in message.parts
-    )
     tool_parts = [
         part for message in rollout_messages for part in message.parts if isinstance(part, ToolPart)
     ]

@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from openviking.message import TextPart, ToolPart
+from openviking.message import ToolPart
 from openviking.session.train.components.dataset_service import (
     case_to_dict,
     evaluation_to_dict,
@@ -748,35 +748,9 @@ def _prompt_for_llm(record: _RolloutRecord) -> str:
 
 
 def _memory_context(rollout: Rollout) -> str:
-    parts: list[str] = []
     metadata = rollout.metadata or {}
     value = metadata.get("memory")
-    if value is not None and str(value).strip():
-        parts.append(str(value).strip())
-
-    pre_tool_reminders = _pre_tool_experience_reminders(rollout)
-    if pre_tool_reminders:
-        parts.append(
-            "# Pre-tool Experience Reminders\n\n"
-            "These experience reminders were injected as user messages immediately before "
-            "the agent retried a tool call.\n\n" + "\n\n---\n\n".join(pre_tool_reminders)
-        )
-    return "\n\n---\n\n".join(parts)
-
-
-def _pre_tool_experience_reminders(rollout: Rollout) -> list[str]:
-    reminders: list[str] = []
-    for message in getattr(rollout, "messages", []) or []:
-        if getattr(message, "role", None) != "user":
-            continue
-        for part in getattr(message, "parts", []) or []:
-            if not isinstance(part, TextPart):
-                continue
-            text = str(part.text or "").strip()
-            if "<experience_reminder>" not in text or "</experience_reminder>" not in text:
-                continue
-            reminders.append(text)
-    return list(dict.fromkeys(reminders))
+    return str(value).strip() if value is not None else ""
 
 
 def _task_case_experience_skill(rollout: Rollout) -> str:

@@ -9,7 +9,6 @@ from typing import Any
 
 from loguru import logger
 
-from vikingbot.agent.experience_constraints import ConstraintExperience
 from vikingbot.config.loader import load_config
 from vikingbot.openviking_mount.ov_server import VikingClient
 from vikingbot.utils.helpers import ensure_dir
@@ -662,71 +661,6 @@ class MemoryStore:
                     await client.close()
                 except Exception as e:
                     logger.warning(f"Error closing VikingClient: {e}")
-
-    async def get_viking_constraint_experiences(
-        self,
-        query: str,
-        workspace_id: str,
-        exclude_uris: list[str] | None = None,
-        openviking_connection: dict[str, Any] | None = None,
-        limit: int | None = None,
-    ) -> list[ConstraintExperience]:
-        """Retrieve structured triggerable experience constraints for pre-tool-call reminders.
-
-        This intentionally ignores old experiences without ``trigger_code``.  It
-        returns candidates in retrieval order; the runtime activation layer then
-        evaluates every trigger and appends all matching reminders.
-        """
-
-        client = None
-        try:
-            ov_cfg = load_config().ov_server
-            client = await VikingClient.create(
-                agent_id=workspace_id,
-                connection=openviking_connection,
-            )
-            recall_limit = max(1, int(limit or getattr(ov_cfg, "exp_recall_limit", 5) or 5))
-            experiences = await self._search_memory_type(
-                client,
-                query,
-                memory_type="experiences",
-                limit=recall_limit,
-            )
-            if exclude_uris:
-                exclude_set = set(exclude_uris)
-                experiences = [exp for exp in experiences if self._get_uri(exp) not in exclude_set]
-            constraints: list[ConstraintExperience] = []
-            for exp in self._dedupe_memories(experiences):
-                uri = self._get_uri(exp)
-                if not uri:
-                    continue
-                try:
-                    content = await client.read_content(uri, level="read")
-                    constraint = ConstraintExperience.from_content_and_fields(
-                        content or "",
-                        uri=uri,
-                        fallback_name=self._filename_from_uri(uri).removesuffix(".md"),
-                        metadata=exp if isinstance(exp, dict) else None,
-                    )
-                except Exception as exc:
-                    logger.warning(f"[READ_CONSTRAINT_EXP]: failed to read {uri}: {exc}")
-                    continue
-                if constraint is not None:
-                    constraints.append(constraint)
-            logger.info(
-                f"[READ_CONSTRAINT_EXP]: found {len(constraints)} triggerable experiences, "
-                f"query={query[:50]}"
-            )
-            return constraints
-        except Exception as e:
-            logger.error(f"[READ_CONSTRAINT_EXP]: error. {e}")
-            return []
-        finally:
-            if client:
-                try:
-                    await client.close()
-                except Exception:
-                    pass
 
     async def get_viking_experience_context(
         self,

@@ -16,10 +16,6 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from vikingbot.agent.context import ContextBuilder
-from vikingbot.agent.experience_constraints import (
-    ConstraintActivationInput,
-    apply_experience_constraint_reminder,
-)
 from vikingbot.agent.memory import MemoryStore
 from vikingbot.agent.subagent import SubagentManager
 from vikingbot.agent.tools import register_default_tools
@@ -225,7 +221,6 @@ class AgentLoop:
         self._mcp_connected = False
         self._mcp_connecting = False
         self._ov_clients: dict[str, Any] = {}
-        self._constraint_reminded_exp_uris: dict[str, set[str]] = {}
         self._last_run_messages: dict[str, list[dict[str, Any]]] = {}
         self._register_default_tools()
 
@@ -714,72 +709,6 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
-    async def _maybe_apply_experience_constraint_reminder(
-        self,
-        *,
-        messages: list[dict],
-        response: Any,
-        session_key: SessionKey,
-        openviking_connection: dict[str, Any] | None,
-        tools_used: list[dict],
-    ) -> list[dict] | None:
-        """Append one experience constraint reminder before executing tool calls.
-
-        A matching experience URI is reminded at most once per live session.  If
-        a reminder is appended, the caller reruns the agent step with the same
-        agent/thinking configuration by continuing the main loop.
-        """
-
-        del tools_used
-        tool_calls = list(getattr(response, "tool_calls", []) or [])
-        if not tool_calls:
-            return None
-
-        try:
-            # Build query from the latest user messages; retrieval is only a
-            # candidate prefilter, trigger_code decides whether to activate.
-            user_messages = [
-                m.get("content", "")
-                for m in messages
-                if m.get("role") == "user" and isinstance(m.get("content"), str)
-            ]
-            query = "\n".join(user_messages[-3:])
-            workspace_id = self._get_ov_workspace_id(session_key)
-            reminded = self._constraint_reminded_exp_uris.setdefault(
-                session_key.safe_name(),
-                set(),
-            )
-            experiences = await self.context.memory.get_viking_constraint_experiences(
-                query=query,
-                workspace_id=workspace_id,
-                exclude_uris=list(reminded),
-                openviking_connection=openviking_connection,
-            )
-            if not experiences:
-                return None
-
-            for tool_call in tool_calls:
-                decision = apply_experience_constraint_reminder(
-                    ConstraintActivationInput(
-                        messages=messages,
-                        candidate_tool=tool_call.name,
-                        candidate_tool_args=tool_call.arguments,
-                        experiences=experiences,
-                        reminded_exp_uris=reminded,
-                    )
-                )
-                if not decision.reminded:
-                    continue
-                logger.info(
-                    "[EXP_CONSTRAINT_REMINDER]: "
-                    f"experiences={decision.experience_uris}, tool={tool_call.name}, "
-                    f"triggered={decision.triggered_uris}"
-                )
-                return decision.messages
-        except Exception as exc:
-            logger.warning(f"[EXP_CONSTRAINT_REMINDER]: failed: {exc}")
-        return None
-
     async def _run_agent_loop(
         self,
         messages: list[dict],
@@ -875,19 +804,6 @@ class AgentLoop:
                 )
 
             if response.has_tool_calls:
-                reminder_hook = getattr(self, "_maybe_apply_experience_constraint_reminder", None)
-                if callable(reminder_hook):
-                    reminder_messages = await reminder_hook(
-                        messages=messages,
-                        response=response,
-                        session_key=session_key,
-                        openviking_connection=openviking_connection,
-                        tools_used=tools_used,
-                    )
-                    if reminder_messages is not None:
-                        messages = reminder_messages
-                        continue
-
                 final_reasoning_content = response.reasoning_content
                 args_list = [tc.arguments for tc in response.tool_calls]
                 tool_call_dicts = [
