@@ -233,6 +233,16 @@ class TestExtractLoopFinalJsonRetry:
                     )
                 ]
 
+            def create_operations_model(self, schema_model_generator, role_scope=None):
+                return schema_model_generator.create_structured_operations_model(role_scope)
+
+            def validate_and_attach_operation_metadata(
+                self,
+                raw_operations,
+                resolved_operations,
+            ):
+                return []
+
             def get_tools(self):
                 return []
 
@@ -327,6 +337,12 @@ class TestExtractLoopPostValidationHook:
         def get_memory_schemas(self, ctx):
             return self._schemas
 
+        def create_operations_model(self, schema_model_generator, role_scope=None):
+            return schema_model_generator.create_structured_operations_model(role_scope)
+
+        def validate_and_attach_operation_metadata(self, raw_operations, resolved_operations):
+            return []
+
         def get_tools(self):
             return []
 
@@ -341,6 +357,9 @@ class TestExtractLoopPostValidationHook:
 
         async def prefetch(self):
             return []
+
+        async def execute_tool(self, tool_call):
+            return {"error": f"not found: {tool_call.arguments.get('uri')}"}
 
     class _FakeIsolationHandler:
         def get_read_scope(self):
@@ -365,6 +384,46 @@ class TestExtractLoopPostValidationHook:
             if not self.responses:
                 raise AssertionError("No fake VLM response left")
             return self.responses.pop(0)
+
+    @pytest.mark.asyncio
+    async def test_provider_operation_metadata_validation_retries_once(self):
+        class RetryProvider(self._FakeContextProvider):
+            def __init__(self, schemas):
+                super().__init__(schemas)
+                self.validation_calls = 0
+
+            def validate_and_attach_operation_metadata(self, raw_operations, resolved_operations):
+                self.validation_calls += 1
+                if self.validation_calls == 1:
+                    return ["missing source binding for upsert operation_page_id=100"]
+                return []
+
+        provider = RetryProvider([self._preference_schema()])
+        vlm = self._SequenceVLM(
+            [
+                self._preference_ops("first draft"),
+                self._preference_ops("second draft"),
+            ]
+        )
+        extract_loop = ExtractLoop(
+            vlm=vlm,
+            viking_fs=MagicMock(),
+            context_provider=provider,
+            isolation_handler=self._FakeIsolationHandler(),
+            max_iterations=1,
+        )
+
+        result, _ = await extract_loop.run()
+
+        assert provider.validation_calls == 2
+        assert result.upsert_operations[0].memory_fields["content"] == "second draft"
+        assert len(vlm.seen_calls) == 2
+        retry_messages = vlm.seen_calls[1]["messages"]
+        assert any(
+            message["role"] == "user"
+            and "missing source binding for upsert operation_page_id=100" in message["content"]
+            for message in retry_messages
+        )
 
     @pytest.mark.asyncio
     async def test_post_validation_hook_can_append_latest_draft_and_retry(self):

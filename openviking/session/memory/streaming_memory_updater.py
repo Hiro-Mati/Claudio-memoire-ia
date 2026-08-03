@@ -660,7 +660,11 @@ async def merge_memory_operations(
                 registry=registry,
                 ctx=ctx,
             )
-            _inherit_source_metadata_to_merged_operations(ops_list, merged.upsert_operations)
+            _inherit_source_metadata_from_patch_bindings(
+                input_operations=ops_list,
+                input_delete_files=delete_groups.get(group_key, []),
+                merged_operations=merged,
+            )
             merged_upserts.extend(merged.upsert_operations)
             merged_deletes.extend(merged.delete_file_contents)
             merged_delete_replacements.update(
@@ -886,7 +890,10 @@ async def merge_one_memory_type_operations(
     tracer.info(
         "[streaming_memory_updater] llm merge output "
         f"memory_type={memory_type} upserts={len(merged.upsert_operations)} "
-        f"deletes={len(merged.delete_file_contents)} errors={len(merged.errors)}",
+        f"deletes={len(merged.delete_file_contents)} errors={len(merged.errors)} "
+        f"upsert_source_patch_ids="
+        f"{[(op.uris, op.source_patch_ids) for op in merged.upsert_operations]} "
+        f"delete_source_patch_ids={merged.delete_source_patch_ids}",
         console=trace_console,
     )
     return merged
@@ -1022,50 +1029,70 @@ def classify_memory_merge_mode(
     return False, "single_existing_content_changed"
 
 
-def _inherit_source_metadata_to_merged_operations(
+def _inherit_source_metadata_from_patch_bindings(
+    *,
     input_operations: list[ResolvedOperation],
-    merged_operations: list[ResolvedOperation],
+    input_delete_files: list[MemoryFile],
+    merged_operations: ResolvedOperations,
 ) -> None:
-    """Best-effort provenance restore after patch-merge LLM output.
+    """Translate exact PatchMerge bindings into ordinary-memory provenance."""
 
-    Patch merge hides system provenance fields from the model, so generated
-    operations can lose source_extraction_id. Reattach it by exact URI match
-    where possible. If a merged output has no URI match but only one input
-    source exists, copy that source; otherwise record all input source IDs as an
-    ambiguous multi-source operation.
-    """
+    patch_source_ids: dict[int, set[str]] = {}
+    for patch_id, input_op in enumerate(input_operations or [], start=1):
+        patch_source_ids[patch_id] = _operation_source_extraction_ids(input_op)
+    delete_patch_offset = len(input_operations or [])
+    for index, memory_file in enumerate(input_delete_files or [], start=1):
+        patch_source_ids[delete_patch_offset + index] = _source_extraction_ids_from_fields(
+            dict(memory_file.extra_fields or {})
+        )
 
-    input_by_uri: dict[str, list[ResolvedOperation]] = {}
-    all_source_ids: set[str] = set()
-    for input_op in input_operations or []:
-        op_source_ids = _operation_source_extraction_ids(input_op)
-        all_source_ids.update(op_source_ids)
-        for uri in list(getattr(input_op, "uris", []) or []):
-            if uri:
-                input_by_uri.setdefault(uri, []).append(input_op)
-
-    if not all_source_ids:
-        return
-
-    for merged_op in merged_operations or []:
-        if _operation_source_extraction_ids(merged_op):
+    for merged_op in list(merged_operations.upsert_operations or []):
+        if not merged_op.source_patch_ids:
             continue
-        matched_inputs: list[ResolvedOperation] = []
-        for uri in list(getattr(merged_op, "uris", []) or []):
-            matched_inputs.extend(input_by_uri.get(uri, []))
-        matched_ids = {
+        source_ids = {
             source_id
-            for input_op in matched_inputs
-            for source_id in _operation_source_extraction_ids(input_op)
+            for patch_id in list(merged_op.source_patch_ids or [])
+            for source_id in patch_source_ids.get(int(patch_id), set())
         }
-        if len(matched_ids) == 1:
-            _set_operation_source_extraction_id(merged_op, next(iter(matched_ids)))
-        elif len(matched_ids) > 1:
-            merged_op.memory_fields["source_extraction_ids"] = sorted(matched_ids)
-        elif len(all_source_ids) == 1:
-            _set_operation_source_extraction_id(merged_op, next(iter(all_source_ids)))
-        else:
-            merged_op.memory_fields["source_extraction_ids"] = sorted(all_source_ids)
+        _set_operation_source_extraction_ids(merged_op, source_ids)
+
+    for memory_file in list(merged_operations.delete_file_contents or []):
+        uri = str(memory_file.uri or "")
+        if uri not in merged_operations.delete_source_patch_ids:
+            continue
+        source_ids = {
+            source_id
+            for patch_id in merged_operations.delete_source_patch_ids.get(uri, [])
+            for source_id in patch_source_ids.get(int(patch_id), set())
+        }
+        _set_memory_file_source_extraction_ids(memory_file, source_ids)
+
+
+def _set_operation_source_extraction_ids(
+    op: ResolvedOperation,
+    source_ids: set[str],
+) -> None:
+    op.memory_fields.pop("source_extraction_id", None)
+    op.memory_fields.pop("source_extraction_ids", None)
+    source = getattr(op, "source", None)
+    if source is not None:
+        source.extraction_id = None
+    if len(source_ids) == 1:
+        _set_operation_source_extraction_id(op, next(iter(source_ids)))
+    elif source_ids:
+        op.memory_fields["source_extraction_ids"] = sorted(source_ids)
+
+
+def _set_memory_file_source_extraction_ids(
+    memory_file: MemoryFile,
+    source_ids: set[str],
+) -> None:
+    memory_file.extra_fields.pop("source_extraction_id", None)
+    memory_file.extra_fields.pop("source_extraction_ids", None)
+    if len(source_ids) == 1:
+        memory_file.extra_fields["source_extraction_id"] = next(iter(source_ids))
+    elif source_ids:
+        memory_file.extra_fields["source_extraction_ids"] = sorted(source_ids)
 
 
 def _set_operation_source_extraction_id(op: ResolvedOperation, extraction_id: str) -> None:

@@ -419,6 +419,7 @@ def test_split_experiences_keep_single_trajectory_provenance():
                 ),
                 memory_type="experiences",
                 uris=[f"{policy_set.root_uri}/{name}.md"],
+                source_patch_ids=[1],
             )
             for name in ("repair_definition", "repair_measurement")
         ],

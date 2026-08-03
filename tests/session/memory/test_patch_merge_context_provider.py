@@ -9,10 +9,19 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from openviking.session.memory.dataclass import MemoryFile, MemoryTypeSchema
+from openviking.session.memory.dataclass import (
+    MemoryFile,
+    MemoryTypeSchema,
+    ResolvedOperation,
+    ResolvedOperations,
+)
 from openviking.session.memory.patch_merge_context_provider import (
     PatchMergeContextProvider,
     PatchMergePatch,
+)
+from openviking.session.memory.schema_model_generator import SchemaModelGenerator
+from openviking.session.memory.session_extract_context_provider import (
+    SessionExtractContextProvider,
 )
 
 
@@ -33,6 +42,215 @@ def _memory_file(
             "status": "production",
         },
     )
+
+
+def _schema() -> MemoryTypeSchema:
+    return MemoryTypeSchema(
+        memory_type="experiences",
+        description="Experiences",
+        directory="viking://user/{{ user_space }}/memories/experiences",
+        filename_template="{{ experience_name }}.md",
+        fields=[],
+    )
+
+
+def test_only_patch_merge_provider_extends_operations_model_with_source_bindings():
+    standard_model = SessionExtractContextProvider(messages=[]).create_operations_model(
+        SchemaModelGenerator([_schema()]),
+        role_scope=None,
+    )
+    patch_provider = PatchMergeContextProvider(
+        memory_type="experiences",
+        patches=[
+            PatchMergePatch(
+                before_file=None,
+                after_file=_memory_file(name="booking", uri=None, content="book safely"),
+            )
+        ],
+    )
+    patch_model = patch_provider.create_operations_model(
+        SchemaModelGenerator([_schema()]),
+        role_scope=None,
+    )
+
+    assert "source_bindings" not in standard_model.model_fields
+    assert patch_model.model_fields["source_bindings"].is_required()
+    with pytest.raises(ValueError, match="source_bindings"):
+        patch_model.model_validate({"experiences": [{"page_id": 101}]})
+
+
+def test_patch_merge_resolves_source_bindings_to_runtime_operation_fields():
+    provider = PatchMergeContextProvider(
+        memory_type="experiences",
+        patches=[
+            PatchMergePatch(
+                before_file=None,
+                after_file=_memory_file(name="booking", uri=None, content="book safely"),
+            ),
+            PatchMergePatch(
+                before_file=None,
+                after_file=_memory_file(name="refund", uri=None, content="refund safely"),
+            ),
+        ],
+    )
+    operations_model = provider.create_operations_model(
+        SchemaModelGenerator([_schema()]),
+        role_scope=None,
+    )
+    raw_operations = operations_model.model_validate(
+        {
+            "experiences": [{"page_id": 101}],
+            "source_bindings": [
+                {
+                    "operation_kind": "upsert",
+                    "operation_page_id": 101,
+                    "source_patch_ids": [1, 2],
+                }
+            ],
+        }
+    )
+    resolved = ResolvedOperations(
+        upsert_operations=[
+            ResolvedOperation(
+                memory_fields={"experience_name": "combined"},
+                memory_type="experiences",
+                uris=["viking://user/u/memories/experiences/combined.md"],
+                page_id=101,
+            )
+        ],
+        delete_file_contents=[],
+        errors=[],
+    )
+
+    errors = provider.validate_and_attach_operation_metadata(raw_operations, resolved)
+
+    assert errors == []
+    assert resolved.upsert_operations[0].source_patch_ids == [1, 2]
+    assert "source_patch_ids" not in resolved.upsert_operations[0].memory_fields
+    assert "source_patch_ids" not in resolved.upsert_operations[0].model_dump()
+
+
+@pytest.mark.parametrize(
+    ("source_bindings", "error_pattern"),
+    [
+        ([], "missing source binding"),
+        (
+            [
+                {
+                    "operation_kind": "upsert",
+                    "operation_page_id": 101,
+                    "source_patch_ids": [9],
+                }
+            ],
+            "unknown source_patch_ids",
+        ),
+        (
+            [
+                {
+                    "operation_kind": "upsert",
+                    "operation_page_id": 101,
+                    "source_patch_ids": [1],
+                },
+                {
+                    "operation_kind": "upsert",
+                    "operation_page_id": 101,
+                    "source_patch_ids": [1],
+                },
+            ],
+            "duplicate source binding",
+        ),
+        (
+            [
+                {
+                    "operation_kind": "upsert",
+                    "operation_page_id": 999,
+                    "source_patch_ids": [1],
+                }
+            ],
+            "unknown upsert operation_page_id",
+        ),
+    ],
+)
+def test_patch_merge_rejects_invalid_source_bindings(source_bindings, error_pattern):
+    provider = PatchMergeContextProvider(
+        memory_type="experiences",
+        patches=[
+            PatchMergePatch(
+                before_file=None,
+                after_file=_memory_file(name="booking", uri=None, content="book safely"),
+            )
+        ],
+    )
+    operations_model = provider.create_operations_model(
+        SchemaModelGenerator([_schema()]),
+        role_scope=None,
+    )
+    raw_operations = operations_model.model_validate(
+        {
+            "experiences": [{"page_id": 101}],
+            "source_bindings": source_bindings,
+        }
+    )
+    resolved = ResolvedOperations(
+        upsert_operations=[
+            ResolvedOperation(
+                memory_fields={"experience_name": "booking"},
+                memory_type="experiences",
+                uris=["viking://user/u/memories/experiences/booking.md"],
+                page_id=101,
+            )
+        ],
+        delete_file_contents=[],
+        errors=[],
+    )
+
+    errors = provider.validate_and_attach_operation_metadata(raw_operations, resolved)
+
+    assert any(error_pattern in error for error in errors)
+    assert resolved.upsert_operations[0].source_patch_ids == []
+
+
+def test_patch_merge_resolves_delete_source_binding_by_page_id():
+    deleted_uri = "viking://user/u/memories/experiences/obsolete.md"
+    provider = PatchMergeContextProvider(
+        memory_type="experiences",
+        patches=[
+            PatchMergePatch(
+                before_file=_memory_file(name="obsolete", uri=deleted_uri, content="old"),
+                after_file=_memory_file(name="obsolete", uri=deleted_uri, content=""),
+            )
+        ],
+    )
+    provider._extract_context = SimpleNamespace(
+        page_id_map=SimpleNamespace(resolve=lambda page_id: deleted_uri if page_id == 7 else None)
+    )
+    operations_model = provider.create_operations_model(
+        SchemaModelGenerator([_schema()]),
+        role_scope=None,
+    )
+    raw_operations = operations_model.model_validate(
+        {
+            "delete_ids": [{"delete_page_id": 7, "replacement_page_id": None}],
+            "source_bindings": [
+                {
+                    "operation_kind": "delete",
+                    "operation_page_id": 7,
+                    "source_patch_ids": [1],
+                }
+            ],
+        }
+    )
+    resolved = ResolvedOperations(
+        upsert_operations=[],
+        delete_file_contents=[_memory_file(name="obsolete", uri=deleted_uri, content="old")],
+        errors=[],
+    )
+
+    errors = provider.validate_and_attach_operation_metadata(raw_operations, resolved)
+
+    assert errors == []
+    assert resolved.delete_source_patch_ids == {deleted_uri: [1]}
+    assert "delete_source_patch_ids" not in resolved.model_dump()
 
 
 @pytest.mark.asyncio
@@ -66,7 +284,7 @@ async def test_patch_merge_context_provider_prefetch_reads_originals_and_renders
     assert read_message["result"]["experience_name"] == "booking"
     assert messages[1]["role"] == "user"
     assert messages[1]["content"].startswith("# Memory File Patches")
-    assert "Patch 1" in messages[1]["content"]
+    assert "Patch 1 [patch_id=1]" in messages[1]["content"]
     # Patch headers should not include target_uri/target_name/memory_type
     assert "target_uri:" not in messages[1]["content"]
     assert "target_name:" not in messages[1]["content"]
@@ -382,6 +600,9 @@ def test_patch_merge_context_provider_instruction_mentions_path_field_normalizat
     assert "Chinese" in instruction
     assert "书籍 not 书/图书" in instruction
     assert "put it in delete_ids" in instruction
+    assert "source_bindings" in instruction
+    assert "source_patch_ids" in instruction
+    assert "exactly one source binding" in instruction
 
 
 def test_patch_merge_context_provider_detects_language_from_patch_content(monkeypatch):

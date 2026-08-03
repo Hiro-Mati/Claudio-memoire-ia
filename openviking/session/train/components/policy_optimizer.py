@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
@@ -514,13 +513,13 @@ def _log_merge_input(
         f"required_file_uris: {provider.required_file_uris}",
         f"gradient_count: {len(gradients)}",
     ]
-    for idx, gradient in enumerate(gradients):
+    for idx, gradient in enumerate(gradients, start=1):
         before_file = gradient.before_file
         after_file = gradient.after_file
         lines.extend(
             [
                 "",
-                f"[Gradient {idx}]",
+                f"[Gradient patch_id={idx}]",
                 f"target_name: {gradient.target_name}",
                 f"target_uri: {gradient.target_uri}",
                 f"base_version: {gradient.base_version}",
@@ -559,6 +558,9 @@ def _log_merge_output(
         f"target: {target}",
         "[Resolved Operations]",
         _dump_model_or_value(operations),
+        f"source_patch_ids: "
+        f"{[(op.uris, op.source_patch_ids) for op in getattr(operations, 'upsert_operations', []) or []]}",
+        f"delete_source_patch_ids: {getattr(operations, 'delete_source_patch_ids', {})}",
         "",
         "[Policy Plan Items]",
     ]
@@ -737,19 +739,12 @@ def _operations_to_plan_items(
     schema: MemoryTypeSchema,
 ) -> list[PolicyPlanItem]:
     items: list[PolicyPlanItem] = []
-    source_links_by_target = _source_trajectory_links_by_target(gradients, policy_set)
+    source_links_by_patch_id = _source_trajectory_links_by_patch_id(gradients, policy_set)
     superseded_policies = _superseded_policies_for_gradients(gradients, policy_set)
     confidence_values = [float(gradient.confidence) for gradient in gradients]
     confidence = max(confidence_values) if confidence_values else None
     name_field = _name_field_for_memory_type(memory_type)
 
-    upsert_output_count = _upsert_output_count(
-        operations,
-        memory_type=memory_type,
-        schema=schema,
-    )
-    single_source_trajectory = _source_trajectory_count(source_links_by_target) == 1
-    replacement_source_uris_by_target = _replacement_source_uris_by_target(operations)
     upsert_target_uris: set[str] = set()
     for op in getattr(operations, "upsert_operations", []) or []:
         if getattr(op, "memory_type", None) != memory_type:
@@ -779,18 +774,10 @@ def _operations_to_plan_items(
         if before_content is None and target_uri:
             policy = _find_policy_by_uri(policy_set, target_uri)
             before_content = policy.content if policy is not None else None
-        item_links = _source_trajectory_links_for_plan_item(
+        item_links = _source_trajectory_links_for_patch_ids(
             target_uri=target_uri or "",
-            target_name=target_name,
-            before_content=before_content,
-            after_content=after_content,
-            trigger_code=str(fields.get("trigger_code") or ""),
-            source_links_by_target=source_links_by_target,
-            replacement_source_uris=replacement_source_uris_by_target.get(
-                target_uri or "",
-                [],
-            ),
-            include_all_sources=(upsert_output_count == 1 or single_source_trajectory),
+            source_patch_ids=list(getattr(op, "source_patch_ids", []) or []),
+            source_links_by_patch_id=source_links_by_patch_id,
         )
         items.append(
             PolicyPlanItem(
@@ -843,14 +830,12 @@ def _operations_to_plan_items(
                 before_content=old_file.plain_content(),
                 after_content=None,
                 confidence=confidence,
-                links=_source_trajectory_links_for_plan_item(
+                links=_source_trajectory_links_for_patch_ids(
                     target_uri=target_uri,
-                    target_name=target_name,
-                    before_content=old_file.plain_content(),
-                    after_content=None,
-                    trigger_code=str((old_file.extra_fields or {}).get("trigger_code") or ""),
-                    source_links_by_target=source_links_by_target,
-                    replacement_source_uris=[],
+                    source_patch_ids=list(
+                        getattr(operations, "delete_source_patch_ids", {}).get(target_uri, [])
+                    ),
+                    source_links_by_patch_id=source_links_by_patch_id,
                 ),
                 metadata={
                     "rationale": "PatchMergeContextProvider merge requested memory deletion.",
@@ -1039,181 +1024,35 @@ def _remap_source_trajectory_links(
     ]
 
 
-def _source_trajectory_links_for_plan_item(
+def _source_trajectory_links_for_patch_ids(
     *,
     target_uri: str,
-    target_name: str,
-    before_content: str | None,
-    after_content: str | None,
-    trigger_code: str = "",
-    source_links_by_target: dict[tuple[str, str], list[StoredLink]],
-    replacement_source_uris: list[str] | None = None,
-    include_all_sources: bool = False,
+    source_patch_ids: list[int],
+    source_links_by_patch_id: dict[int, list[StoredLink]],
 ) -> list[StoredLink]:
-    """Return only source trajectory links whose patch target maps to this plan item.
-
-    Patch merge can reconcile several independent patch proposals into one or
-    more final policy files.  Source links belong to the patch proposal that
-    produced them, not to the whole merge batch.  Therefore link propagation must
-    follow proposal-target/replacement provenance instead of broadcasting all
-    gradient links to every upsert.
-    """
-
-    links: list[StoredLink] = []
-    seen_source_keys: set[tuple[str, str]] = set()
-    candidate_keys = _plan_item_source_keys(
-        target_uri=target_uri,
-        target_name=target_name,
-        before_content=before_content,
-        after_content=after_content,
-        trigger_code=trigger_code,
-        source_links_by_target=source_links_by_target,
-        replacement_source_uris=replacement_source_uris or [],
-        include_all_sources=include_all_sources,
-    )
-    for key in candidate_keys:
-        if key in seen_source_keys:
-            continue
-        seen_source_keys.add(key)
-        links.extend(source_links_by_target.get(key, []))
+    links = [
+        link
+        for patch_id in source_patch_ids
+        for link in source_links_by_patch_id.get(int(patch_id), [])
+    ]
     return _merge_source_trajectory_links(
         _remap_source_trajectory_links(links, target_uri=target_uri)
     )
 
 
-def _plan_item_source_keys(
-    *,
-    target_uri: str,
-    target_name: str,
-    before_content: str | None,
-    after_content: str | None,
-    trigger_code: str = "",
-    source_links_by_target: dict[tuple[str, str], list[StoredLink]],
-    replacement_source_uris: list[str] | None = None,
-    include_all_sources: bool = False,
-) -> list[tuple[str, str]]:
-    keys: list[tuple[str, str]] = []
-    all_keys = list(source_links_by_target.keys())
-
-    def add(key: tuple[str, str]) -> None:
-        if key in source_links_by_target and key not in keys:
-            keys.append(key)
-
-    uri = str(target_uri or "")
-    name = str(target_name or "")
-    trigger = str(trigger_code or "").strip()
-    if uri:
-        add(("uri", uri))
-    if name:
-        add(("name", name))
-    if trigger:
-        add(("trigger_code", trigger))
-    for source_uri in replacement_source_uris or []:
-        add(("uri", source_uri))
-
-    # Existing-file updates and replacement deletes should inherit links from
-    # the previous canonical file that the merge output is editing/replacing.
-    for key in all_keys:
-        kind, value = key
-        if kind == "uri" and uri and value == uri:
-            add(key)
-        elif kind == "name" and name and value == name:
-            add(key)
-
-    # New proposals that keep their target URI/name may not have old content.
-    # If there is exactly one source candidate with the same rendered content,
-    # treat it as this plan item's source.  This handles URI/name normalization
-    # without turning duplicate-content batches into a broadcast.
-    content = str(after_content or "").strip()
-    if content:
-        matches = [key for key in all_keys if key[0] == "content" and key[1].strip() == content]
-        if len(matches) == 1:
-            add(matches[0])
-
-    source_identities = _source_identity_keys(source_links_by_target)
-    if include_all_sources:
-        for key in source_identities:
-            add(key)
-
-    # Single-patch merge: if the final URI/name was normalized, there is still
-    # only one possible source, so carry its provenance forward.
-    if not keys and len(source_identities) == 1:
-        keys.extend(source_identities)
-
-    return keys
-
-
-def _source_trajectory_links_by_target(
+def _source_trajectory_links_by_patch_id(
     gradients: list[SemanticGradient],
     policy_set: PolicySet,
-) -> dict[tuple[str, str], list[StoredLink]]:
-    result: dict[tuple[str, str], list[StoredLink]] = defaultdict(list)
-    seen: set[tuple[tuple[str, str], str, str | None]] = set()
-    for gradient in gradients:
-        links = _merge_source_trajectory_links(
+) -> dict[int, list[StoredLink]]:
+    return {
+        patch_id: _merge_source_trajectory_links(
             [
                 *list(getattr(gradient, "links", []) or []),
                 *_superseded_source_trajectory_links(gradient, policy_set),
             ]
         )
-        if not links:
-            continue
-        for key in _gradient_source_keys(gradient, policy_set):
-            for link in links:
-                dedupe_key = (key, link.to_uri, link.match_text)
-                if dedupe_key in seen:
-                    continue
-                seen.add(dedupe_key)
-                result[key].append(link)
-    return dict(result)
-
-
-def _source_trajectory_count(
-    source_links_by_target: dict[tuple[str, str], list[StoredLink]],
-) -> int:
-    return len(
-        {
-            link.to_uri
-            for links in source_links_by_target.values()
-            for link in links
-            if _is_source_trajectory_link(link) and link.to_uri
-        }
-    )
-
-
-def _gradient_source_keys(
-    gradient: SemanticGradient,
-    policy_set: PolicySet,
-) -> list[tuple[str, str]]:
-    keys: list[tuple[str, str]] = []
-
-    def add(kind: str, value: Any) -> None:
-        text = str(value or "").strip()
-        if text and (kind, text) not in keys:
-            keys.append((kind, text))
-
-    add("uri", gradient.target_uri)
-    add("name", gradient.target_name)
-    after_file = getattr(gradient, "after_file", None)
-    if after_file is not None:
-        add("content", getattr(after_file, "content", ""))
-        add("trigger_code", (getattr(after_file, "extra_fields", {}) or {}).get("trigger_code"))
-    before_file = getattr(gradient, "before_file", None)
-    if before_file is not None:
-        add("uri", getattr(before_file, "uri", None))
-        fields = getattr(before_file, "extra_fields", {}) or {}
-        add("name", fields.get("experience_name") or fields.get("name"))
-        add("content", getattr(before_file, "content", ""))
-        add("trigger_code", fields.get("trigger_code"))
-
-    superseded_policy = _find_superseded_policy(_gradient_supersedes(gradient), policy_set)
-    if superseded_policy is not None:
-        add("uri", superseded_policy.uri)
-        add("name", superseded_policy.name)
-        add("content", superseded_policy.content)
-        add("trigger_code", superseded_policy.metadata.get("trigger_code"))
-
-    return keys
+        for patch_id, gradient in enumerate(gradients, start=1)
+    }
 
 
 def _superseded_source_trajectory_links(
@@ -1222,22 +1061,6 @@ def _superseded_source_trajectory_links(
 ) -> list[StoredLink]:
     superseded_policy = _find_superseded_policy(_gradient_supersedes(gradient), policy_set)
     return _source_trajectory_links_from_experience(superseded_policy)
-
-
-def _upsert_output_count(
-    operations: Any,
-    *,
-    memory_type: str,
-    schema: MemoryTypeSchema,
-) -> int:
-    count = 0
-    for op in getattr(operations, "upsert_operations", []) or []:
-        if getattr(op, "memory_type", None) != memory_type:
-            continue
-        after_file = render_operation_after_file(op, schema=schema)
-        if _memory_file_has_schema_content(after_file, schema=schema):
-            count += 1
-    return count
 
 
 def _memory_file_has_schema_content(
@@ -1254,31 +1077,6 @@ def _memory_file_has_schema_content(
         if str(value or "").strip():
             return True
     return False
-
-
-def _replacement_source_uris_by_target(operations: Any) -> dict[str, list[str]]:
-    replacements = getattr(operations, "delete_replacements", {}) or {}
-    if not isinstance(replacements, dict):
-        return {}
-    result: dict[str, list[str]] = defaultdict(list)
-    for source_uri, target_uri in replacements.items():
-        source = str(source_uri or "").strip()
-        target = str(target_uri or "").strip()
-        if not source or not target or source == target:
-            continue
-        if source not in result[target]:
-            result[target].append(source)
-    return dict(result)
-
-
-def _source_identity_keys(
-    source_links_by_target: dict[tuple[str, str], list[StoredLink]],
-) -> list[tuple[str, str]]:
-    result: list[tuple[str, str]] = []
-    for key in source_links_by_target:
-        if key[0] in {"uri", "name"} and key not in result:
-            result.append(key)
-    return result
 
 
 def _is_source_trajectory_link(link: StoredLink) -> bool:

@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import difflib
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field, create_model
 
 from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import MemoryFile, MemoryTypeSchema
@@ -14,6 +16,7 @@ from openviking.session.memory.session_extract_context_provider import (
     SessionExtractContextProvider,
 )
 from openviking.session.memory.utils.language import resolve_output_language_from_text
+from openviking.telemetry import tracer
 
 _SYSTEM_HIDDEN_FIELDS = {
     "source_extraction_id",
@@ -32,6 +35,7 @@ class PatchMergePatch:
     before_file: MemoryFile | None
     after_file: MemoryFile
     metadata: dict[str, Any] = field(default_factory=dict)
+    patch_id: int | None = None
 
     @property
     def target_uri(self) -> str | None:
@@ -73,6 +77,14 @@ class PatchMergePatch:
                     return parts[-2]
             return uri.rstrip("/").split("/")[-1].removesuffix(".md")
         return "unknown"
+
+
+class PatchMergeSourceBinding(BaseModel):
+    """Invocation-local lineage from one merged operation to its input patches."""
+
+    operation_kind: Literal["upsert", "delete"]
+    operation_page_id: int
+    source_patch_ids: list[int]
 
 
 def _resolve_patch_output_language(patches: list[PatchMergePatch]) -> str:
@@ -127,7 +139,117 @@ class PatchMergeContextProvider(SessionExtractContextProvider):
         self.memory_type = memory_type
         self.required_file_uris = list(required_file_uris or [])
         self.patches = list(patches)
+        seen_patch_ids: set[int] = set()
+        for index, patch in enumerate(self.patches, start=1):
+            patch.patch_id = patch.patch_id or index
+            if patch.patch_id in seen_patch_ids:
+                raise ValueError(f"Duplicate PatchMerge patch_id: {patch.patch_id}")
+            seen_patch_ids.add(patch.patch_id)
         self._output_language = output_language or _resolve_patch_output_language(self.patches)
+
+    def create_operations_model(self, schema_model_generator: Any, role_scope: Any = None) -> Any:
+        base_model = super().create_operations_model(schema_model_generator, role_scope)
+        return create_model(
+            f"PatchMerge{base_model.__name__}",
+            __base__=base_model,
+            source_bindings=(
+                list[PatchMergeSourceBinding],
+                Field(
+                    ...,
+                    description=(
+                        "Required source lineage for every PatchMerge output operation. "
+                        "Reference output page_ids and the contributing input patch_ids."
+                    ),
+                ),
+            ),
+        )
+
+    def validate_and_attach_operation_metadata(
+        self,
+        raw_operations: Any,
+        resolved_operations: Any,
+    ) -> list[str]:
+        valid_patch_ids = {
+            int(patch.patch_id) for patch in self.patches if patch.patch_id is not None
+        }
+        upserts_by_page_id = {
+            int(operation.page_id): operation
+            for operation in list(resolved_operations.upsert_operations or [])
+            if operation.page_id is not None
+        }
+        resolved_delete_uris = {
+            str(memory_file.uri)
+            for memory_file in list(resolved_operations.delete_file_contents or [])
+            if memory_file.uri
+        }
+        page_id_map = getattr(self._extract_context, "page_id_map", None)
+        deletes_by_page_id: dict[int, str] = {}
+        for delete_id in list(getattr(raw_operations, "delete_ids", []) or []):
+            page_id = getattr(delete_id, "delete_page_id", None)
+            if page_id is None or page_id_map is None:
+                continue
+            uri = page_id_map.resolve(page_id)
+            if uri and str(uri) in resolved_delete_uris:
+                deletes_by_page_id[int(page_id)] = str(uri)
+        bindings_by_key: dict[tuple[str, int], list[int]] = {}
+        errors: list[str] = []
+
+        for binding in list(getattr(raw_operations, "source_bindings", []) or []):
+            key = (str(binding.operation_kind), int(binding.operation_page_id))
+            if key in bindings_by_key:
+                errors.append(
+                    "duplicate source binding for "
+                    f"operation_kind={key[0]} operation_page_id={key[1]}"
+                )
+                continue
+            source_patch_ids = list(dict.fromkeys(int(item) for item in binding.source_patch_ids))
+            if not source_patch_ids:
+                errors.append(
+                    f"empty source_patch_ids for operation_kind={key[0]} operation_page_id={key[1]}"
+                )
+                continue
+            unknown_patch_ids = sorted(set(source_patch_ids) - valid_patch_ids)
+            if unknown_patch_ids:
+                errors.append(
+                    f"unknown source_patch_ids={unknown_patch_ids} for "
+                    f"operation_kind={key[0]} operation_page_id={key[1]}"
+                )
+                continue
+            if key[0] == "upsert" and key[1] not in upserts_by_page_id:
+                errors.append(f"unknown upsert operation_page_id={key[1]}")
+                continue
+            if key[0] == "delete" and key[1] not in deletes_by_page_id:
+                errors.append(f"unknown delete operation_page_id={key[1]}")
+                continue
+            bindings_by_key[key] = source_patch_ids
+
+        for page_id in sorted(upserts_by_page_id):
+            if ("upsert", page_id) not in bindings_by_key:
+                errors.append(f"missing source binding for upsert operation_page_id={page_id}")
+        for page_id in sorted(deletes_by_page_id):
+            if ("delete", page_id) not in bindings_by_key:
+                errors.append(f"missing source binding for delete operation_page_id={page_id}")
+
+        if errors:
+            tracer.info(
+                "[patch_merge] source binding validation failed "
+                f"memory_type={self.memory_type} errors={errors}"
+            )
+            return errors
+
+        for page_id, operation in upserts_by_page_id.items():
+            operation.source_patch_ids = list(bindings_by_key[("upsert", page_id)])
+        resolved_operations.delete_source_patch_ids = {
+            uri: list(bindings_by_key[("delete", page_id)])
+            for page_id, uri in deletes_by_page_id.items()
+        }
+        tracer.info(
+            "[patch_merge] source bindings resolved "
+            f"memory_type={self.memory_type} "
+            f"upserts={[(page_id, operation.source_patch_ids) for page_id, operation in sorted(upserts_by_page_id.items())]} "
+            f"deletes={resolved_operations.delete_source_patch_ids}"
+        )
+        return []
 
     def instruction(self) -> str:
         output_language = self._output_language
@@ -160,6 +282,10 @@ Every upsert must preserve the `{self.memory_type}` schema's structured content 
 {structured_fields}. Put only content bodies in those fields; the storage template adds the
 Markdown structure.
 {experience_guidance}
+For every output upsert or delete, emit exactly one source binding in `source_bindings`.
+Set `operation_page_id` to that output operation's page_id and list every contributing input
+`patch_id` in `source_patch_ids`. Do not omit a binding, invent a patch_id, or bind an output to
+an unrelated patch.
 """
 
     def get_tools(self) -> list[str]:
@@ -263,7 +389,8 @@ def _render_one_field_diff_patch(
     *,
     schema: MemoryTypeSchema | None = None,
 ) -> str:
-    lines = [f"Patch {index}"]
+    patch_id = patch.patch_id or index
+    lines = [f"Patch {index} [patch_id={patch_id}]"]
     if patch.metadata:
         compact_metadata = _compact_patch_metadata(patch.metadata)
         if compact_metadata:

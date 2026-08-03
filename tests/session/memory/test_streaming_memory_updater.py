@@ -30,6 +30,7 @@ from openviking.session.memory.streaming_memory_updater import (
     StreamingMemoryUpdateResult,
     classify_memory_merge_mode,
     enforce_merge_group_peer_id,
+    merge_memory_operations,
     merge_one_memory_type_operations,
     operation_to_patch,
     render_operation_after_file_content,
@@ -204,6 +205,42 @@ def _note_op_with_source(name: str, extraction_id: str) -> ResolvedOperation:
     op = _note_op(name)
     op.memory_fields["source_extraction_id"] = extraction_id
     return op
+
+
+@pytest.mark.asyncio
+async def test_merge_memory_operations_uses_source_patch_bindings_for_extraction_provenance(
+    monkeypatch,
+):
+    first = _note_op_with_source("first", "extract_a")
+    second = _note_op_with_source("second", "extract_b")
+    merged_output = _note_op("renamed")
+    merged_output.source_patch_ids = [2]
+
+    async def fake_merge_one_memory_type_operations(**kwargs):
+        return ResolvedOperations(
+            upsert_operations=[merged_output],
+            delete_file_contents=[],
+            errors=[],
+        )
+
+    monkeypatch.setattr(
+        "openviking.session.memory.streaming_memory_updater.merge_one_memory_type_operations",
+        fake_merge_one_memory_type_operations,
+    )
+
+    merged = await merge_memory_operations(
+        operations=ResolvedOperations(
+            upsert_operations=[first, second],
+            delete_file_contents=[],
+            errors=[],
+        ),
+        messages=[],
+        ctx=_ctx(),
+        registry=_registry(),
+    )
+
+    assert merged.upsert_operations[0].memory_fields["source_extraction_id"] == "extract_b"
+    assert "source_extraction_ids" not in merged.upsert_operations[0].memory_fields
 
 
 def _peer_note_op(name: str, peer_id: str) -> ResolvedOperation:

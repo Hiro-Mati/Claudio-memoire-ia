@@ -188,6 +188,7 @@ class ExtractLoop:
         # Reset format retry counter for each run
         self._format_retry_count = 0
         patch_repair_count = 0
+        operation_metadata_repair_count = 0
         post_validation_retry_count = 0
 
         # 从 provider 获取 schemas（内部自动加载 registry）
@@ -226,8 +227,9 @@ class ExtractLoop:
         # 预计算 operations_model
         role_scope = self._isolation_handler.get_read_scope() if self._isolation_handler else None
 
-        self._operations_model = self.schema_model_generator.create_structured_operations_model(
-            role_scope
+        self._operations_model = self.context_provider.create_operations_model(
+            self.schema_model_generator,
+            role_scope,
         )
 
         json_schema = self._operations_model.model_json_schema()
@@ -343,6 +345,36 @@ OUTPUT_SCHEMA definition itself.
                         console=True,
                     )
                     continue
+
+                operation_metadata_errors = (
+                    self.context_provider.validate_and_attach_operation_metadata(
+                        operations,
+                        final_operations,
+                    )
+                )
+                if operation_metadata_errors:
+                    if operation_metadata_repair_count == 0:
+                        operation_metadata_repair_count += 1
+                        max_iterations += 1
+                        self._disable_tools_for_iteration = True
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": self._build_operation_metadata_repair_instruction(
+                                    operation_metadata_errors
+                                ),
+                            }
+                        )
+                        tracer.info(
+                            "Extended max_iterations to "
+                            f"{max_iterations} for provider operation metadata repair",
+                            console=True,
+                        )
+                        continue
+                    details = "; ".join(operation_metadata_errors)
+                    raise ValueError(
+                        "Provider operation metadata validation failed after retry: " + details
+                    )
 
                 if self.post_validation_hook is not None:
                     decision = await self._run_post_validation_hook(
@@ -1063,6 +1095,16 @@ OUTPUT_SCHEMA definition itself.
             "Output ONLY the complete JSON object as an instance of OUTPUT_SCHEMA; "
             "do not output the OUTPUT_SCHEMA definition itself, JSON Schema metadata, $defs, or properties.\n\n"
             f"Failed patch operations:\n{details}"
+        )
+
+    def _build_operation_metadata_repair_instruction(self, errors: List[str]) -> str:
+        details = "\n".join(f"- {error}" for error in errors)
+        return (
+            "Provider-specific operation metadata is invalid. Regenerate the complete operations "
+            "JSON and preserve every valid memory operation while correcting the metadata errors "
+            "below. Output ONLY the complete JSON object as an instance of OUTPUT_SCHEMA; do not "
+            "output the OUTPUT_SCHEMA definition itself, JSON Schema metadata, $defs, or "
+            f"properties.\n\nMetadata errors:\n{details}"
         )
 
     async def _add_refetch_results_to_messages(

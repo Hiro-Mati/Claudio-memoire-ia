@@ -306,6 +306,7 @@ class ResolvedOperation(BaseModel):
     add_only_uri_bases: Dict[str, str] = Field(default_factory=dict, exclude=True, repr=False)
     page_id: Optional[int] = None  # Temporary page_id for link resolution (not persisted)
     source: Optional[MemoryOperationSource] = None
+    source_patch_ids: List[int] = Field(default_factory=list, exclude=True, repr=False)
 
     def is_edit(self):
         return self.old_memory_file_content is not None
@@ -317,6 +318,11 @@ class ResolvedOperations(BaseModel):
     errors: List[str]
     resolved_links: List[StoredLink] = Field(default_factory=list)
     delete_replacements: Dict[str, str] = Field(default_factory=dict)
+    delete_source_patch_ids: Dict[str, List[int]] = Field(
+        default_factory=dict,
+        exclude=True,
+        repr=False,
+    )
 
     def has_errors(self) -> bool:
         return len(self.errors) > 0

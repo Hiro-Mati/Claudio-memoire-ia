@@ -17,6 +17,21 @@ from openviking.server.identity import RequestContext
 class ExtractContextProvider(ABC):
     """Extract Context Provider 接口"""
 
+    def create_operations_model(self, schema_model_generator: Any, role_scope: Any = None) -> Any:
+        """Select the structured output model for this extraction run."""
+
+        return schema_model_generator.create_structured_operations_model(role_scope)
+
+    def validate_and_attach_operation_metadata(
+        self,
+        raw_operations: Any,
+        resolved_operations: Any,
+    ) -> List[str]:
+        """Validate provider-specific output metadata and attach runtime state."""
+
+        del raw_operations, resolved_operations
+        return []
+
     @abstractmethod
     def instruction(self) -> str:
         """
