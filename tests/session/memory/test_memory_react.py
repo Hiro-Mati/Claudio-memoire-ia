@@ -8,6 +8,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic import Field, create_model
 
 from openviking.session.memory.dataclass import (
     MemoryField,
@@ -20,6 +21,7 @@ from openviking.session.memory.extract_loop import (
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.memory.memory_updater import ExtractContext
 from openviking.session.memory.merge_op.base import FieldType, MergeOp
+from openviking.session.memory.patch_merge_context_provider import PatchMergeSourceBinding
 
 
 class TestPreFetchFileFiltering:
@@ -424,6 +426,68 @@ class TestExtractLoopPostValidationHook:
             and "missing source binding for upsert operation_page_id=100" in message["content"]
             for message in retry_messages
         )
+
+    @pytest.mark.asyncio
+    async def test_provider_operations_model_fields_survive_json_parsing(self):
+        class ProviderWithSourceBindings(self._FakeContextProvider):
+            def __init__(self, schemas):
+                super().__init__(schemas)
+                self.received_source_bindings = None
+
+            def create_operations_model(self, schema_model_generator, role_scope=None):
+                base_model = super().create_operations_model(
+                    schema_model_generator,
+                    role_scope,
+                )
+                return create_model(
+                    "ProviderOperations",
+                    __base__=base_model,
+                    source_bindings=(list[PatchMergeSourceBinding], Field(...)),
+                )
+
+            def validate_and_attach_operation_metadata(
+                self,
+                raw_operations,
+                resolved_operations,
+            ):
+                self.received_source_bindings = raw_operations.source_bindings
+                return []
+
+        provider = ProviderWithSourceBindings([self._preference_schema()])
+        response = json.dumps(
+            {
+                "preferences": [
+                    {
+                        "page_id": 100,
+                        "topic": "color",
+                        "content": "blue",
+                    }
+                ],
+                "delete_ids": [],
+                "source_bindings": [
+                    {
+                        "operation_kind": "upsert",
+                        "operation_page_id": 100,
+                        "source_patch_ids": [1],
+                    }
+                ],
+            }
+        )
+        extract_loop = ExtractLoop(
+            vlm=self._SequenceVLM([response]),
+            viking_fs=MagicMock(),
+            context_provider=provider,
+            isolation_handler=self._FakeIsolationHandler(),
+            max_iterations=1,
+        )
+
+        result, _ = await extract_loop.run()
+
+        assert result.errors == []
+        assert result.upsert_operations[0].memory_fields["content"] == "blue"
+        assert provider.received_source_bindings[0].source_patch_ids == [1]
+        assert "delete_ids" in extract_loop._expected_fields
+        assert "source_bindings" in extract_loop._expected_fields
 
     @pytest.mark.asyncio
     async def test_post_validation_hook_can_append_latest_draft_and_retry(self):

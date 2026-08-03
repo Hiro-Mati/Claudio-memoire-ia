@@ -210,19 +210,14 @@ class ExtractLoop:
             if tool.name in allowed_tools
         ]
 
-        # 预计算 expected_fields
+        # 预计算 link 配置
         config = get_openviking_config()
         self._link_enabled = config.memory.link_enabled if config.memory else False
-        self._expected_fields = []
-        if self._link_enabled:
-            self._expected_fields.append("links")
 
         # 获取 ExtractContext（整个流程复用）
         self._extract_context = self.context_provider.get_extract_context()
         if self._extract_context is None:
             raise ValueError("Failed to get ExtractContext from provider")
-        for schema in schemas:
-            self._expected_fields.append(f"{schema.memory_type}")
 
         # 预计算 operations_model
         role_scope = self._isolation_handler.get_read_scope() if self._isolation_handler else None
@@ -231,6 +226,7 @@ class ExtractLoop:
             self.schema_model_generator,
             role_scope,
         )
+        self._expected_fields = list(self._operations_model.model_fields)
 
         json_schema = self._operations_model.model_json_schema()
 
