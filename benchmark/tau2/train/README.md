@@ -29,7 +29,7 @@ What the launcher does:
 Default train/eval arguments, when no custom train/eval args are passed, are:
 
 ```bash
---commit-concurrency 200 --epochs 2 --trials 8 --train-trials 1 --skip-final-eval
+--commit-concurrency 150 --epochs 2 --trials 8 --train-trials 1 --skip-final-eval
 ```
 
 If you pass any train/eval arguments to `restart_vikingbot_train_eval.sh`, that
@@ -207,8 +207,8 @@ result/tau2/<result-dir-name>/service_logs/
 | `--domain` | `airline` | Benchmark domain to run |
 | `--epochs` | `1`; restart default `2` | Number of training epochs. Use `0` for eval-only. |
 | `--batch-size` | whole split | Train/eval batch size (cases per batch) |
-| `--concurrency` | `200` in Tau2 wrapper | Max concurrent rollout executions |
-| `--commit-concurrency` | `200` in Tau2 wrapper | Max concurrent `session.commit` submissions during training |
+| `--concurrency` | `50` in Tau2 wrapper | Max concurrent rollout executions |
+| `--commit-concurrency` | `150` in Tau2 wrapper | Max concurrent `session.commit` submissions during training |
 | `--trials` | `8` | Run each eval case N times and aggregate scores |
 | `--train-trials` | `1` | Run each train case N times per epoch |
 | `--train-index` | all | Run train sample(s) at 0-based split index/indices, e.g. `7` or `1,5,6` |
