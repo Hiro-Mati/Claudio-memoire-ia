@@ -6,6 +6,7 @@ Session as Context: Sessions integrated into L0/L1/L2 system.
 """
 
 import asyncio
+import inspect
 import json
 import re
 from dataclasses import dataclass, field
@@ -559,7 +560,7 @@ class Session:
         tool_output_externalization_config: Optional[ToolOutputExternalizationConfig] = None,
         agent_evolution_enabled: bool = True,
         usage_reporter: Optional["UsageReporter"] = None,
-        agent_evolution_enabled_provider: Optional[Callable[[], bool]] = None,
+        agent_evolution_enabled_provider: Optional[Callable[[], bool | Awaitable[bool]]] = None,
     ):
         self._viking_fs = viking_fs
         self._vikingdb_manager = vikingdb_manager
@@ -1736,11 +1737,14 @@ class Session:
             memory_policy if memory_policy is not None else self._meta.memory_policy
         )
         _validate_memory_policy_types(effective_policy)
-        agent_evolution_enabled = (
-            self._agent_evolution_enabled_provider()
-            if self._agent_evolution_enabled_provider is not None
-            else self._agent_evolution_enabled
-        )
+        agent_evolution_enabled = self._agent_evolution_enabled
+        if self._agent_evolution_enabled_provider is not None:
+            provided_enabled = self._agent_evolution_enabled_provider()
+            agent_evolution_enabled = (
+                await provided_enabled
+                if inspect.isawaitable(provided_enabled)
+                else provided_enabled
+            )
         effective_policy = _apply_agent_evolution_setting(
             effective_policy,
             agent_evolution_enabled=agent_evolution_enabled,
@@ -3798,7 +3802,29 @@ class Session:
         combined: List[Message] = []
         completed_memory_steps: Dict[str, set[str]] = {}
         for state in replay_states:
-            combined.extend(await self._read_archive_messages(state.archive_uri))
+            # A terminally-failed earlier archive can have a missing or corrupt
+            # messages.jsonl (legacy "no messages" data, or #3417's own
+            # archive_read terminal path). Tolerate that exactly like
+            # _get_uncovered_archive_messages does, otherwise every subsequent
+            # commit's Phase 2 re-raises here and stays permanently poisoned.
+            # Real storage failures still propagate.
+            try:
+                replayed = await self._read_archive_messages(state.archive_uri)
+            except _ArchiveMessagesCorruptError:
+                logger.warning(
+                    "Skipping failed archive %s in Phase-2 replay: messages.jsonl is corrupt",
+                    state.archive_uri,
+                )
+                continue
+            except Exception as exc:
+                if not _is_storage_not_found(exc):
+                    raise
+                logger.warning(
+                    "Skipping failed archive %s in Phase-2 replay: messages.jsonl is missing",
+                    state.archive_uri,
+                )
+                continue
+            combined.extend(replayed)
             marker = state.failed
             self._merge_completed_memory_steps(
                 completed_memory_steps,
