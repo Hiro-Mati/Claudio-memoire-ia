@@ -29,6 +29,7 @@ from vikingbot.compile.models import (
     CompileLimits,
     CompileOutputPlan,
     CompileRequest,
+    CompileRuleCheck,
     CompileSkillChecklist,
     CompileSkillRule,
     CompileTask,
@@ -857,6 +858,52 @@ async def test_compile_output_receipt_requires_real_files_and_planned_page_citat
     accepted = await tool.execute(context, output_ids=["page-001", "index"])
     assert accepted == "Compile output batch accepted with 2 file(s)."
     assert tool.receipt is not None
+
+
+@pytest.mark.asyncio
+async def test_compile_output_receipt_tolerates_extra_ids_but_requires_batch_ids():
+    source_uri = "viking://resources/source/a.md"
+    files = {
+        "__compile_staging__/wiki_pages/concepts/reading.md": (
+            f"# Reading\n\n[Source]({source_uri})".encode()
+        ),
+        "index.md": b"# Index",
+    }
+
+    class Sandbox:
+        async def read_file_bytes(self, path):
+            return files[path]
+
+    class Manager:
+        async def get_sandbox(self, session_key):
+            del session_key
+            return Sandbox()
+
+    tool = SubmitCompileOutputsTool(
+        expected_paths={
+            "page-001": ("__compile_staging__/wiki_pages/concepts/reading.md", True),
+            "index": ("index.md", False),
+        },
+        expected_source_uris={"page-001": (source_uri,)},
+        required_workspace_reads=set(),
+        observed_workspace_paths=set(),
+        limits=CompileLimits(),
+    )
+    context = ToolContext(
+        session_key=SessionKey(type="compile", channel_id="cmp", chat_id="cmp"),
+        sandbox_manager=Manager(),
+    )
+
+    # Model echoes the whole plan (extra ids from other batches) -> still accepted.
+    accepted = await tool.execute(
+        context, output_ids=["page-001", "index", "page-999", "page-999"]
+    )
+    assert accepted.startswith("Compile output batch accepted")
+
+    # Missing an output assigned to this batch -> rejected with the missing id named.
+    missing = await tool.execute(context, output_ids=["page-001"])
+    assert "must include every output assigned to this batch" in missing
+    assert "index" in missing
 
 
 @pytest.mark.asyncio
@@ -2456,8 +2503,12 @@ async def test_submit_tool_rejects_protected_anchor_and_path_collision():
         ],
         links=[{"f": 1, "t": 2, "match_text": "Two"}],
     )
-    assert protected.startswith("Error:")
-    assert tool.bundle is None
+    # A non-linkable anchor is dropped rather than failing the whole bundle.
+    assert protected.startswith("Compile bundle accepted")
+    assert "Dropped 1 non-linkable inter-page link(s)." in protected
+    assert tool.bundle is not None
+    assert tool.bundle.links == []
+    assert tool.dropped_links
 
     accepted = await tool.execute(context, pages=[], links=[])
     assert "must contain at least one output" in accepted
@@ -2591,7 +2642,7 @@ async def test_submit_tool_resolves_existing_updates_outside_relevant_catalog():
 
 
 @pytest.mark.asyncio
-async def test_submit_tool_reports_all_invalid_links():
+async def test_submit_tool_drops_non_linkable_links_but_keeps_pages():
     tool = SubmitCompileBundleTool(
         source_ids={"src_1"},
         catalog_uris=set(),
@@ -2612,9 +2663,35 @@ async def test_submit_tool_reports_all_invalid_links():
         ],
     )
 
-    assert result.startswith("Error: Invalid Compile bundle: 2 invalid link(s):")
-    assert "links[0] from page 1 has non-linkable anchor 'Missing One'" in result
-    assert "links[1] from page 1 has non-linkable anchor 'Missing Two'" in result
+    assert result.startswith("Compile bundle accepted with 3 page(s)")
+    assert "Dropped 2 non-linkable inter-page link(s)." in result
+    assert tool.bundle is not None
+    assert tool.bundle.links == []
+    assert len(tool.dropped_links) == 2
+
+
+@pytest.mark.asyncio
+async def test_submit_tool_still_rejects_structurally_invalid_links():
+    tool = SubmitCompileBundleTool(
+        source_ids={"src_1"},
+        catalog_uris=set(),
+        target_uri="viking://resources/wiki",
+        limits=CompileLimits(),
+    )
+
+    result = await tool.execute(
+        ToolContext(),
+        pages=[
+            _page(1, "One", body_markdown="First page body"),
+            _page(2, "Two"),
+        ],
+        links=[
+            {"f": 1, "t": 1, "match_text": "First page body"},
+        ],
+    )
+
+    assert result.startswith("Error: Invalid Compile bundle: 1 invalid link(s):")
+    assert "must not be a self-link" in result
     assert tool.bundle is None
 
 
@@ -3760,7 +3837,256 @@ async def _empty_receipts():
     return []
 
 
+@pytest.mark.asyncio
+async def test_execute_completes_best_effort_when_plan_audit_never_converges(
+    monkeypatch, tmp_path: Path
+):
+    target_uri = "viking://resources/wiki"
+    source_uri = "viking://resources/source/a.md"
 
+    class TaskConfig:
+        def __init__(self):
+            self.bot_data_path = tmp_path
+            self.workspace_path = tmp_path / "host-workspace"
+            self.skills = []
+            self.sandbox = SimpleNamespace(mode=None)
+            self.agents = SimpleNamespace(compile_temperature=0.0, compile_allow_partial=True)
+
+        def model_copy(self, *, deep):
+            assert deep is True
+            return TaskConfig()
+
+    class FakeSandboxManager:
+        def __init__(self, config, workspace_parent, workspace_path):
+            del config, workspace_path
+            self.workspace = workspace_parent / "workspace"
+            self.workspace.mkdir(parents=True)
+
+        def get_workspace_path(self, session_key):
+            del session_key
+            return self.workspace
+
+        async def get_sandbox(self, session_key):
+            del session_key
+            workspace = self.workspace
+
+            class Sandbox:
+                async def write_file(self, path, content):
+                    target = workspace / path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if isinstance(content, bytes):
+                        target.write_bytes(content)
+                    else:
+                        target.write_text(content, encoding="utf-8")
+
+                async def read_file_bytes(self, path):
+                    return (workspace / path).read_bytes()
+
+            return Sandbox()
+
+        async def cleanup_session(self, session_key):
+            del session_key
+
+    class FakeSkillsLoader:
+        def __init__(self, workspace, *, builtin_skills_dir):
+            del workspace, builtin_skills_dir
+
+        def load_skills_for_context(self, names):
+            del names
+            return "Transform sources into a Wiki."
+
+        def _get_skill_meta(self, name):
+            del name
+            return {}
+
+    class FakeRequestLoop:
+        def __init__(self, **kwargs):
+            self.sandbox_manager = kwargs["sandbox_manager"]
+
+        async def close_mcp(self):
+            return None
+
+    class Client:
+        def __init__(self):
+            self.operations = None
+
+        async def get_skill(self, skill_name, *, target_uri):
+            del skill_name, target_uri
+            return {
+                "root_uri": "viking://agent/skills/llm-wiki",
+                "content": "---\nname: llm-wiki\ndescription: Wiki\n---\nWrite it.",
+                "files": [],
+            }
+
+        async def read_raw(self, uri):
+            del uri
+            return ""
+
+        async def download_bytes(self, uri):
+            del uri
+            return b""
+
+        async def batch_write(self, *, root_uri, operations, wait, timeout):
+            del root_uri, wait, timeout
+            self.operations = operations
+            created = [op["uri"] for op in operations]
+            return {"created": created, "updated": [], "unchanged": []}
+
+        @property
+        def client(self):
+            return self
+
+        async def set_tags(self, uri, tags, *, mode):
+            del uri, tags, mode
+            return {"tags_updated": True}
+
+        async def close(self):
+            return None
+
+    class Store:
+        def __init__(self, task):
+            self.task = task
+
+        async def update(self, task_id, mutate):
+            assert task_id == self.task.task_id
+            mutate(self.task)
+            return self.task
+
+    async def create_client(**kwargs):
+        del kwargs
+        return client
+
+    async def no_op(*args, **kwargs):
+        del args, kwargs
+
+    async def build_sources(client, roots):
+        del client, roots
+        return [
+            {
+                "source_id": "src_1",
+                "directory_uri": "viking://resources/source",
+                "overview": "Source overview",
+                "entries": [{"uri": source_uri, "is_dir": False, "name": "a.md"}],
+                "catalog_truncated": False,
+            }
+        ]
+
+    async def build_catalog(client, target, *, query):
+        del client, target, query
+        return [], {}
+
+    async def build_skill_checklist(**kwargs):
+        del kwargs
+        return CompileSkillChecklist()
+
+    plan = _partial_plan(source_uri)
+
+    async def plan_outputs(**kwargs):
+        del kwargs
+        return plan
+
+    audit_calls = {"count": 0}
+
+    async def never_converging_plan_audit(**kwargs):
+        # Same failing rule every round: re-planning cannot make progress, so the
+        # loop must detect the stall and stop instead of exhausting all attempts.
+        del kwargs
+        audit_calls["count"] += 1
+        return CompileValidationReport(
+            passed=False,
+            issues=[{"code": "UNPROVABLE", "message": "read schema first: no evidence"}],
+            rule_checks=[
+                CompileRuleCheck(
+                    rule_id="read_schema_first",
+                    passed=False,
+                    evidence="no evidence in artifacts",
+                )
+            ],
+        )
+
+    async def pass_validation(**kwargs):
+        del kwargs
+        return CompileValidationReport(passed=True)
+
+    async def materialize_outputs(**kwargs):
+        sandbox = await kwargs["request_loop"].sandbox_manager.get_sandbox(kwargs["session_key"])
+        await sandbox.write_file(
+            "__compile_staging__/wiki_pages/concepts/reading-skills.md",
+            f"# Reading Skills\n\n[Source]({source_uri})",
+        )
+        await sandbox.write_file(
+            "__compile_staging__/wiki_pages/concepts/assessment-methods.md",
+            f"# Assessment Methods\n\n[Source]({source_uri})",
+        )
+        await sandbox.write_file("index.md", "# Index\n")
+
+    monkeypatch.setattr("vikingbot.compile.service.SandboxManager", FakeSandboxManager)
+    monkeypatch.setattr("vikingbot.compile.service.SkillsLoader", FakeSkillsLoader)
+    monkeypatch.setattr("vikingbot.compile.service.AgentLoop", FakeRequestLoop)
+    monkeypatch.setattr("vikingbot.compile.service.VikingClient.create", create_client)
+
+    host_loop = SimpleNamespace(
+        config=TaskConfig(),
+        bus=None,
+        provider=None,
+        workspace=tmp_path,
+        model=None,
+        temperature=0,
+        max_iterations=1,
+        memory_window=1,
+        brave_api_key=None,
+        exa_api_key=None,
+        gen_image_model=None,
+        exec_config=None,
+        _mcp_servers={},
+    )
+    service = BotCompileService(agent_loop=host_loop)
+    request = SanitizedCompileRequest.model_validate(
+        {
+            "from": ["viking://resources/source"],
+            "to": target_uri,
+            "skill": "viking://agent/skills/llm-wiki",
+            "reason": "Compile the source into a Wiki",
+        }
+    )
+    task = CompileTask(
+        task_id="cmp_plan_stall",
+        principal_scope="owner",
+        sanitized_request=request,
+        status="accepted",
+        stage="queued",
+        created_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    client = Client()
+    service.store = Store(task)
+    monkeypatch.setattr(service, "_materialize_skill", no_op)
+    monkeypatch.setattr(
+        service,
+        "_load_skill_texts",
+        lambda skill_dir: {"SKILL.md": "---\nname: llm-wiki\ndescription: Wiki\n---\nWrite it."},
+    )
+    monkeypatch.setattr(service, "_check_requirements", no_op)
+    monkeypatch.setattr(service, "_build_sources", build_sources)
+    monkeypatch.setattr(service, "_build_catalog", build_catalog)
+    monkeypatch.setattr(service, "_build_skill_checklist", build_skill_checklist)
+    monkeypatch.setattr(service, "_run_work_items", lambda **kwargs: _empty_receipts())
+    monkeypatch.setattr(service, "_plan_outputs", plan_outputs)
+    monkeypatch.setattr(service, "_audit_output_plan", never_converging_plan_audit)
+    monkeypatch.setattr(service, "_run_output_batches", materialize_outputs)
+    monkeypatch.setattr(service, "_audit_candidate", pass_validation)
+
+    await service._execute_task(task.task_id, request, {"api_key": "secret"})
+
+    # The run completes best-effort with output rather than discarding everything.
+    assert task.status == "completed"
+    assert task.result is not None
+    assert task.result.page_count == 2
+    assert task.result.warnings
+    assert any("Plan audit did not fully pass" in line for line in task.result.warnings)
+    # Non-convergence is detected early: the second identical failure stops the loop
+    # rather than running all repair attempts.
+    assert audit_calls["count"] == 2
 @pytest.mark.asyncio
 async def test_source_context_builds_bounded_compact_recursive_catalog():
     class Client:

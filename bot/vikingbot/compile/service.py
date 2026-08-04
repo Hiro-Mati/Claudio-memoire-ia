@@ -770,7 +770,9 @@ class BotCompileService:
 
             prompt_sources = self._sources_for_prompt(sources)
             plan_report: CompileValidationReport | None = None
+            plan_audit_warnings: list[str] = []
             plan_repair_rounds = self.limits.repair_attempts if self.limits.plan_audit_enabled else 0
+            previous_failed_rules: set[str] | None = None
             for attempt in range(plan_repair_rounds + 1):
                 await self._set_state(
                     task_id,
@@ -826,16 +828,29 @@ class BotCompileService:
                 )
                 if plan_report.passed:
                     break
-            else:
-                issues = (
-                    "; ".join(issue.message for issue in plan_report.issues)
-                    if plan_report is not None
-                    else ""
-                )
-                raise CompileFailure(
-                    "CONTRACT_VALIDATION_FAILED",
-                    issues or "Compile output plan did not satisfy the selected Skill.",
-                    stage="validating_plan",
+                # Stop re-planning once repair stalls: if this round failed the exact
+                # same rules as the last, another identical plan will not converge.
+                failed_rules = {
+                    check.rule_id for check in plan_report.rule_checks if not check.passed
+                }
+                if previous_failed_rules is not None and failed_rules == previous_failed_rules:
+                    break
+                previous_failed_rules = failed_rules
+            if plan_report is not None and not plan_report.passed:
+                issues = "; ".join(issue.message for issue in plan_report.issues)
+                # A failing plan audit that will not converge should not discard the whole
+                # run. Proceed best-effort into materialization (which salvages written
+                # outputs) unless strict mode is configured, surfacing the unresolved
+                # audit findings as warnings.
+                if not self._compile_allow_partial():
+                    raise CompileFailure(
+                        "CONTRACT_VALIDATION_FAILED",
+                        issues or "Compile output plan did not satisfy the selected Skill.",
+                        stage="validating_plan",
+                    )
+                plan_audit_warnings.append(
+                    "Plan audit did not fully pass; proceeded best-effort. Unresolved: "
+                    + (issues or "unspecified plan-audit findings")
                 )
 
             validation_report: CompileValidationReport | None = None
@@ -968,6 +983,7 @@ class BotCompileService:
                 plan, submit_tool, bundle, file_payloads, partial_warnings = partial
             else:
                 partial_warnings = []
+            partial_warnings = [*plan_audit_warnings, *partial_warnings]
 
             source_count = len(self._source_file_uris(sources))
             processed_source_count = len(
@@ -1092,6 +1108,15 @@ class BotCompileService:
             unchanged = list(
                 dict.fromkeys([*rendered.unchanged, *batch_result.get("unchanged", [])])
             )
+            dropped_links = list(getattr(submit_tool, "dropped_links", []) or [])
+            dropped_warnings = (
+                [
+                    f"Dropped {len(dropped_links)} inter-page link(s) whose anchor text "
+                    "was not found verbatim in the source page body; pages were kept intact."
+                ]
+                if dropped_links
+                else []
+            )
             result = CompileResult(
                 **{
                     "from": request.from_,
@@ -1107,7 +1132,7 @@ class BotCompileService:
                     "processed_source_count": processed_source_count,
                     "validation_attempts": validation_attempts,
                     "contract_source": contract_source,
-                    "warnings": partial_warnings,
+                    "warnings": [*partial_warnings, *dropped_warnings, *rendered.warnings],
                 }
             )
 

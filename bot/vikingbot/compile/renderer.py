@@ -56,6 +56,7 @@ class RenderedBundle:
     unchanged: list[str] = field(default_factory=list)
     wiki_uris: list[str] = field(default_factory=list)
     link_count: int = 0
+    warnings: list[str] = field(default_factory=list)
 
 
 def content_hash(content: str | bytes) -> str:
@@ -468,6 +469,9 @@ class WikiRenderer:
             ):
                 raise ValueError(f"workspace payload was not loaded for file {index}")
 
+        result = RenderedBundle()
+        linkable_links = []
+        dropped_links = 0
         for link in bundle.links:
             if link.f is None or link.t is None or link.f == link.t:
                 raise ValueError("WikiLink endpoints must be non-null and non-self")
@@ -476,6 +480,10 @@ class WikiRenderer:
                 raise ValueError(f"WikiLink references an unknown page_id: f={link.f}, t={link.t}")
             if not link.match_text:
                 raise ValueError("WikiLink match_text is required")
+            # A match_text that does not appear as a linkable span in the source
+            # body (models sometimes emit a relationship *description* instead of
+            # exact body text) must not sink the whole bundle: drop just that link
+            # and keep every page. The graph loses one edge; the content survives.
             if (
                 LinkRenderer._find_match_span(
                     source_page.body_markdown,
@@ -484,13 +492,18 @@ class WikiRenderer:
                 )
                 is None
             ):
-                raise ValueError(
-                    f"WikiLink match_text is not a linkable body anchor: {link.match_text!r}"
-                )
+                dropped_links += 1
+                continue
+            linkable_links.append(link)
 
-        resolved_links = resolve_wiki_links(bundle.links, page_uris, strict=True)
+        if dropped_links:
+            result.warnings.append(
+                f"Dropped {dropped_links} inter-page link(s) whose anchor text was not "
+                "found verbatim in the source page body; pages were kept intact."
+            )
+
+        resolved_links = resolve_wiki_links(linkable_links, page_uris, strict=True)
         page_titles = {page_uris[page.page_id][0]: page.title.strip() for page in bundle.pages}
-        result = RenderedBundle()
         total_bytes = 0
         for page in bundle.pages:
             uri = page_uris[page.page_id][0]

@@ -803,10 +803,18 @@ class SubmitCompileOutputsTool(Tool):
         self.receipt = None
         try:
             receipt = CompileOutputReceipt(output_ids=output_ids)
-            if len(receipt.output_ids) != len(set(receipt.output_ids)) or set(
-                receipt.output_ids
-            ) != set(self.expected_paths):
-                raise ValueError("output_ids must contain every assigned output exactly once")
+            submitted = set(receipt.output_ids)
+            expected = set(self.expected_paths)
+            # Accept as long as every output assigned to THIS batch was submitted.
+            # Models sometimes echo the whole plan's output_ids instead of just the
+            # batch's; extras that belong to other batches are ignored rather than
+            # rejected, which previously caused a submit/reject spin loop.
+            missing_ids = sorted(expected - submitted)
+            if missing_ids:
+                raise ValueError(
+                    "output_ids must include every output assigned to this batch; missing: "
+                    + ", ".join(missing_ids)
+                )
             unread = sorted(self.required_workspace_reads - self.observed_workspace_paths)
             if unread:
                 raise ValueError("required workspace files were not read: " + ", ".join(unread))
@@ -970,6 +978,7 @@ class SubmitCompileBundleTool(Tool):
         self.page_workspace_paths: dict[int, str] = {}
         self.workspace_files: set[str] | None = None
         self.skill_name: str | None = None
+        self.dropped_links: list[str] = []
 
     @property
     def _is_skill_target(self) -> bool:
@@ -1084,6 +1093,7 @@ class SubmitCompileBundleTool(Tool):
         self.page_workspace_paths = {}
         self.workspace_files = None
         self.skill_name = None
+        self.dropped_links = []
         raw_links = links or []
         for index, link in enumerate(raw_links):
             if not isinstance(link, Mapping) or set(link) - _LINK_FIELDS:
@@ -1116,9 +1126,14 @@ class SubmitCompileBundleTool(Tool):
             return (
                 f"Skill bundle accepted for '{self.skill_name}' with {len(bundle.files)} file(s)."
             )
+        dropped_note = (
+            f" Dropped {len(self.dropped_links)} non-linkable inter-page link(s)."
+            if self.dropped_links
+            else ""
+        )
         return (
             f"Compile bundle accepted with {len(bundle.pages)} page(s) and "
-            f"{len(bundle.files)} file(s)."
+            f"{len(bundle.files)} file(s).{dropped_note}"
         )
 
     async def _list_workspace_files(
@@ -1412,6 +1427,8 @@ class SubmitCompileBundleTool(Tool):
             self.skill_name = self._validate_skill_bundle(bundle, file_payloads)
         page_by_id = {page.page_id: page for page in bundle.pages}
         link_errors: list[str] = []
+        dropped_links: list[str] = []
+        kept_links: list[Any] = []
         for index, link in enumerate(bundle.links):
             prefix = f"links[{index}]"
             if link.f is None or link.t is None:
@@ -1438,13 +1455,17 @@ class SubmitCompileBundleTool(Tool):
                 )
                 is None
             ):
-                link_errors.append(
-                    f"{prefix} from page {link.f} has non-linkable anchor "
-                    f"{link.match_text!r}; remove the link or use exact unprotected "
-                    "text from that page body"
+                # Anchor text isn't a verbatim body span: drop just this link so the
+                # pages still land, rather than failing the whole bundle.
+                dropped_links.append(
+                    f"page {link.f} anchor {link.match_text!r} not found verbatim in body"
                 )
+                continue
+            kept_links.append(link)
         if link_errors:
             raise ValueError(f"{len(link_errors)} invalid link(s): " + "; ".join(link_errors))
+        bundle.links = kept_links
+        self.dropped_links = dropped_links
         return file_payloads
 
     def _validate_contract(self, bundle: CompileBundleDraft) -> None:
