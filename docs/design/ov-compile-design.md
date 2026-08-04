@@ -2,13 +2,13 @@
 
 | 项目 | 信息 |
 | --- | --- |
-| 状态 | 待实现 |
+| 状态 | 已实现 |
 | 目标版本 | v1 |
-| 更新日期 | 2026-07-20 |
+| 更新日期 | 2026-08-03 |
 
 ## 1. 概述
 
-`ov compile` 使用指定 Skill 整理 OpenViking 中的材料，并在目标目录生成或更新 Wiki 页面。
+`ov compile` 使用指定 Skill 把 OpenViking 材料编译成 Skill 声明的产物。产物可以是 Wiki 页面、精确文件树，或两者的组合；Compile 本身不内置业务领域或 Wiki 分类规则。
 
 命令由 VikingBot 执行。`ov` CLI 通过 OpenViking 的 Bot 代理调用 VikingBot，VikingBot 运行 AgentLoop，并使用当前用户身份读取和写入 OpenViking 数据。
 
@@ -23,8 +23,10 @@ v1 的核心目标：
 
 - 支持一个或多个来源目录；
 - 加载用户指定的 OV Skill；
-- 根据任务描述生成一个或多个 Wiki 页面；
-- 增量更新已有 Wiki；
+- 根据 Skill 生成 Wiki、文件或混合产物；
+- 完整清点来源并在隔离上下文中分批处理；
+- 通过结构化输出计划、可选 Skill Contract 和独立审计执行“验证—修复”闭环；
+- 增量更新已有目标；
 - 通过异步任务返回进度和结果。
 
 ## 2. 用户接口
@@ -43,7 +45,7 @@ ov compile \
 | 参数 | 规则 |
 | --- | --- |
 | `--from` | 必填，可重复，也可使用逗号分隔多个目录 |
-| `--to` | 必填，目标 Wiki 目录 |
+| `--to` | 必填，目标 resource、memory 或 Skill namespace 目录 |
 | `--skill` | 必填，Skill 目录或 `SKILL.md` 的 Viking URI |
 | `--reason` | 可选，本次整理任务的描述 |
 | `--wait` | 可选，等待任务完成 |
@@ -52,7 +54,7 @@ ov compile \
 参数在 OpenViking 用户身份下 canonicalize 后满足以下约束：
 
 - `from` 必须是一个或多个可读目录；重复项去重，空项报错；
-- `to` 必须是可写的 resource 或 memory 目录，不能是 namespace 根、文件、Skill 目录或 OpenViking 派生目录；
+- `to` 必须是可写的 resource、memory 内容目录或受支持的 Skill namespace，不能是文件、无效 namespace 根或 OpenViking 派生目录；
 - `skill` 必须解析为 Skill root，目录 URI 和其 `SKILL.md` URI 视为同一个 Skill；
 - `from`、`to` 和 `skill` 的权限最终仍由 OpenViking Server 校验，CLI 不根据 URI 文本推断权限。
 
@@ -80,12 +82,16 @@ created: 1
 updated: 2
 unchanged: 3
 page_count: 6
+file_count: 1
 link_count: 8
+source_coverage: 32/32
+validation_attempts: 1
+contract_source: declared
 ```
 
 完整 URI 列表通过全局 JSON 输出返回。
 
-`created`、`updated` 和 `unchanged` 只统计 Agent 本次提交的页面；未被草稿触达的目标页面不计入 `unchanged`。`page_count` 等于三者之和，`link_count` 只统计最终正文中实际渲染出的 bundle 内 WikiLink。
+`created`、`updated` 和 `unchanged` 只统计本次提交的产物；未被草稿触达的目标文件不计入 `unchanged`。`page_count` 和 `file_count` 分别统计 Wiki 页面与精确文件，`link_count` 只统计最终正文中实际渲染出的 bundle 内 WikiLink。
 
 `--wait` 使用单调时钟计算整体等待 deadline，并以有上限的 polling interval 查询任务；CLI timeout 或 Ctrl-C 只结束本地等待，不向 Bot 发送取消请求。
 
@@ -107,9 +113,12 @@ link_count: 8
 │                            │
 │ Compile Task               │
 │   ├─ Skill Loader          │
+│   ├─ Evidence Work Queue   │
+│   ├─ Source Work Queue     │
 │   ├─ Context Tools         │
 │   ├─ AgentLoop             │
-│   ├─ Wiki Renderer         │
+│   ├─ Output Plan / Auditor │
+│   ├─ Output Renderer       │
 │   └─ OpenViking Writer     │
 └──────────────┬─────────────┘
                │ read / search / batch-write
@@ -141,7 +150,7 @@ Compile 只增加任务编排和领域规则，基础能力使用现有实现：
 | Gateway 认证 | `OpenAPIChannel` 的 Gateway Token dependency、`OpenVikingConnection` 和 principal scope | compile request model 和 task owner 绑定 |
 | URI 与权限 | `fs/attrs` 返回的 canonical URI、`validate_viking_uri()`、`canonicalize_uri()`、`context_type_for_uri()`、VikingFS access check | 用户上下文中的目录约束和 target containment |
 | Skill | OpenViking Skills API、`SkillLoader.parse()`、VikingBot `SkillsLoader`、`SandboxManager` | OV bundle 快照和 task-local materialization |
-| Agent | `AgentLoop._run_agent_loop()`、`ToolRegistry`、`register_default_tools()` | structured wrapper、scope guard 和 `submit_wiki_bundle` |
+| Agent | `AgentLoop._run_agent_loop()`、`ToolRegistry`、`register_default_tools()` | structured wrapper、分批 worker、scope guard 和通用提交工具 |
 | 内容读取 | `openviking_list/search/grep/glob/multi_read` | 限定允许的 URI roots；不增加同义读取工具 |
 | Link 与 metadata | `WikiLink`、`StoredLink`、`LinkRenderer`；Memory 目标额外复用 `MemoryFileUtils`、`next_memory_version()` 和 resource refs helper | OKF path、citation 和严格校验 |
 | 写入与刷新 | `ContentWriteCoordinator` 的校验/refresh helper、`LockManager`、`VikingFS.write_file(..., lock_handle=...)`、`RequestWaitTracker` | batch precondition 和多文件编排 |
@@ -149,7 +158,8 @@ Compile 只增加任务编排和领域规则，基础能力使用现有实现：
 新增能力保持在以下边界内：
 
 - Bot 侧 Compile request/task/result 和最小 task store；
-- `submit_wiki_bundle` 工具及其 schema；
+- `submit_compile_work`、`submit_compile_plan`、`submit_compile_outputs`、`submit_compile_validation`、`submit_compile_bundle` 及其 schema；
+- 可选的 `compile-contract.yaml`；
 - Compile 特有的 OKF/path/citation 规则；
 - `/bot/v1/compile` API family 和 `/api/v1/content/batch-write` 数据接口。
 
@@ -207,7 +217,7 @@ GET /bot/v1/compile/{task_id}
 | status | stage |
 | --- | --- |
 | `accepted` | `queued` |
-| `running` | `loading_skill`、`collecting_context`、`agent`、`rendering` |
+| `running` | `loading_skill`、`collecting_context`、`planning`、`processing_sources`、`planning_outputs`、`validating_plan`、`materializing_outputs`、`validating`、`rendering`、`writing`、`refreshing` |
 | `committing` | `writing`、`refreshing` |
 | `completed` | `completed` |
 | `failed` | 失败时所在阶段 |
@@ -227,7 +237,12 @@ GET /bot/v1/compile/{task_id}
     "updated": [],
     "unchanged": [],
     "page_count": 1,
+    "file_count": 0,
     "link_count": 0,
+    "source_count": 32,
+    "processed_source_count": 32,
+    "validation_attempts": 1,
+    "contract_source": "declared",
     "warnings": []
   }
 }
@@ -258,15 +273,18 @@ VikingBot 创建异步任务后依次执行：
 1. 计算 `effective_reason`，并对 `from`、`to` 和 `skill` 做 URI 语法校验。
 2. 通过 OpenViking 现有 `fs/attrs` 取得来源和目标的 canonical URI，再用 stat/list/read 路径验证形状与权限；Skill API 直接返回 canonical Skill root。VikingBot 后续只使用这些响应中的 canonical URI。
 3. 通过 Skills API 取得 Skill root、定义和文件清单，通过现有 content read/download 路径读取辅助文件，在 task workspace 中物化快照，并交给 `SkillsLoader` 加载。
-4. 为每个来源建立 `source_id + directory_uri + overview` 描述，并使用现有 list/tree 能力建立目标 Wiki 的有界轻量 catalog。
-5. 从现有 `ToolRegistry` 构建 request-local 工具集，用显式 Compile Prompt 和 selected Skill 正文运行 structured AgentLoop；不加载普通 chat history、自动 memory recall 或其他 workspace Skill。
-6. 接收 Agent 提交的结构化 `WikiBundleDraft`。
-7. 对草稿中的每个 `update_uri` 读取一次最新 raw content，生成 base hash；新页面不需要预读全部目标正文。
-8. 校验并渲染最终 Wiki 文件，区分 created、updated 和 unchanged。
-9. 有 write operation 时通过 batch-write 一次提交并等待索引刷新；空 bundle 或全部 unchanged 时跳过写入接口。
-10. 保存任务结果并清理 task workspace。
+4. 递归建立完整来源 Manifest；超过硬上限时失败，不以截断目录继续生成。Manifest、工作报告和候选验证文件只写入 task workspace 的 `__compile_staging__/`。
+5. Skill 未声明 `compile-contract.yaml` 时，不让模型推导 Contract。可信代码只按目标类型确定产物边界：Resource 为 `mixed`、Memory 为 `wiki`、Skill namespace 为 `files`；`SKILL.md` 递归引用的本地 Markdown 作为 Skill reference 参与规划和审计，但不会被冒充成显式 validation rubric。
+6. 可信代码先把 `SKILL.md` 及其递归引用的本地 Markdown 切成稳定编号的原文证据块，再由模型选择证据 ID 并形成 task-local 的 Skill checklist；原文路径和引文由代码回填，模型不能伪造。带有 must/required/never/at least/create/emit 等强约束语气（以及常见中文对应词）的证据块必须全部进入 checklist，并同时参与计划与候选审计，避免模型漏选明确规则。checklist 不是 Contract，不推断固定产物，也不会写入目标目录。
+7. 按 URI 稳定排序和单次读取上限生成 work items，以有界并发运行短上下文 worker。每个 worker 只提取证据，不决定最终页面、路径或文件树；它必须读取全部分配来源并提交独立报告。
+8. 全局 Planner 读取完整 Manifest、Skill checklist、全部 worker 报告、Skill references 和显式 rubric，提交结构化 `CompileOutputPlan`。该计划是唯一的输出 TODO list，明确每个页面/文件的稳定 ID、最终路径、证据报告、coverage disposition，以及覆盖全部产物的 materialization groups/依赖 DAG，不包含正文。
+9. 独立只读 Auditor 在生成正文前按有界规则批次逐条核对适用于计划阶段的 Skill checklist，并汇总全部批次结果；每个 Skill 批次只聚焦少量带原文证据的规则。task reason 则由宿主按分号、句号和换行稳定切成 `compile_task_reason_001...N`，每个子句各用一个完全独立的审计回合，只读取原始 reason 和最终计划决策的紧凑上下文，不读取 worker 报告，避免来源细节或其他子句稀释当前约束。每个子句必须分别且恰好检查一次；普通验证通过后再由一个新的 adversarial challenger 尝试寻找反例，最终只保留 challenger 的结论，任一阶段失败都拒绝计划。用户的具体指令不得被更一般的 Skill 规则放宽；全称或否定约束必须检查并列出全部受影响计划字段。审计覆盖计划完整性、产物粒度、命名、路径、来源映射、分组依赖和导航拓扑；任何适用规则失败都拒绝计划，通过证据必须引用实际计划字段，不合格时只修复计划。
+10. 计划通过后按 DAG 拓扑层生成正文和精确文件；独立 group 可并发，强耦合产物在同一 group 中生成，依赖 group 必须读取前序文本产物。`submit_compile_outputs` 逐项核验所有计划路径真实存在；Wiki 页面还必须是无 frontmatter 的 UTF-8 Markdown，并引用该页面计划中的精确来源 URI。
+11. 可信代码按计划组装 `CompileBundleDraft`，模型不能增删或改名。随后执行确定性的 Bundle/Contract 校验和声明的验证命令；命令执行后重新装载产物。候选验证分别运行 Skill/Contract 审计和 task-reason 审计：前者读取完整证据；后者为每个 `compile_task_reason_001...N` 单独发起 verifier + adversarial challenger，只读取紧凑计划、candidate 清单及每个生成的文本输出。验证失败时按结构化问题重新物化，超过上限则任务失败且不写目标目录。
+12. 验证通过后，对每个 `update_uri` 读取最新 raw content 并生成 base hash，渲染 Wiki 与文件产物，区分 created、updated 和 unchanged。
+13. 有 write operation 时通过 batch-write 一次提交并等待索引刷新；保存任务结果并清理 task workspace。
 
-其中 AgentLoop 是唯一的内容生成阶段。后续校验、路径生成和写入都是确定性操作。
+Compile 使用固定的 Manifest → Evidence Work → Output Plan → Plan Audit → Materialize → Validate/Repair → Commit 状态机，不引入第二套工作流框架。内容生成仍复用现有 AgentLoop，TODO 完整性、路径、覆盖和提交条件由可信代码校验。
 
 ## 6. Skill 与上下文
 
@@ -287,7 +305,33 @@ Skill 用于描述整理方法，例如：
 - 使用什么表达风格；
 - 何时生成索引页或专题页。
 
-### 6.2 来源上下文
+### 6.2 Compile Contract
+
+Skill 可以在根目录提供可选的 `compile-contract.yaml`。Contract 只描述通用完成条件，不包含任何内置的 Wiki、论文或客户领域规则：
+
+```yaml
+version: 1
+output:
+  kind: files # wiki | files | mixed
+coverage:
+  mode: all_sources # all_sources | selected | custom
+required_outputs:
+  - path: PAPER.md
+  - glob: logic/*.md
+capabilities:
+  required: [exec]
+validators:
+  - type: rubric
+    path: references/validation.md
+  - type: command
+    run: python3 skills/compiler/scripts/validate.py
+```
+
+`compile-contract.yaml` 不是 Skill 的必需文件。没有它时不运行 LLM Contract 推导，也不猜固定文件名；可信代码仅从目标类型确定 `output` 边界，并保留默认 `coverage=all_sources`。Skill 正文与其递归链接的本地 Markdown 规范直接参与全局规划，并产生带原文证据的临时 Skill checklist 供计划审计和候选审计逐条核对；结果标记 `contract_source=inferred`。
+
+显式 Contract 用于作者确实需要机器可执行 validator、运行能力、固定产物路径或非默认 coverage 的场景；其未知字段、非法内部路径、缺失 rubric 或运行环境能力不足会在内容生成前失败。Contract 和内部 `CompileOutputPlan` 都只属于 Compile 任务，`__compile_staging__/`、`.compile/`、来源 Manifest、工作报告和 `output-plan.json` 不会进入最终 Bundle 或 `to` 目录。
+
+### 6.3 来源上下文
 
 VikingBot 按 canonical `from` 顺序为每个来源分配稳定的 request-local ID：
 
@@ -295,7 +339,9 @@ VikingBot 按 canonical `from` 顺序为每个来源分配稳定的 request-loca
 source_id, directory_uri, overview
 ```
 
-`source_id` 只标识用户传入的来源目录，例如 `src_1`；它不是文件读取追踪 ID。Agent 首先获得这些来源描述和有界轻量目录信息，再通过 VikingBot 已有 OpenViking 工具按需读取：
+`source_id` 只标识用户传入的来源目录，例如 `src_1`。完整目录清单和明确的一级 coverage units 写入 `__compile_staging__/source-manifest.json`，避免把递归目录项数误当成一级材料数；Prompt 只携带有界摘要。叶子文件按稳定 URI 顺序切成 work items；worker 的 `submit_compile_work` 只有在所有分配 URI 都被 `openviking_multi_read` 成功读到且报告文件存在时才接受。Planner 必须读取 Manifest、Skill checklist 和全部报告；Skill 计划审计读取聚合的 `plan-audit-context.json`，task-reason 计划审计改读不含 worker 报告的 `task-reason-audit-context.json`。候选阶段同样把 Skill/Contract 与 task reason 分开验证，后者只增加 candidate 和实际文本产物。宿主为每个 `compile_task_reason_001...N` 创建独立审计回合，并要求它与适用的 checklist rule ID 各自恰好检查一次，避免“文件读过或提示词提过，但硬要求没有被实际检查”。
+
+各阶段通过 VikingBot 已有 OpenViking 工具按需复查：
 
 - `openviking_list`：浏览来源目录；
 - `openviking_search`：语义检索；
@@ -304,9 +350,9 @@ source_id, directory_uri, overview
 
 Compile 不注册另一组 source tools。它在现有工具执行前增加 request-local URI scope guard：所有 URI 参数必须位于 `from`、`to` 或 Skill root 内；`openviking_search/list/grep/glob` 不能省略 scope 后退化为全库查询；`multi_read` 的 URI 数量、递归 list 的节点数、单次结果和任务累计工具结果字节数受 Compile 上限约束。原工具没有上限的地方由这个 guard 补齐，但实际读取和权限判断仍由原工具完成。
 
-### 6.3 目标上下文
+### 6.4 目标上下文
 
-运行 Agent 前，VikingBot 使用现有 list/tree/read API 建立目标 Wiki catalog：
+运行 Agent 前，VikingBot 使用现有 list/tree/read API 建立目标 catalog：
 
 ```text
 page_id, uri, title, type, summary
@@ -314,16 +360,16 @@ page_id, uri, title, type, summary
 
 catalog 只保存目录项和 L0/L1 可得的轻量信息，不为了计算 hash 或 outgoing links 预读全部目标正文。Agent 可以按需读取已有页面，用于判断创建、更新或复用；只有最终草稿选中的 `update_uri` 会在渲染前读取 raw content 并计算 precondition hash。未被本次结果引用的已有页面保持不变。
 
-### 6.4 工具集合
+### 6.5 工具集合
 
 `request_tools` 从 `register_default_tools()` 创建的 task-local registry 中筛选：
 
 ```text
 compile_tools = available_tools ∩ (_COMPILE_CORE_TOOLS ∪ _OV_READ_TOOLS)
-request_tools = compile_tools + submit_wiki_bundle
+request_tools = compile_tools + stage_submission_tool
 ```
 
-`_COMPILE_CORE_TOOLS` 固定为 `read_file`、`write_file`、`edit_file` 和 `exec`；`_OV_READ_TOOLS` 固定为 `openviking_list`、`openviking_search`、`openviking_grep`、`openviking_glob` 和 `openviking_multi_read`。OpenViking 工具仍受用户权限和 Compile URI scope 限制，本地文件和 shell 工具仍受 task workspace 与 sandbox policy 限制。
+`_COMPILE_CORE_TOOLS` 固定为 `read_file`、`write_file` 和 `edit_file`；隔离 backend 或显式启用的可信 direct backend 才增加 `exec`。`_OV_READ_TOOLS` 固定为 `openviking_list`、`openviking_search`、`openviking_grep`、`openviking_glob` 和 `openviking_multi_read`。每个 AgentLoop 只注册当前阶段的一个 submission tool；Planner 和 Auditor 使用只读 registry，批次 materializer 才获得写文件能力。
 
 Compile 不使用 Skill 的 `allowed-tools` 推导、授权或限制工具，也不为 Skill 连接 MCP。该字段可作为其他 Skill 宿主的兼容 metadata 保留。Skill 需要飞书、方舟等外部能力时，通过 `exec` 调用 task sandbox 中预装的 CLI；可选的 `requires.bins/env` 只用于提前检查运行条件，不负责安装 CLI 或依赖。
 
@@ -340,22 +386,22 @@ await agent_loop.run_structured_task(
     session_key=SessionKey(type="compile", channel_id=task_id, chat_id=task_id),
     tool_registry=request_tools,
     openviking_tool_names=openviking_read_tool_names,
-    stop_tool_names=["submit_wiki_bundle"],
+    stop_tool_names=[stage_submission_tool_name],
     openviking_connection=connection,
 )
 ```
 
 BotCompileService 使用当前 provider/config、`workspace=task_workspace` 和 task-local `SandboxManager` 创建 request-local `AgentLoop`。`run_structured_task()` 用显式的 system/user prompt 建立 messages 后委托给 `_run_agent_loop()`；后者增加可选 `tool_registry` 和 `openviking_tool_names` 参数，并以选定 registry 同时生成 definitions 和执行工具。只有名称属于 `openviking_tool_names` 的现有 OV adapter 才在 `ToolContext`/post-call hook 中收到用户 connection；file 和 shell tool 收到 `None`。普通 chat 未传这些参数时仍使用 `self.tools` 和现有 connection 行为。
 
-该入口不使用普通 chat history、自动 memory/experience recall 或普通最终回答。只有 `submit_wiki_bundle` 成功执行并保存合法 bundle 后才能结束；参数校验或领域校验返回 `Error:` 时继续同一 loop 修复。只有自然语言而没有 submit 时，wrapper 追加提交提醒后继续；达到 iteration limit 时直接返回 `AGENT_OUTPUT_INVALID`，不执行现有聊天路径的“禁用工具后再回答一次”。模型调用、工具执行和 token usage 仍沿用现有实现。
+该入口不使用普通 chat history、自动 memory/experience recall 或普通最终回答。它接受且只接受一个 stop tool 名称，因此同一薄封装可用于 work、plan、output receipt 和 validation 等结构化阶段。参数或领域校验返回 `Error:` 时继续当前 loop 修复；只有自然语言而没有 submit 时，wrapper 追加对应工具名的提交提醒。达到 iteration limit 时直接返回 `AGENT_OUTPUT_INVALID`，不执行现有聊天路径的“禁用工具后再回答一次”。
 
 现有 `_run_agent_loop()` 的 stop 判定需要从“出现 stop tool name”改成“该 stop tool 的结果通过 `_is_tool_result_success()`”；这是 structured task 正确重试的必要条件，默认聊天未传 `stop_tool_names`，行为不变。
 
-`request_tools` 仍使用现有 `ToolRegistry` 中的工具实例；OpenViking 权限不在 Bot 中模拟，实际调用继续由 Server 校验。`submit_wiki_bundle` 最后注册。Skill 的文件操作和 CLI 命令继续在 task-local `SandboxManager` 中执行；Prompt 明确要求将 Bash、shell 或 CLI 指令交给 `exec`。
+`request_tools` 仍使用现有 `ToolRegistry` 中的工具实例；OpenViking 权限不在 Bot 中模拟，实际调用继续由 Server 校验。当前阶段的 submission tool 最后注册。Skill 的文件操作和 CLI 命令继续在 task-local `SandboxManager` 中执行；Prompt 明确要求将 Bash、shell 或 CLI 指令交给 `exec`。
 
-当 `write_file` 可用时，artifact 必须先由 `write_file` 或 `exec` 生成到 task workspace，再通过 `workspace_path` 提交；Wiki page body 同样先写到 `__compile_staging__/wiki_pages/`，再通过 `body_workspace_path` 提交。此时 `submit_wiki_bundle` 的动态 schema 不暴露内联 `content` / `body_markdown`，运行时也执行相同校验，避免大型多文件产物被拼进单次 tool call。
+Planner 先通过 `submit_compile_plan` 提交不含正文的完整 TODO 和 materialization DAG。Materializer 按拓扑层写文件后，只能通过 `submit_compile_outputs` 提交当前 group 的 output IDs；工具会从 task workspace 读取每个绑定路径并拒绝缺失、空文件、非 UTF-8 Wiki、frontmatter 或无计划来源引用。最终 `CompileBundleDraft` 由可信代码从计划和真实文件组装，不再由模型提交路径清单。
 
-Agent 必须通过 `submit_wiki_bundle` 提交最终结果。
+`submit_compile_bundle` 保留为最终确定性 Bundle 校验边界，但在主流程中由可信代码调用。
 
 核心结构：
 
@@ -371,31 +417,42 @@ class WikiPageDraft(BaseModel):
     path_hint: str | None = None
     update_uri: str | None = None
 
-class WikiBundleDraft(BaseModel):
+class CompileFileDraft(BaseModel):
+    path: str | None = None
+    update_uri: str | None = None
+    content: str | None = None
+    workspace_path: str | None = None
+
+class CompileBundleDraft(BaseModel):
     pages: list[WikiPageDraft]
+    files: list[CompileFileDraft] = Field(default_factory=list)
     links: list[WikiLink] = Field(default_factory=list)
 ```
 
-`WikiLink` 直接复用 `openviking.session.memory.dataclass.WikiLink` 做运行时校验，使用其 `f/t/link_type/weight/match_text/description` 字段，不定义 compile 专属 link model。`submit_wiki_bundle` 的 tool schema 将 `match_text` 描述覆盖为“必须出现在来源草稿正文中的锚点”，避免沿用 Memory 模型中“original conversation”的提示语义。
+`WikiLink` 直接复用 `openviking.session.memory.dataclass.WikiLink` 做运行时校验，使用其 `f/t/link_type/weight/match_text/description` 字段，不定义 compile 专属 link model。`submit_compile_bundle` 的 tool schema 将 `match_text` 描述覆盖为“必须出现在来源草稿正文中的锚点”，避免沿用 Memory 模型中“original conversation”的提示语义。
 
 约束：
 
-- `pages=[]` 表示没有足够依据生成可靠页面，此时 `links` 必须为空，任务成功但返回 warning；
+- `pages` 只包含真实 Wiki 页面；Skill 规定的 Markdown、YAML、JSON、图片或其他文件树全部进入 `files`；
+- `pages=[]` 对纯文件 Skill 完全合法，但 `pages` 和 `files` 同时为空会被拒绝；
+- Contract 的 `output=wiki/files/mixed` 限制可提交的产物类别，`required_paths/globs` 必须被最终路径满足；
+- `__compile_staging__/` 和 `.compile/` 不能作为最终输出路径；
 - `page_id` 在 bundle 内唯一；
 - `update_uri` 必须来自目标 catalog；
 - update 保持原 URI，不能通过 `path_hint` rename 或 move；create 的 `path_hint` 只能是 `to` 下的相对 Markdown 路径；
 - create 的最终 canonical path 不能与 catalog 中的已有文件或本 bundle 的其他页面冲突；并发创建同一路径仍由 batch precondition 拦截；
 - link 的 `f/t` 必须非空、非 self-link，并引用 bundle 中的页面；
-- `pages` 非空时，每个页面至少引用一个 `source_id`，且必须来自本次请求的来源描述；
+- link 的 `match_text` 必须是未包含 Markdown 方括号的正文原文，避免生成嵌套链接；
+- `pages` 非空时，每个页面至少引用一个 `source_id`，且必须来自本次请求的来源描述；页面正文还必须包含至少一个本次完整来源清单中的精确叶子文件 URI，只有来源根目录不算可追溯引用；
 - Agent 不提供最终文件 URI，也不能直接写入 OpenViking。
 
-Pydantic model 使用 `extra="forbid"`；字段校验和 CompileLimits 都在 `submit_wiki_bundle` 内执行。校验失败时，工具将错误返回给 Agent 修复。达到迭代上限仍未提交合法结果时，任务失败。
+Pydantic model 使用 `extra="forbid"`；计划阶段先校验输出类型、完整 coverage、路径冲突和来源映射，物化阶段校验真实文件，最终再执行 Bundle 和 CompileLimits 校验。失败问题结构化返回对应修复阶段；达到上限仍不合法时任务失败。
 
-页面数量由 reason、Skill 和材料决定。高层总结可以只生成一个页面，`link_count=0` 是合法结果。
+页面和文件数量由 reason、Skill、Contract 和材料决定。纯文件 Compile 的 `page_count=0`、`link_count=0` 是合法结果。
 
-## 8. Wiki 渲染与写入
+## 8. 产物渲染与写入
 
-VikingBot renderer 将 `WikiBundleDraft` 转成最终写入计划。Compile 新代码只负责 OKF、目标路径和 citation 规则，其余复用现有内容模型：
+VikingBot renderer 将 `CompileBundleDraft` 转成最终写入计划。普通 `CompileFileDraft` 保持精确字节和路径；只有 `WikiPageDraft` 进入 OKF、链接和 citation 渲染：
 
 1. 解析已有 OKF frontmatter；Memory 目标先用 `MemoryFileUtils.read()` 分离可见文档与 hidden metadata，Resource 目标不生成 `MEMORY_FIELDS`。
 2. 将现有 `ExtractLoop._resolve_links()` 中 page ID 解析、self-link 和去重的纯逻辑提取为共享 helper；Compile 使用严格校验模式。
@@ -554,7 +611,7 @@ Bot 当前没有通用的持久化后台任务管理器，因此这里实现一�
 
 运行中任务目录可以保存有大小限制的 Skill 快照、catalog 和 draft，但不能保存用户凭证。任务进入终态后删除 workspace、Skill snapshot 和 draft；task/result/error JSON 最长保留 24 小时且最多保留 1,000 条，启动和任务结束时都会清理。
 
-VikingBot 使用独立的 compile 并发限制，并对同一 canonical 目标目录串行执行。accepted task 最多排队 5 分钟，取得 target lock 和全局执行 slot 后才开始计算 30 分钟 runtime。该锁只减少同一 Bot 进程内的浪费；跨进程或人工写入冲突仍由 batch-write 的 tree lock 和 content hash 检查解决。v1 task store 以单个 VikingBot gateway 进程为部署边界，不承诺多副本共享 task 查询。
+VikingBot 使用独立的 compile 并发限制，并对同一 canonical 目标目录串行执行。accepted task 最多排队 5 分钟，取得 target lock 和全局执行 slot 后才开始计算 4 小时 runtime。该锁只减少同一 Bot 进程内的浪费；跨进程或人工写入冲突仍由 batch-write 的 tree lock 和 content hash 检查解决。v1 task store 以单个 VikingBot gateway 进程为部署边界，不承诺多副本共享 task 查询。
 
 VikingBot 启动时把 store 中所有非终态任务统一标记为 `BOT_RESTARTED`，包括处于 committing 的任务；因为 API key 不落盘，重启后不能安全恢复原任务。用户可以重新提交，batch-write 通过最终 content hash 跳过已落盘内容并继续收敛。
 
@@ -565,12 +622,15 @@ v1 先使用集中定义、可测试的 `CompileLimits`，不把常量散落在 
 | 项目 | 默认值 |
 | --- | --- |
 | source roots | 16 |
+| source inventory / Prompt catalog entries | 5,000 / 200 |
 | Skill files / 单文件 / 总大小 | 128 / 8 MiB / 32 MiB |
 | target inventory entries / relevance catalog pages | 2,000 / 10 |
 | initial prompt characters | 200,000 |
 | tool URI count / 单次结果 / 任务累计结果 | 32 / 1 MiB / 8 MiB |
-| output pages / 最终总大小 | 64 / 4 MiB |
-| concurrent Compile tasks / task runtime | 2 / 30 min |
+| work items / 每项来源 / 并发 / 单报告 | 64 / 24 / 3 / 64 KiB |
+| repair attempts | 2 |
+| output pages / files / 最终总大小 | 64 / 64 / 4 MiB |
+| concurrent Compile tasks / task runtime | 2 / 4 h |
 | accepted tasks（全局 / 单 principal）/ queue wait | 16 / 4 / 5 min |
 | terminal task retention / records | 24 h / 1,000 |
 
@@ -587,6 +647,7 @@ OpenViking batch-write 自己还要设置独立的 request 上限，至少覆盖
 | `SKILL_INVALID` | Skill 结构或引用不合法 |
 | `SKILL_CAPABILITY_UNAVAILABLE` | Skill 声明的 requirement 或 tool 不可用 |
 | `AGENT_OUTPUT_INVALID` | Agent 未提交合法 bundle |
+| `CONTRACT_VALIDATION_FAILED` | 候选产物在修复上限内仍未满足 Skill Contract |
 | `MODEL_UNAVAILABLE` | 模型服务不可用 |
 | `WRITE_CONFLICT` | 目标页面在任务期间发生变化 |
 | `WRITE_FAILED` | 内容写入或索引刷新失败 |
@@ -633,7 +694,7 @@ bot/vikingbot/compile/
 
 - `bot/vikingbot/agent/loop.py`：为 `_run_agent_loop()` 增加可选 request registry，并提供薄的 `run_structured_task()`；
 - `bot/vikingbot/channels/openapi.py`：接收 `BotCompileService` 并用现有 Gateway auth/principal resolver 注册 compile router；
-- `bot/vikingbot/agent/tools/`：增加 `submit_wiki_bundle` 和 request-local URI scope guard；
+- `bot/vikingbot/agent/tools/`：增加通用 work/bundle/validation 提交工具和 request-local URI scope guard；
 - `bot/vikingbot/openviking_mount/ov_server.py`：在现有 request-scoped `VikingClient` 上薄封装 Skills/read/download/batch-write 调用；
 - `bot/vikingbot/cli/commands.py`：gateway 先构造共享 provider/config 所属的 AgentLoop，再创建 `BotCompileService` 并注入 OpenAPIChannel；不增加全局 service holder。
 
@@ -644,11 +705,12 @@ bot/vikingbot/compile/
 - CLI 参数展开、默认 reason、`--wait` 和 timeout；
 - Bot proxy 的创建/GET 查询身份转交、未启用 Bot 的 503 和上游错误；
 - Skill 复用现有 parser/loader、相对引用、requirements 和路径逃逸检查；`allowed-tools` 可正常解析但不影响 Compile 工具集合；
-- request registry 固定包含本地核心工具、scope-guarded OpenViking 只读工具和 `submit_wiki_bundle`，不包含 message/cron/spawn/Web/image/MCP/OV write，用户 connection 只进入 OV read adapter；
+- request registry 固定包含当前阶段所需的本地工具、scope-guarded OpenViking 只读工具和唯一 submission tool，不包含 message/cron/spawn/Web/image/MCP/OV write，用户 connection 只进入 OV read adapter；
 - Agent structured wrapper 复用原 loop；失败 submit 不停止、plain text 会修复、iteration limit 不额外生成普通回答，普通 chat 行为不回归；
 - OpenViking 工具的 URI scope、缺省全库参数和数量/单次/累计输出上限，并确认没有注册第二组 source tools；
-- 非法 bundle 的 loop 内修复、空 bundle no-op 和最终失败；
-- 单页面零 link、多页面互链和已有页面更新；
+- 非法 output plan/bundle 的 loop 内修复、空计划拒绝和最终失败；
+- Wiki-only、file-only、mixed bundle、单页面零 link、多页面互链和已有页面更新；
+- 完整来源 Manifest、证据型 worker receipt、结构化 TODO、计划逐项落盘、独立审计、Contract validator 和修复上限；
 - OKF frontmatter、保留未知字段、Resource/Memory 格式差异、protected anchor、路径 containment、citation merge、WikiLink、Memory version 和 resource refs；
 - batch-write 复用现有锁/write/refresh helper，覆盖 canonical URI/重复 operation、权限、content hash conflict、响应丢失/refresh 失败/部分写入后的安全重试，并验证释放 tree lock 后才 refresh；
 - 多文件 resource 每个 refresh root 只产生一个 SemanticMsg，memory 每个目录只刷新一次 overview，strict refresh 失败不会返回成功；

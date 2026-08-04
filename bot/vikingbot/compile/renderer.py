@@ -26,7 +26,7 @@ from openviking.utils.path_safety import (
     validate_safe_viking_uri_path,
 )
 from openviking_cli.utils import VikingURI
-from vikingbot.compile.models import CompileLimits, WikiBundleDraft
+from vikingbot.compile.models import CompileBundleDraft, CompileLimits
 
 _FRONTMATTER_RE = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
 _FRONTMATTER_START_RE = re.compile(rb"\A---[ \t]*\r?\n")
@@ -322,7 +322,6 @@ def validate_relative_file_path(path: str) -> str:
     if (
         not relative
         or any(not segment or segment in {".", ".."} for segment in segments)
-        or any(segment.startswith(".") for segment in segments)
     ):
         raise ValueError(f"invalid output file path: {path}")
     if segments[-1].lower() in _PLATFORM_DERIVED_FILENAMES:
@@ -376,7 +375,7 @@ class WikiRenderer:
     def render(
         self,
         *,
-        bundle: WikiBundleDraft,
+        bundle: CompileBundleDraft,
         target_uri: str,
         source_roots: Mapping[str, str],
         catalog_uris: set[str],

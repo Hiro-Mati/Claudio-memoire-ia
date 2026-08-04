@@ -122,7 +122,12 @@ fn render_completed(value: &CompileTaskStatus, format: OutputFormat, compact: bo
             updated: Vec::new(),
             unchanged: Vec::new(),
             page_count: 0,
+            file_count: 0,
             link_count: 0,
+            source_count: 0,
+            processed_source_count: 0,
+            validation_attempts: 0,
+            contract_source: String::new(),
             warnings: Vec::new(),
         });
     println!("to: {}", result.to);
@@ -130,7 +135,16 @@ fn render_completed(value: &CompileTaskStatus, format: OutputFormat, compact: bo
     println!("updated: {}", result.updated.len());
     println!("unchanged: {}", result.unchanged.len());
     println!("page_count: {}", result.page_count);
+    println!("file_count: {}", result.file_count);
     println!("link_count: {}", result.link_count);
+    println!(
+        "source_coverage: {}/{}",
+        result.processed_source_count, result.source_count
+    );
+    println!("validation_attempts: {}", result.validation_attempts);
+    if !result.contract_source.is_empty() {
+        println!("contract_source: {}", result.contract_source);
+    }
     for warning in result.warnings {
         eprintln!("warning: {warning}");
     }

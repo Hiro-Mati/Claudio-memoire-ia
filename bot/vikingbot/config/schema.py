@@ -440,6 +440,20 @@ class AgentsConfig(BaseModel):
         le=2.0,
         description="Sampling temperature for LLM requests.",
     )
+    compile_temperature: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature for ov compile structured tasks.",
+    )
+    compile_allow_partial: bool = Field(
+        default=True,
+        description=(
+            "When true, ov compile emits a completed result with warnings if at least one "
+            "compliant output was written after materialization retries are exhausted, instead "
+            "of failing the whole task."
+        ),
+    )
     thinking: bool = Field(
         default=True,
         description=(

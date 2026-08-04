@@ -1302,6 +1302,10 @@ class AgentLoop:
     ) -> tuple[Any, list[dict], dict[str, int], int]:
         """Run a tool-terminated structured task through the existing agent loop."""
 
+        if len(stop_tool_names) != 1:
+            raise ValueError("structured tasks require exactly one submission tool")
+        submission_tool_name = stop_tool_names[0]
+
         async def require_submission(context: _PlainTextContext) -> _PlainTextDelivered:
             messages = self.context.add_assistant_message(context.messages, context.text, [])
             messages.append(
@@ -1309,7 +1313,7 @@ class AgentLoop:
                     "role": "user",
                     "content": (
                         "Your response was not submitted. Continue the task and call "
-                        "submit_wiki_bundle with the complete final bundle."
+                        f"{submission_tool_name} with the complete structured result."
                     ),
                 }
             )
@@ -1332,11 +1336,15 @@ class AgentLoop:
             allow_final_fallback=False,
             inject_write_experience=False,
         )
-        submit_tool = tool_registry.get("submit_wiki_bundle")
-        bundle = getattr(submit_tool, "bundle", None)
-        if bundle is None:
-            raise ValueError("AGENT_OUTPUT_INVALID: Agent did not submit a valid Wiki bundle")
-        return bundle, tools_used, token_usage, iteration
+        submit_tool = tool_registry.get(submission_tool_name)
+        result = getattr(submit_tool, "structured_result", None)
+        if result is None:
+            result = getattr(submit_tool, "bundle", None)
+        if result is None:
+            result = getattr(submit_tool, "receipt", None)
+        if result is None:
+            raise ValueError("AGENT_OUTPUT_INVALID: Agent did not submit a valid result")
+        return result, tools_used, token_usage, iteration
 
     @trace(
         name="process_message",

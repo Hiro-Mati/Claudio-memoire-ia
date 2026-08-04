@@ -137,8 +137,20 @@ pub struct CompileResult {
     pub updated: Vec<String>,
     #[serde(default)]
     pub unchanged: Vec<String>,
+    #[serde(default)]
     pub page_count: usize,
+    #[serde(default)]
+    pub file_count: usize,
+    #[serde(default)]
     pub link_count: usize,
+    #[serde(default)]
+    pub source_count: usize,
+    #[serde(default)]
+    pub processed_source_count: usize,
+    #[serde(default)]
+    pub validation_attempts: usize,
+    #[serde(default)]
+    pub contract_source: String,
     #[serde(default)]
     pub warnings: Vec<String>,
 }

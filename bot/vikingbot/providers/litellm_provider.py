@@ -1,5 +1,6 @@
 """LiteLLM provider implementation for multi-provider support."""
 
+import asyncio
 import os
 from typing import Any, AsyncIterator
 
@@ -7,6 +8,10 @@ import litellm
 from litellm import acompletion
 from loguru import logger
 
+from openviking.utils.model_retry import (
+    is_retryable_rate_limit_error,
+    rate_limit_retry_delay,
+)
 from openviking.utils.multimodal import redact_image_data_urls
 from vikingbot.integrations.langfuse import LangfuseClient
 from vikingbot.providers.base import (
@@ -208,6 +213,37 @@ class LiteLLMProvider(LLMProvider):
 
         return messages
 
+    # Bound the rate-limit retry loop so a persistently throttled provider
+    # eventually surfaces the error instead of hanging a request forever.
+    _MAX_RATE_LIMIT_RETRIES = 5
+
+    async def _acompletion_with_rate_limit_retry(self, **kwargs: Any) -> Any:
+        """Call litellm.acompletion, retrying only on rate-limit (429/RPM/TPM) errors.
+
+        Higher compile concurrency makes transient throttling likely; every other
+        error class (auth, 400, content safety, context length) is re-raised
+        immediately so the existing error handling still applies.
+        """
+        attempt = 1
+        while True:
+            try:
+                return await acompletion(**kwargs)
+            except Exception as exc:
+                if (
+                    attempt > self._MAX_RATE_LIMIT_RETRIES
+                    or not is_retryable_rate_limit_error(exc)
+                ):
+                    raise
+                delay = rate_limit_retry_delay(attempt)
+                logger.warning(
+                    "LiteLLM rate limited; retrying attempt={} delay={:.1f}s error={}",
+                    attempt,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+                attempt += 1
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -291,7 +327,7 @@ class LiteLLMProvider(LLMProvider):
                             response_id, langfuse_observation, metadata=metadata
                         )
 
-            response = await acompletion(**kwargs)
+            response = await self._acompletion_with_rate_limit_retry(**kwargs)
             llm_response = self._parse_response(response)
 
             # Update and end Langfuse observation
@@ -432,7 +468,7 @@ class LiteLLMProvider(LLMProvider):
         usage: dict[str, int] = {}
 
         try:
-            response = await acompletion(**kwargs)
+            response = await self._acompletion_with_rate_limit_retry(**kwargs)
             async for chunk in response:
                 if getattr(chunk, "usage", None):
                     usage = self._parse_usage(chunk.usage)
