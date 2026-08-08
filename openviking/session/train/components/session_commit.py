@@ -633,7 +633,7 @@ def _commit_case_spec_enabled(
     if isinstance(raw, bool):
         return raw
     if raw is None:
-        return True
+        return False
     return str(raw).strip().lower() not in {"0", "false", "no", "off", "disabled"}
 
 

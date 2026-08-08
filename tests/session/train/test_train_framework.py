@@ -1693,6 +1693,7 @@ async def test_session_commit_policy_trainer_retries_transient_batch_add_message
         client=client,
         run_id="run1",
         poll_interval_seconds=0.01,
+        commit_case_spec_enabled=True,
     )
     rollout = Rollout(
         case=_case(),
@@ -1729,6 +1730,7 @@ async def test_session_commit_policy_trainer_recovers_completed_batch_add_respon
         client=client,
         run_id="run1",
         poll_interval_seconds=0.01,
+        commit_case_spec_enabled=True,
     )
     rollout = Rollout(
         case=_case(),
@@ -1956,6 +1958,7 @@ async def test_session_commit_policy_trainer_splits_large_message_batches():
         client=client,
         run_id="run1",
         poll_interval_seconds=0.01,
+        commit_case_spec_enabled=True,
     )
     rollout = Rollout(
         case=_case(),
@@ -2814,6 +2817,41 @@ async def test_session_commit_policy_trainer_filters_legacy_embedded_evaluation_
     )
     assert "evaluation report:" not in visible_text
     assert visible_text.count("# OpenViking OutcomeEvaluation") == 1
+
+
+@pytest.mark.asyncio
+async def test_session_commit_policy_trainer_disables_case_spec_by_default():
+    from openviking.session.train import SessionCommitPolicyTrainer
+
+    client = FakeSessionCommitClient()
+    trainer = SessionCommitPolicyTrainer(
+        client=client,
+        run_id="run1",
+        poll_interval_seconds=0.01,
+    )
+    rollout = Rollout(
+        case=_case(),
+        messages=[Message(id="m1", role="user", parts=[TextPart(text="hello")])],
+        policy_snapshot_id="snapshot-1",
+        evaluation=RubricEvaluation(
+            passed=False,
+            score=0.0,
+            criterion_results=[],
+            feedback=[],
+        ),
+        metadata={"data_split": "unit", "task_no": 7},
+    )
+
+    result = await trainer.train_rollouts([rollout], _policy_set())
+
+    commit_result = result.apply_result.metadata["commit_results"][0]
+    committed_messages = client.messages[commit_result["session_id"]]
+    visible_text = "\n".join(
+        part.get("text", "") for message in committed_messages for part in message.get("parts", [])
+    )
+    assert "# OpenViking Batch Training CaseSpec" not in visible_text
+    assert "# OpenViking OutcomeEvaluation" in visible_text
+    assert commit_result["commit_case_spec_enabled"] is False
 
 
 @pytest.mark.asyncio

@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Prepend the structured CaseSpec system message during training commit. "
-            "When omitted, use rollout metadata and otherwise default to enabled."
+            "When omitted, use rollout metadata and otherwise default to disabled."
         ),
     )
     parser.add_argument("--config", default=None, help="ov.conf path (optional)")

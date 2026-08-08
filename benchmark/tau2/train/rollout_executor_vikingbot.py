@@ -365,7 +365,6 @@ def _make_search_experience_tool(
                         candidates=candidates,
                     )
                     return _format_search_experience_response(
-                        situation=situation,
                         task_signature=task_signature,
                         match_type="exp_ann",
                         candidates=candidates,
@@ -396,7 +395,6 @@ def _make_search_experience_tool(
                             ),
                         )
                         return _format_search_experience_response(
-                            situation=situation,
                             task_signature=task_signature,
                             match_type="exact_case",
                             candidates=candidates,
@@ -416,26 +414,29 @@ def _make_search_experience_tool(
                     memories = result.get("memories", []) if isinstance(result, dict) else []
                     selected_cases = memories[:normalized_limit]
 
-                    experience_uris = await _linked_experience_scope(client, selected_cases)
+                    case_scopes, experience_uris = await _case_experience_scope(
+                        client,
+                        selected_cases,
+                    )
                     fallback_reason = (
                         "task_signature_not_found" if str(task_signature or "").strip() else None
                     )
                     if not experience_uris:
+                        candidates = _case_exp_rerank_candidates(case_scopes, [])
                         _trace_experience_recall(
                             match_type="case_exp_rerank",
                             task_signature=task_signature,
-                            candidates=[],
+                            candidates=candidates,
                             fallback_reason=fallback_reason,
                             exact_case_found=False,
                             selected_case_count=len(selected_cases),
                             scoped_experience_count=0,
                         )
                         return _format_search_experience_response(
-                            situation=situation,
                             task_signature=task_signature,
                             match_type="case_exp_rerank",
                             fallback_reason=fallback_reason,
-                            candidates=[],
+                            candidates=candidates,
                         )
 
                     experience_result = await client.search(
@@ -465,8 +466,8 @@ def _make_search_experience_tool(
                             for item in experience_memories[:normalized_experience_top_n]
                         )
                     )
-                    candidates = _single_experience_candidate(
-                        "case_exp_rerank",
+                    candidates = _case_exp_rerank_candidates(
+                        case_scopes,
                         [entry for entry in entries if entry],
                     )
                     _trace_experience_recall(
@@ -479,7 +480,6 @@ def _make_search_experience_tool(
                         scoped_experience_count=len(experience_uris),
                     )
                     return _format_search_experience_response(
-                        situation=situation,
                         task_signature=task_signature,
                         match_type="case_exp_rerank",
                         fallback_reason=fallback_reason,
@@ -495,7 +495,6 @@ def _make_search_experience_tool(
                         candidates=candidates,
                     )
                     return _format_search_experience_response(
-                        situation=situation,
                         task_signature=task_signature,
                         match_type="exact_case",
                         candidates=candidates,
@@ -531,7 +530,6 @@ def _make_search_experience_tool(
                         fallback_reason=fallback_reason,
                     )
                     return _format_search_experience_response(
-                        situation=situation,
                         task_signature=task_signature,
                         match_type="semantic",
                         fallback_reason=fallback_reason,
@@ -601,7 +599,6 @@ def _make_search_experience_tool(
                     exact_case_found=exact_case,
                 )
                 return _format_search_experience_response(
-                    situation=situation,
                     task_signature=task_signature,
                     match_type="hybrid_ann",
                     fallback_reason=fallback_reason,
@@ -619,7 +616,6 @@ def _make_search_experience_tool(
 
 def _format_search_experience_response(
     *,
-    situation: str,
     candidates: list[dict[str, Any]],
     match_type: str = "semantic",
     task_signature: str | None = None,
@@ -634,7 +630,6 @@ def _format_search_experience_response(
 
     payload: dict[str, Any] = {
         "match_type": match_type,
-        "situation": situation,
         "candidates": candidates,
     }
     if task_signature:
@@ -935,6 +930,7 @@ async def _experience_search_summary(client: Any, item: Any, rank: int) -> dict[
     summary: dict[str, Any] = {
         "rank": rank,
         "case_name": _filename_name(case_uri),
+        "situation": "",
         "experiences": [],
     }
     if not case_uri:
@@ -943,6 +939,7 @@ async def _experience_search_summary(client: Any, item: Any, rank: int) -> dict[
         content = await client.read_content(case_uri, level="read")
     except Exception:
         return summary
+    summary["situation"] = _markdown_section(content, "Situation")
     exp_uris = _linked_experience_uris(content, source_uri=case_uri)
     # ponytail: fetch Situation snippet per experience so agent can gate read_experience on applicability.
     experiences: list[dict[str, Any]] = []
@@ -978,27 +975,67 @@ async def _experience_ann_entry(client: Any, item: Any) -> dict[str, Any] | None
     }
 
 
-async def _linked_experience_scope(client: Any, case_items: list[Any]) -> list[str]:
-    async def read_links(item: Any) -> list[str]:
+@dataclass(slots=True)
+class _CaseExperienceScope:
+    rank: int
+    case_name: str
+    situation: str
+    experience_uris: tuple[str, ...]
+
+
+async def _case_experience_scope(
+    client: Any,
+    case_items: list[Any],
+) -> tuple[list[_CaseExperienceScope], list[str]]:
+    async def read_scope(rank: int, item: Any) -> _CaseExperienceScope:
         case_uri = _case_uri(item)
+        content = ""
         if not case_uri:
-            return []
+            return _CaseExperienceScope(rank, "", "", ())
         try:
             content = await client.read_content(case_uri, level="read")
         except Exception:
-            return []
-        return _linked_experience_uris(content, source_uri=case_uri)
+            pass
+        return _CaseExperienceScope(
+            rank=rank,
+            case_name=_filename_name(case_uri),
+            situation=_markdown_section(content, "Situation"),
+            experience_uris=tuple(_linked_experience_uris(content, source_uri=case_uri)),
+        )
 
-    linked_groups = await asyncio.gather(*(read_links(item) for item in case_items))
+    case_scopes = list(
+        await asyncio.gather(
+            *(read_scope(rank, item) for rank, item in enumerate(case_items, start=1))
+        )
+    )
     experience_uris: list[str] = []
     seen: set[str] = set()
-    for group in linked_groups:
-        for uri in group:
+    for case_scope in case_scopes:
+        for uri in case_scope.experience_uris:
             if uri in seen:
                 continue
             seen.add(uri)
             experience_uris.append(uri)
-    return experience_uris
+    return case_scopes, experience_uris
+
+
+def _case_exp_rerank_candidates(
+    case_scopes: list[_CaseExperienceScope],
+    ranked_experiences: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "rank": case_scope.rank,
+            "case_name": case_scope.case_name,
+            "situation": case_scope.situation,
+            "experiences": [
+                dict(experience)
+                for experience in ranked_experiences
+                if str(experience.get("uri") or "") in case_scope.experience_uris
+            ],
+        }
+        for case_scope in case_scopes
+    ]
 
 
 def _trace_exact_case_experience_event(event: str, case_uri: str, **fields: Any) -> None:
@@ -1021,6 +1058,7 @@ async def _exact_case_experience_summary(
     summary: dict[str, Any] = {
         "rank": rank,
         "case_name": _filename_name(case_uri),
+        "situation": "",
         "experiences": [],
     }
     if not case_uri:
@@ -1035,6 +1073,7 @@ async def _exact_case_experience_summary(
             outcome="missing_case_content",
         )
         return summary
+    summary["situation"] = _markdown_section(case_content, "Situation")
 
     experiences: list[dict[str, str]] = []
     exp_uris = sorted(_linked_experience_uris(case_content, source_uri=case_uri))

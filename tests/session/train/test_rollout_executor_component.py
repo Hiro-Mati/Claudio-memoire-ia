@@ -1136,7 +1136,7 @@ async def test_tau2_rollout_experience_client_closes_once_after_failure(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_tau2_search_experience_summary_only_exposes_case_name_and_experience_snippets():
+async def test_tau2_search_experience_summary_exposes_case_situation_and_experience_snippets():
     from benchmark.tau2.train.rollout_executor_vikingbot import _experience_search_summary
 
     case_uri = "viking://user/u/memories/cases/case_1.md"
@@ -1148,6 +1148,8 @@ async def test_tau2_search_experience_summary_only_exposes_case_name_and_experie
             if uri == case_uri:
                 return (
                     "# case_1\n\n"
+                    "## Situation\n"
+                    "- Applies when: the original request scope matters\n\n"
                     "## Task Signature\nsecret task signature\n\n"
                     "## Input\nsecret case input\n\n"
                     "## Linked Experiences\n"
@@ -1171,6 +1173,7 @@ async def test_tau2_search_experience_summary_only_exposes_case_name_and_experie
     assert summary == {
         "rank": 1,
         "case_name": "case_1",
+        "situation": "- Applies when: the original request scope matters",
         "experiences": [
             {
                 "uri": exp_uri,
@@ -1194,11 +1197,11 @@ def test_tau2_search_experience_response_hides_internal_search_metadata():
 
     payload = json.loads(
         _format_search_experience_response(
-            situation="The user wants to cancel all upcoming reservations.",
             candidates=[
                 {
                     "rank": 1,
                     "case_name": "case_1",
+                    "situation": "- Applies when: scope matters",
                     "experiences": [
                         {
                             "uri": "viking://user/u/memories/experiences/keep_scope.md",
@@ -1212,11 +1215,11 @@ def test_tau2_search_experience_response_hides_internal_search_metadata():
 
     assert payload == {
         "match_type": "semantic",
-        "situation": "The user wants to cancel all upcoming reservations.",
         "candidates": [
             {
                 "rank": 1,
                 "case_name": "case_1",
+                "situation": "- Applies when: scope matters",
                 "experiences": [
                     {
                         "uri": "viking://user/u/memories/experiences/keep_scope.md",
@@ -1325,7 +1328,6 @@ async def test_tau2_search_experience_uses_declarative_situation(monkeypatch):
     }
     assert payload == {
         "match_type": "semantic",
-        "situation": "The user wants to cancel all upcoming reservations.",
         "candidates": [],
     }
 
@@ -1423,9 +1425,11 @@ async def test_tau2_search_experience_case_exp_rerank_reranks_all_linked_experie
     cases_uri = "viking://user/u/memories/cases"
     case_a_uri = f"{cases_uri}/case_a.md"
     case_b_uri = f"{cases_uri}/case_b.md"
+    case_c_uri = f"{cases_uri}/case_c.md"
     exp_a_uri = "viking://user/u/memories/experiences/exp_a.md"
     exp_shared_uri = "viking://user/u/memories/experiences/exp_shared.md"
     exp_b_uri = "viking://user/u/memories/experiences/exp_b.md"
+    exp_c_uri = "viking://user/u/memories/experiences/exp_c.md"
 
     class FakeClient:
         search_calls = []
@@ -1451,15 +1455,20 @@ async def test_tau2_search_experience_case_exp_rerank_reranks_all_linked_experie
             self.search_calls.append((query, target_uri, limit, score_threshold, filter))
             if target_uri == cases_uri:
                 return {
-                    "memories": [{"uri": case_a_uri}, {"uri": case_b_uri}],
+                    "memories": [
+                        {"uri": case_a_uri},
+                        {"uri": case_b_uri},
+                        {"uri": case_c_uri},
+                    ],
                     "server_trace_id": "1" * 32,
                 }
             assert target_uri == "viking://user/u/memories/experiences"
             return {
                 "memories": [
+                    {"uri": exp_shared_uri},
                     {"uri": exp_b_uri},
                     {"uri": exp_a_uri},
-                    {"uri": exp_shared_uri},
+                    {"uri": exp_c_uri},
                 ],
                 "server_trace_id": "2" * 32,
             }
@@ -1470,6 +1479,7 @@ async def test_tau2_search_experience_case_exp_rerank_reranks_all_linked_experie
             if uri == case_a_uri:
                 return (
                     "# case_a\n\n"
+                    "## Situation\n- Case A applies\n\n"
                     "## Linked Experiences\n"
                     f"- [exp_a]({exp_a_uri})\n"
                     f"- [exp_shared]({exp_shared_uri})\n"
@@ -1477,9 +1487,17 @@ async def test_tau2_search_experience_case_exp_rerank_reranks_all_linked_experie
             if uri == case_b_uri:
                 return (
                     "# case_b\n\n"
+                    "## Situation\n- Case B applies\n\n"
                     "## Linked Experiences\n"
                     f"- [exp_shared]({exp_shared_uri})\n"
                     f"- [exp_b]({exp_b_uri})\n"
+                )
+            if uri == case_c_uri:
+                return (
+                    "# case_c\n\n"
+                    "## Situation\n- Case C applies\n\n"
+                    "## Linked Experiences\n"
+                    f"- [exp_c]({exp_c_uri})\n"
                 )
             if uri == exp_a_uri:
                 return "## Situation\n- Applies to exp A\n"
@@ -1487,6 +1505,8 @@ async def test_tau2_search_experience_case_exp_rerank_reranks_all_linked_experie
                 return "## Situation\n- Applies to exp B\n"
             if uri == exp_shared_uri:
                 return "## Situation\n- Applies to shared exp\n"
+            if uri == exp_c_uri:
+                return "## Situation\n- Applies to exp C\n"
             raise AssertionError(f"unexpected uri: {uri}")
 
         async def close(self):
@@ -1506,37 +1526,52 @@ async def test_tau2_search_experience_case_exp_rerank_reranks_all_linked_experie
         experience_rerank_top_n=2,
     )
 
-    payload = json.loads(await tool.execute(None, situation=situation, limit=2))
+    payload = json.loads(await tool.execute(None, situation=situation, limit=3))
 
     assert FakeClient.search_calls == [
         (situation, cases_uri, 10, 0.0, None),
         (
             situation,
             "viking://user/u/memories/experiences",
-            3,
+            4,
             0.0,
             {
                 "op": "must",
                 "field": "uri",
-                "conds": [exp_a_uri, exp_shared_uri, exp_b_uri],
+                "conds": [exp_a_uri, exp_shared_uri, exp_b_uri, exp_c_uri],
             },
         ),
     ]
     assert payload == {
         "match_type": "case_exp_rerank",
-        "situation": situation,
         "candidates": [
             {
                 "rank": 1,
-                "case_name": "case_exp_rerank",
+                "case_name": "case_a",
+                "situation": "- Case A applies",
                 "experiences": [
-                    {"uri": exp_b_uri, "situation": "- Applies to exp B"},
-                    {"uri": exp_a_uri, "situation": "- Applies to exp A"},
+                    {"uri": exp_shared_uri, "situation": "- Applies to shared exp"},
                 ],
-            }
+            },
+            {
+                "rank": 2,
+                "case_name": "case_b",
+                "situation": "- Case B applies",
+                "experiences": [
+                    {"uri": exp_shared_uri, "situation": "- Applies to shared exp"},
+                    {"uri": exp_b_uri, "situation": "- Applies to exp B"},
+                ],
+            },
+            {
+                "rank": 3,
+                "case_name": "case_c",
+                "situation": "- Case C applies",
+                "experiences": [],
+            },
         ],
     }
-    assert exp_shared_uri not in FakeClient.read_uris
+    assert exp_a_uri not in FakeClient.read_uris
+    assert exp_c_uri not in FakeClient.read_uris
     search_trace_events = [
         event
         for message in trace_messages
@@ -1601,7 +1636,10 @@ async def test_tau2_search_experience_case_exp_rerank_exact_case_returns_all_lin
             assert level == "read"
             self.read_uris.append(uri)
             if uri == case_uri:
-                return _tau2_exact_case_content_with_links([exp_b_uri, exp_a_uri])
+                return _tau2_exact_case_content_with_links([exp_b_uri, exp_a_uri]).replace(
+                    "## Linked Experiences",
+                    "## Situation\n- Exact Case applies\n\n## Linked Experiences",
+                )
             if uri == exp_a_uri:
                 return "## Situation\n- Exact exp A\n"
             if uri == exp_b_uri:
@@ -1628,6 +1666,7 @@ async def test_tau2_search_experience_case_exp_rerank_exact_case_returns_all_lin
     )
 
     assert payload["match_type"] == "exact_case"
+    assert payload["candidates"][0]["situation"] == "- Exact Case applies"
     assert payload["candidates"][0]["experiences"] == [
         {"uri": exp_a_uri, "content": "## Situation\n- Exact exp A"},
         {"uri": exp_b_uri, "content": "## Situation\n- Exact exp B"},
@@ -1844,7 +1883,11 @@ async def test_tau2_search_experience_case_exp_rerank_skips_empty_experience_sco
         async def read_content(self, uri, level="read"):
             assert uri == case_uri
             assert level == "read"
-            return "# no_experience\n\n## Linked Experiences\n"
+            return (
+                "# no_experience\n\n"
+                "## Situation\n- No reusable guidance exists\n\n"
+                "## Linked Experiences\n"
+            )
 
         async def close(self):
             return None
@@ -1857,8 +1900,14 @@ async def test_tau2_search_experience_case_exp_rerank_skips_empty_experience_sco
     assert len(FakeClient.search_calls) == 1
     assert payload == {
         "match_type": "case_exp_rerank",
-        "situation": "A task without linked experience",
-        "candidates": [],
+        "candidates": [
+            {
+                "rank": 1,
+                "case_name": "no_experience",
+                "situation": "- No reusable guidance exists",
+                "experiences": [],
+            }
+        ],
     }
 
 
@@ -1954,7 +2003,6 @@ async def test_tau2_search_experience_exp_ann_searches_experience_tree(monkeypat
     }
     assert payload == {
         "match_type": "exp_ann",
-        "situation": "A matching situation",
         "candidates": [
             {
                 "rank": 1,
@@ -2223,11 +2271,11 @@ async def test_tau2_search_experience_returns_exact_case_without_semantic_search
     assert payload == {
         "match_type": "exact_case",
         "task_signature": "tau2:airline:train:39",
-        "situation": "The user wants to cancel all upcoming reservations.",
         "candidates": [
             {
                 "rank": 1,
                 "case_name": "tau2_airline_train_22",
+                "situation": "",
                 "experiences": [
                     {
                         "uri": exp_uri,
@@ -2364,6 +2412,7 @@ async def test_tau2_search_experience_returns_exact_empty_case_without_semantic_
         {
             "rank": 1,
             "case_name": "tau2_airline_train_22",
+            "situation": "",
             "experiences": [],
         }
     ]
