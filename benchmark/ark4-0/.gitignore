@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*.local.json
+*.local.log
+*.local.jsonl
+*.local.pid

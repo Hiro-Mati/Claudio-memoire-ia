@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ov-proxy-ov-ark-test
+  namespace: ai-search-rec
+  labels:
+    app: ov-proxy
+    lane: ov-ark-test
+    owner: ov-ark-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ov-proxy
+      owner: ov-ark-test
+  template:
+    metadata:
+      labels:
+        app: ov-proxy
+        instance: main
+        lane: ov-ark-test
+        owner: ov-ark-test
+    spec:
+      containers:
+        - name: placeholder
+          image: hub.byted.org/byteair/data.ai_search_rec.vaka_tool_server:1.0.0.1805
+          command:
+            - sh
+            - -c
+            - while true; do sleep 3600; done
+          ports:
+            - name: http
+              containerPort: 8765
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ov-proxy-ov-ark-test
+  namespace: ai-search-rec
+  labels:
+    app: ov-proxy
+    lane: ov-ark-test
+    owner: ov-ark-test
+spec:
+  type: ClusterIP
+  selector:
+    app: ov-proxy
+    instance: main
+    owner: ov-ark-test
+  ports:
+    - name: http
+      port: 8765
+      targetPort: http
+      protocol: TCP

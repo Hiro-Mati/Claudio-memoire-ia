@@ -1,0 +1,21 @@
+{
+  "kubeconfig": "../../../evolution/.kube/config_stg",
+  "namespace": "ai-search-rec",
+  "openviking_target": "ov-ark-test",
+  "deployment": "ov-proxy-ov-ark-test",
+  "remote_port": 8765,
+  "local_port": 1944,
+  "local_health_url": "http://127.0.0.1:1944/health",
+  "image": "",
+  "headers": {},
+  "state_file": "kubevpn_state.local.json",
+  "kubevpn_log_file": "kubevpn.local.log",
+  "probe": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "response_status": 503,
+    "marker": "ARK4_LOCAL_TRAFFIC_PROBE",
+    "process_log_file": "traffic_probe.local.log",
+    "event_log_file": "traffic_probe_events.local.jsonl"
+  }
+}
