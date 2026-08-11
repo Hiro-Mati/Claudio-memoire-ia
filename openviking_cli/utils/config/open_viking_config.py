@@ -185,7 +185,6 @@ class OpenVikingConfig(BaseModel):
         default_factory=GitConfig, description="Git version control configuration"
     )
 
-    # Parser configurations
     pdf: PDFConfig = Field(default_factory=PDFConfig, description="PDF parsing configuration")
 
     code: CodeConfig = Field(default_factory=CodeConfig, description="Code parsing configuration")

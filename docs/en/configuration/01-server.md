@@ -208,6 +208,18 @@ Remote backends also require endpoint, bucket/collection, credentials, and timeo
 
 This setting controls queue-job concurrency. It is separate from `vlm.media.max_concurrent`, which limits audio/video VLM calls, and does not limit individual Understanding API HTTP requests.
 
+### `queue_workers.add_resource`
+
+| Field | Type | Default | Description |
+|---|---|---:|---|
+| `max_concurrent` | integer | `4` | Number of complete AddResource jobs consumed concurrently; must be greater than `0`; requires a server restart after changes |
+
+### `queue_workers.session_commit`
+
+| Field | Type | Default | Description |
+|---|---|---:|---|
+| `max_concurrent` | integer | `4` | Number of SessionCommit jobs consumed concurrently; must be greater than `0`; requires a server restart after changes |
+
 ## HTTP Server Settings
 
 ```json
