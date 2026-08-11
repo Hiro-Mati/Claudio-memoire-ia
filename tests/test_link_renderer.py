@@ -63,6 +63,51 @@ class TestRelativePath:
         assert result == ""
 
 
+class TestLinkSatisfaction:
+    source_uri = "viking://resources/wiki/overview.md"
+    target_uri = "viking://resources/wiki/tags.md"
+
+    def test_unprotected_anchor_can_be_linked(self):
+        assert LinkRenderer.can_render_link(
+            "Read the behavior tags.",
+            "behavior tags",
+            self.source_uri,
+            self.target_uri,
+        )
+
+    def test_existing_link_to_target_is_already_satisfied(self):
+        assert LinkRenderer.can_render_link(
+            "参见 [L2 行为标签库](./tags.md)。",
+            "行为标签库",
+            self.source_uri,
+            self.target_uri,
+        )
+
+    def test_equivalent_encoded_target_with_fragment_is_satisfied(self):
+        assert LinkRenderer.can_render_link(
+            "See [ByteDance](../concepts/byte%20dance.md#facts).",
+            "ByteDance",
+            "viking://resources/wiki/sections/overview.md",
+            "viking://resources/wiki/concepts/byte dance.md",
+        )
+
+    def test_existing_link_to_other_target_is_not_satisfied(self):
+        assert not LinkRenderer.can_render_link(
+            "参见 [行为标签库](./other.md)。",
+            "行为标签库",
+            self.source_uri,
+            self.target_uri,
+        )
+
+    def test_link_syntax_in_code_is_not_satisfied(self):
+        assert not LinkRenderer.can_render_link(
+            "`[行为标签库](./tags.md)`",
+            "行为标签库",
+            self.source_uri,
+            self.target_uri,
+        )
+
+
 class TestRenderLinks:
     def test_single_link(self):
         content = "Caroline attended a support group meeting."

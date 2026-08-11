@@ -453,13 +453,14 @@ class WikiRenderer:
                 raise ValueError(f"WikiLink references an unknown page_id: f={link.f}, t={link.t}")
             if not link.match_text:
                 raise ValueError("WikiLink match_text is required")
-            if LinkRenderer._find_match_span(
+            if not LinkRenderer.can_render_link(
                 source_page.body_markdown,
                 link.match_text,
-                LinkRenderer.protected_markdown_spans(source_page.body_markdown),
-            ) is None:
+                page_uris[link.f][0],
+                page_uris[link.t][0],
+            ):
                 raise ValueError(
-                    f"WikiLink match_text is not a linkable body anchor: {link.match_text!r}"
+                    f"WikiLink match_text is not a satisfiable body anchor: {link.match_text!r}"
                 )
 
         resolved_links = resolve_wiki_links(bundle.links, page_uris, strict=True)

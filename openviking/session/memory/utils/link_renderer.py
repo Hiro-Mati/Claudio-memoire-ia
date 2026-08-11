@@ -1,5 +1,7 @@
+import posixpath
 import re
 from typing import Dict, List, Optional
+from urllib.parse import unquote
 
 from openviking.core.namespace import uri_parts
 
@@ -78,6 +80,51 @@ class LinkRenderer:
                 continue
             return start, end
         return None
+
+    @staticmethod
+    def _normalize_markdown_target(target: str) -> str:
+        target = unquote(target.strip())
+        if target.startswith("<") and target.endswith(">"):
+            target = target[1:-1]
+        target = target.split("#", 1)[0]
+        return target.rstrip("/") if "://" in target else posixpath.normpath(target)
+
+    @staticmethod
+    def can_render_link(
+        content: str,
+        match_text: str,
+        source_uri: str,
+        target_uri: str,
+    ) -> bool:
+        """Return whether rendering can insert or preserve the requested link."""
+        protected_spans = LinkRenderer.protected_markdown_spans(content)
+        if LinkRenderer._find_match_span(content, match_text, protected_spans) is not None:
+            return True
+
+        markdown_links = list(LinkRenderer._RELATIVE_LINK_RE.finditer(content))
+        link_spans = {(match.start(), match.end()) for match in markdown_links}
+        non_link_protected = [span for span in protected_spans if span not in link_spans]
+        relative_target = LinkRenderer.relative_path(source_uri, target_uri)
+        expected_targets = {
+            LinkRenderer._normalize_markdown_target(target_uri),
+            LinkRenderer._normalize_markdown_target(
+                relative_target if relative_target is not None else target_uri
+            ),
+        }
+
+        for link in markdown_links:
+            if link.start() > 0 and content[link.start() - 1] == "!":
+                continue
+            if any(
+                not (link.end() <= start or link.start() >= end)
+                for start, end in non_link_protected
+            ):
+                continue
+            if LinkRenderer._find_match_span(link.group("text"), match_text) is None:
+                continue
+            if LinkRenderer._normalize_markdown_target(link.group("target")) in expected_targets:
+                return True
+        return False
 
     @staticmethod
     def render_links(content: str, source_uri: str, links: List[Dict]) -> str:

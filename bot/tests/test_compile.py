@@ -321,6 +321,31 @@ def test_renderer_creates_okf_pages_links_and_citations():
     assert "[1] [source](viking://resources/source)" in first["content"]
 
 
+def test_renderer_preserves_existing_link_and_keeps_relationship():
+    bundle = WikiBundleDraft.model_validate(
+        {
+            "pages": [
+                _page(1, "Overview", body_markdown="Read [Details](./details.md) next."),
+                _page(2, "Details"),
+            ],
+            "links": [{"f": 1, "t": 2, "match_text": "Details"}],
+        }
+    )
+
+    rendered = WikiRenderer().render(
+        bundle=bundle,
+        target_uri="viking://resources/wiki",
+        source_roots={"src_1": "viking://resources/source"},
+        catalog_uris=set(),
+        existing_raw={},
+    )
+    operations = {operation["uri"]: operation["content"] for operation in rendered.operations}
+
+    assert operations["viking://resources/wiki/overview.md"].count("[Details](./details.md)") == 1
+    assert "- [Overview](./overview.md)" in operations["viking://resources/wiki/details.md"]
+    assert rendered.link_count == 0
+
+
 def test_wiki_page_title_path_normalizes_spaced_dashes_only():
     assert (
         wiki_page_path_from_title("Experimental Designs - Residual Networks")
@@ -759,6 +784,40 @@ async def test_submit_tool_rejects_protected_anchor_and_path_collision():
 
 
 @pytest.mark.asyncio
+async def test_submit_tool_accepts_existing_link_only_when_target_matches():
+    tool = SubmitWikiBundleTool(
+        source_ids={"src_1"},
+        catalog_uris=set(),
+        target_uri="viking://resources/wiki",
+        limits=CompileLimits(),
+    )
+    context = ToolContext()
+
+    accepted = await tool.execute(
+        context,
+        pages=[
+            _page(1, "One", body_markdown="参见 [L2 行为标签库](./two.md)。"),
+            _page(2, "Two"),
+        ],
+        links=[{"f": 1, "t": 2, "match_text": "行为标签库"}],
+    )
+    assert accepted.startswith("Wiki bundle accepted")
+    assert tool.bundle is not None and len(tool.bundle.links) == 1
+
+    rejected = await tool.execute(
+        context,
+        pages=[
+            _page(1, "One", body_markdown="参见 [行为标签库](./three.md)。"),
+            _page(2, "Two"),
+            _page(3, "Three"),
+        ],
+        links=[{"f": 1, "t": 2, "match_text": "行为标签库"}],
+    )
+    assert "unsatisfied anchor '行为标签库'" in rejected
+    assert tool.bundle is None
+
+
+@pytest.mark.asyncio
 async def test_submit_tool_checks_size_before_parsing_okf_artifact():
     tool = SubmitWikiBundleTool(
         source_ids={"src_1"},
@@ -869,8 +928,8 @@ async def test_submit_tool_reports_all_invalid_links():
     )
 
     assert result.startswith("Error: Invalid Wiki bundle: 2 invalid link(s):")
-    assert "links[0] from page 1 has non-linkable anchor 'Missing One'" in result
-    assert "links[1] from page 1 has non-linkable anchor 'Missing Two'" in result
+    assert "links[0] from page 1 has unsatisfied anchor 'Missing One'" in result
+    assert "links[1] from page 1 has unsatisfied anchor 'Missing Two'" in result
     assert tool.bundle is None
 
 
