@@ -311,6 +311,10 @@ class QueueManager:
         """Check if QueueManager is running."""
         return self._started
 
+    def has_task_work(self, task_id: str) -> bool:
+        """Check the process-local work index without querying QueueFS."""
+        return self._task_work_index.has_work(task_id)
+
     def get_queue(
         self,
         name: str,

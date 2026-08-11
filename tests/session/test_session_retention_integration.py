@@ -16,8 +16,10 @@ from openviking.session.memory.constants import AGENT_EVOLUTION_MEMORY_TYPES
 from openviking.session.session import (
     ArchiveState,
     Session,
+    _ArchiveQueueLiveness,
     _ArchiveSummaryResult,
     _CheckpointRequest,
+    _SessionCommitQueueSnapshot,
 )
 
 
@@ -622,7 +624,57 @@ async def test_pending_predecessor_uses_terminal_notification_without_full_scan(
     assert plan.latest_completed.archive_id == "archive_001"
 
 
-async def test_pending_predecessor_timeout_marks_orphan_failed_for_raw_replay(
+@pytest.mark.parametrize("liveness_state", ["active", "unknown"])
+async def test_pending_predecessor_timeout_keeps_unconfirmed_work_pending(
+    client,
+    monkeypatch,
+    liveness_state,
+):
+    session = client(session_id=f"phase2_predecessor_{liveness_state}_timeout_test")
+    await session.ensure_exists()
+    pending_uri = await _write_archive(
+        session,
+        1,
+        [_text_message("u1", "user", "long-running pending predecessor")],
+        meta={
+            "phase1": {
+                "status": "ready",
+                "queue_message": {"task_id": f"task-{liveness_state}"},
+            }
+        },
+    )
+    monkeypatch.setattr("openviking.session.session._ARCHIVE_WAIT_POLL_SECONDS", 0.01)
+    monkeypatch.setattr("openviking.session.session._ARCHIVE_WAIT_MAX_POLL_SECONDS", 0.02)
+    checked = asyncio.Event()
+
+    async def liveness(_archive_uri):
+        checked.set()
+        return _ArchiveQueueLiveness(
+            state=liveness_state,
+            task_id=f"task-{liveness_state}",
+            reason="synthetic non-terminal task state",
+        )
+
+    monkeypatch.setattr(session, "_check_archive_queue_liveness", liveness)
+    waiter = asyncio.create_task(session._resolve_phase2_predecessors(2, timeout=0.05))
+    await asyncio.wait_for(checked.wait(), timeout=0.5)
+    assert not waiter.done()
+
+    await session._write_failed_marker(
+        pending_uri,
+        stage="synthetic_terminal",
+        error="finish the test wait without orphan recovery",
+    )
+    plan = await asyncio.wait_for(waiter, timeout=0.5)
+
+    failed = json.loads(
+        await session._viking_fs.read_file(f"{pending_uri}/.failed.json", ctx=session.ctx)
+    )
+    assert failed["stage"] == "synthetic_terminal"
+    assert [state.archive_id for state in plan.replay_states] == ["archive_001"]
+
+
+async def test_pending_predecessor_timeout_marks_confirmed_orphan_failed_for_raw_replay(
     client,
     monkeypatch,
 ):
@@ -632,9 +684,24 @@ async def test_pending_predecessor_timeout_marks_orphan_failed_for_raw_replay(
         session,
         1,
         [_text_message("u1", "user", "orphaned pending predecessor")],
+        meta={
+            "phase1": {
+                "status": "ready",
+                "queue_message": {"task_id": "task-orphan"},
+            }
+        },
     )
     monkeypatch.setattr("openviking.session.session._ARCHIVE_WAIT_POLL_SECONDS", 0.01)
     monkeypatch.setattr("openviking.session.session._ARCHIVE_WAIT_MAX_POLL_SECONDS", 0.02)
+
+    async def missing_liveness(_archive_uri):
+        return _ArchiveQueueLiveness(
+            state="missing",
+            task_id="task-orphan",
+            reason="synthetic durable queue miss",
+        )
+
+    monkeypatch.setattr(session, "_check_archive_queue_liveness", missing_liveness)
 
     with pytest.raises(TimeoutError, match="archive_001"):
         await asyncio.wait_for(
@@ -645,11 +712,252 @@ async def test_pending_predecessor_timeout_marks_orphan_failed_for_raw_replay(
     failed = json.loads(
         await session._viking_fs.read_file(f"{orphan_uri}/.failed.json", ctx=session.ctx)
     )
-    assert failed["stage"] == "phase2_wait_timeout"
+    assert failed["stage"] == "phase2_orphan_recovery"
     assert failed["blocked_by"] == "archive_002"
 
     plan = await session._resolve_phase2_predecessors(2, timeout=0.05)
     assert [state.archive_id for state in plan.replay_states] == ["archive_001"]
+
+
+async def test_pending_predecessor_rechecks_terminal_after_orphan_lookup(
+    client,
+    monkeypatch,
+):
+    session = client(session_id="phase2_predecessor_orphan_race_test")
+    await session.ensure_exists()
+    pending_uri = await _write_archive(
+        session,
+        1,
+        [_text_message("u1", "user", "finishes during orphan lookup")],
+    )
+    monkeypatch.setattr("openviking.session.session._ARCHIVE_WAIT_POLL_SECONDS", 0.01)
+
+    async def completes_during_lookup(_archive_uri):
+        await session._viking_fs.write_file(
+            f"{pending_uri}/.done",
+            json.dumps(
+                {
+                    "predecessor_barrier_version": 1,
+                    "coverage_start_archive": "archive_001",
+                    "coverage_end_archive": "archive_001",
+                    "covered_failed_archives": [],
+                }
+            ),
+            ctx=session.ctx,
+        )
+        return _ArchiveQueueLiveness(state="missing", reason="stale absence")
+
+    monkeypatch.setattr(
+        session,
+        "_check_archive_queue_liveness",
+        completes_during_lookup,
+    )
+
+    plan = await session._resolve_phase2_predecessors(2, timeout=0.01)
+
+    assert plan.latest_completed is not None
+    assert plan.latest_completed.archive_id == "archive_001"
+    assert not await session._archive_file_exists(pending_uri, ".failed.json")
+
+
+async def test_archive_queue_liveness_uses_local_index_without_snapshot(
+    client,
+    monkeypatch,
+):
+    session = client(session_id="archive_queue_local_index_test")
+
+    async def phase1(_archive_uri):
+        return {
+            "queue_message": {"task_id": "task-local"},
+            "queue_mount_point": "/queue",
+        }
+
+    class FakeManager:
+        mount_point = "/queue"
+
+        @staticmethod
+        def has_task_work(task_id):
+            return task_id == "task-local"
+
+    async def unexpected_snapshot(*_args, **_kwargs):
+        raise AssertionError("local active work must not query durable QueueFS")
+
+    monkeypatch.setattr(session, "_read_phase1_meta", phase1)
+    monkeypatch.setattr(session, "_get_session_commit_queue_snapshot", unexpected_snapshot)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.get_queue_manager",
+        lambda: FakeManager(),
+    )
+
+    liveness = await session._check_archive_queue_liveness("archive-uri")
+
+    assert liveness.state == "active"
+    assert "process-local" in liveness.reason
+
+
+async def test_legacy_archive_liveness_matches_durable_work_by_archive_uri(
+    client,
+    monkeypatch,
+):
+    session = client(session_id="legacy_archive_queue_uri_match_test")
+    archive_uri = f"{session.uri}/history/archive_001"
+
+    async def phase1(_archive_uri):
+        return {}
+
+    class FakeManager:
+        mount_point = "/queue"
+
+        @staticmethod
+        def has_task_work(_task_id):
+            return False
+
+    async def snapshot():
+        return _SessionCommitQueueSnapshot(
+            task_ids=frozenset({"legacy-task"}),
+            archive_uris=frozenset({archive_uri}),
+            mount_point="/queue",
+        )
+
+    monkeypatch.setattr(session, "_read_phase1_meta", phase1)
+    monkeypatch.setattr(session, "_get_session_commit_queue_snapshot", snapshot)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.get_queue_manager",
+        lambda: FakeManager(),
+    )
+
+    liveness = await session._check_archive_queue_liveness(archive_uri)
+
+    assert liveness.state == "active"
+    assert "durable QueueFS" in liveness.reason
+
+
+@pytest.mark.parametrize(
+    (
+        "expected_mount",
+        "current_mount",
+        "task_status",
+        "expected_state",
+        "expected_snapshot_calls",
+    ),
+    [
+        ("/queue", "/queue", "running", "missing", 1),
+        ("/queue/worker-1", "/queue/worker-1", "running", "missing", 1),
+        ("/queue/worker-1", "/queue/worker-2", "running", "active", 0),
+        ("", "/queue/worker-2", "running", "active", 1),
+        ("/queue", "/queue", "completed", "unknown", 1),
+    ],
+)
+async def test_archive_queue_liveness_respects_worker_authority(
+    client,
+    monkeypatch,
+    expected_mount,
+    current_mount,
+    task_status,
+    expected_state,
+    expected_snapshot_calls,
+):
+    session = client(session_id=f"archive_queue_liveness_{uuid4()}")
+    snapshot_calls = 0
+
+    async def phase1(_archive_uri):
+        return {
+            "queue_message": {"task_id": "task-check"},
+            "queue_mount_point": expected_mount,
+        }
+
+    class FakeManager:
+        mount_point = current_mount
+
+        @staticmethod
+        def has_task_work(_task_id):
+            return False
+
+    async def snapshot():
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return _SessionCommitQueueSnapshot(
+            task_ids=frozenset(),
+            archive_uris=frozenset(),
+            mount_point=current_mount,
+        )
+
+    class FakeTracker:
+        async def get(self, *_args, **_kwargs):
+            return SimpleNamespace(status=SimpleNamespace(value=task_status))
+
+    monkeypatch.setattr(session, "_read_phase1_meta", phase1)
+    monkeypatch.setattr(session, "_get_session_commit_queue_snapshot", snapshot)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.get_queue_manager",
+        lambda: FakeManager(),
+    )
+    monkeypatch.setattr(
+        "openviking.service.task_tracker.get_task_tracker",
+        lambda: FakeTracker(),
+    )
+
+    liveness = await session._check_archive_queue_liveness("archive-uri")
+
+    assert liveness.state == expected_state
+    assert snapshot_calls == expected_snapshot_calls
+
+
+async def test_session_commit_queue_snapshot_is_singleflight_and_cached(
+    client,
+    monkeypatch,
+):
+    session = client(session_id="archive_queue_snapshot_singleflight_test")
+    snapshot_started = asyncio.Event()
+    release_snapshot = asyncio.Event()
+    snapshot_calls = 0
+    mount_point = f"/queue/test-{uuid4()}"
+
+    class FakeQueue:
+        async def snapshot(self):
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            snapshot_started.set()
+            await release_snapshot.wait()
+            return [
+                {
+                    "id": "queue-message-1",
+                    "data": json.dumps(
+                        {
+                            "task_id": "task-1",
+                            "archive_uri": "viking://session/s1/history/archive_001",
+                        }
+                    ),
+                }
+            ]
+
+    class FakeManager:
+        def __init__(self):
+            self.mount_point = mount_point
+            self.queue = FakeQueue()
+
+        def get_queue(self, _queue_name):
+            return self.queue
+
+    manager = FakeManager()
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.get_queue_manager",
+        lambda: manager,
+    )
+
+    first = asyncio.create_task(session._get_session_commit_queue_snapshot())
+    second = asyncio.create_task(session._get_session_commit_queue_snapshot())
+    await asyncio.wait_for(snapshot_started.wait(), timeout=0.5)
+    release_snapshot.set()
+    first_result, second_result = await asyncio.gather(first, second)
+    cached_result = await session._get_session_commit_queue_snapshot()
+
+    assert snapshot_calls == 1
+    assert first_result == second_result == cached_result
+    assert first_result.task_ids == frozenset({"task-1"})
+    assert first_result.archive_uris == frozenset(
+        {"viking://session/s1/history/archive_001"}
+    )
 
 
 async def test_terminal_notification_does_not_hot_loop_on_stale_marker_read(
@@ -2194,6 +2502,8 @@ async def test_phase1_enqueues_before_root_rewrite_and_publishes_ready_last(
     observations: list[tuple[list[str], str]] = []
 
     class InspectingQueueManager:
+        mount_point = "/queue/test-worker"
+
         async def enqueue(self, _queue_name, data):
             root = await session._read_live_messages_strict()
             archive_uri = data["archive_uri"]
@@ -2208,11 +2518,17 @@ async def test_phase1_enqueues_before_root_rewrite_and_publishes_ready_last(
         "openviking.storage.queuefs.get_queue_manager",
         lambda: InspectingQueueManager(),
     )
+    monkeypatch.setattr(
+        "openviking.utils.agfs_utils.resolve_queuefs_mount_point",
+        lambda: "/queue/test-worker",
+    )
 
     result = await session.commit_async()
 
     assert observations == [(["archive me"], "preparing")]
-    assert (await session._read_phase1_meta(result["archive_uri"]))["status"] == "ready"
+    phase1 = await session._read_phase1_meta(result["archive_uri"])
+    assert phase1["status"] == "ready"
+    assert phase1["queue_mount_point"] == "/queue/test-worker"
     assert await session._read_live_messages_strict() == []
 
 
