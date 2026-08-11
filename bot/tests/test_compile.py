@@ -15,6 +15,7 @@ from vikingbot.compile.models import (
     CompileFailure,
     CompileLimits,
     CompileRequest,
+    CompileResult,
     CompileTask,
     SanitizedCompileRequest,
     WikiBundleDraft,
@@ -2504,6 +2505,295 @@ async def test_compile_queue_wait_has_a_deadline(tmp_path: Path):
     assert failed.error is not None
     assert failed.error.code == "DEADLINE_EXCEEDED"
     assert service._target_locks == {}
+
+
+@pytest.mark.asyncio
+async def test_timeout_salvage_copies_workspace_and_repairs_links(tmp_path: Path):
+    service = _compile_service(
+        tmp_path,
+        auth_mode="api_key",
+        backend=SandboxBackend.DIRECT,
+    )
+    workspace = tmp_path / "workspace"
+    page_root = workspace / "__compile_staging__" / "wiki_pages"
+    (page_root / "guide").mkdir(parents=True)
+    (workspace / "__compile_staging__" / "work").mkdir(parents=True)
+    (workspace / "__compile_staging__" / "tmp").mkdir(parents=True)
+    (workspace / "meta").mkdir()
+    (workspace / "skills" / "wiki").mkdir(parents=True)
+    (workspace / "empty").mkdir()
+    (page_root / "home.md").write_text("# Home\n", encoding="utf-8")
+    (page_root / "guide" / "topic.md").write_text(
+        "\n".join(
+            [
+                "[Home](home.md#top)",
+                "[Meta](meta/readme.md)",
+                "[Existing](../existing.md)",
+                "[Missing](missing.md)",
+                "![Missing image](missing.png)",
+                '[Titled](../meta/title.md "Title")',
+                "[Paren](../meta/foo(1).md)",
+                "[Web](https://example.com)",
+                "[Source](viking://resources/source)",
+                "[Anchor](#local)",
+                "`[Code](missing.md)`",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (workspace / "meta" / "readme.md").write_text("# Meta\n", encoding="utf-8")
+    (workspace / "meta" / "title.md").write_text("# Title\n", encoding="utf-8")
+    (workspace / "meta" / "foo(1).md").write_text("# Paren\n", encoding="utf-8")
+    (workspace / "meta" / "events.jsonl").write_bytes(b"")
+    (workspace / "artifact.bin").write_bytes(b"\x00\x01")
+    (workspace / "home.md").write_text("# Artifact Home\n", encoding="utf-8")
+    (workspace / "caseonly.md").write_text("case mismatch", encoding="utf-8")
+    (workspace / "Foo.md").write_text("first", encoding="utf-8")
+    (workspace / "foo.md").write_text("duplicate", encoding="utf-8")
+    (workspace / "bad#name.txt").write_text("unsafe URI", encoding="utf-8")
+    (workspace / "__compile_staging__" / "work" / "notes.txt").write_text("notes", encoding="utf-8")
+    (workspace / "__compile_staging__" / "tmp" / "check.txt").write_text("check", encoding="utf-8")
+    (workspace / "skills" / "wiki" / "SKILL.md").write_text("do not copy", encoding="utf-8")
+
+    class Client:
+        operations = []
+
+        async def tree(self, uri, *, node_limit):
+            assert uri == "viking://resources/wiki"
+            assert node_limit == service.limits.target_inventory_entries + 1
+            return [
+                {"uri": f"{uri}/existing.md", "isDir": False},
+                {"uri": f"{uri}/CaseOnly.md", "isDir": False},
+                {"uri": f"{uri}/meta/events.jsonl", "isDir": False},
+            ]
+
+        async def download_bytes(self, uri):
+            return {
+                "viking://resources/wiki/CaseOnly.md": b"old case",
+                "viking://resources/wiki/meta/events.jsonl": b"old",
+            }[uri]
+
+        async def batch_write(self, *, root_uri, operations, wait):
+            assert root_uri == "viking://resources/wiki"
+            assert wait is False
+            self.operations = operations
+            updated = [
+                operation["uri"]
+                for operation in operations
+                if operation["precondition"]["kind"] == "replace_if_hash"
+            ]
+            created = [
+                operation["uri"]
+                for operation in operations
+                if operation["precondition"]["kind"] == "create_if_absent"
+            ]
+            return {"created": created, "updated": updated, "unchanged": []}
+
+    client = Client()
+    result = await service._salvage_workspace(
+        client=client,
+        request=_sanitized_compile_request(),
+        workspace=workspace,
+    )
+
+    assert result is not None
+    payloads = {
+        operation["uri"].removeprefix("viking://resources/wiki/"): base64.b64decode(
+            operation["content_base64"]
+        )
+        for operation in client.operations
+    }
+    assert "skills/wiki/SKILL.md" not in payloads
+    assert "empty" not in payloads
+    assert "__compile_staging__/wiki_pages/home.md" not in payloads
+    assert payloads["home.md"] == b"# Artifact Home\n"
+    assert payloads["artifact.bin"] == b"\x00\x01"
+    assert payloads["CaseOnly.md"] == b"case mismatch"
+    assert payloads["meta/events.jsonl"] == b""
+    assert "__compile_staging__/work/notes.txt" not in payloads
+    assert "__compile_staging__/tmp/check.txt" not in payloads
+    assert sum(path.casefold() == "foo.md" for path in payloads) == 1
+    assert "bad#name.txt" not in payloads
+    topic = payloads["guide/topic.md"].decode()
+    assert "[Home](../home.md#top)" in topic
+    assert "[Meta](../meta/readme.md)" in topic
+    assert "[Existing](../existing.md)" in topic
+    assert "Missing\nMissing image" in topic
+    assert '[Titled](../meta/title.md "Title")' in topic
+    assert "[Paren](../meta/foo(1).md)" in topic
+    assert "[Web](https://example.com)" in topic
+    assert "[Source](viking://resources/source)" in topic
+    assert "[Anchor](#local)" in topic
+    assert "`[Code](missing.md)`" in topic
+    assert result.warnings and "partial output" in result.warnings[0]
+    assert any("Skipped" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_runtime_deadline_salvages_before_workspace_cleanup(monkeypatch, tmp_path: Path):
+    observed = []
+
+    class TaskConfig:
+        def __init__(self):
+            self.bot_data_path = tmp_path
+            self.workspace_path = tmp_path / "host-workspace"
+            self.skills = []
+            self.sandbox = SimpleNamespace(
+                mode=None, model_copy=lambda *, deep: SimpleNamespace(mode=None)
+            )
+
+        def model_copy(self, *, update):
+            copy = TaskConfig()
+            for key, value in update.items():
+                setattr(copy, key, value)
+            return copy
+
+    class FakeSandboxManager:
+        def __init__(self, config, workspace_parent, workspace_path):
+            del config, workspace_path
+            self.workspace = workspace_parent / "workspace"
+            self.workspace.mkdir(parents=True)
+
+        def get_workspace_path(self, session_key):
+            del session_key
+            return self.workspace
+
+        async def cleanup_session(self, session_key):
+            del session_key
+            observed.append("cleanup")
+
+    class FakeSkillsLoader:
+        def __init__(self, workspace, *, builtin_skills_dir):
+            del workspace, builtin_skills_dir
+
+        def load_skills_for_context(self, names):
+            assert names == ["wiki"]
+            return "Write Wiki pages."
+
+        def _get_skill_meta(self, name):
+            assert name == "wiki"
+            return {}
+
+    class FakeRequestLoop:
+        def __init__(self, **kwargs):
+            self.workspace = kwargs["workspace"]
+
+        async def run_structured_task(self, **kwargs):
+            del kwargs
+            (self.workspace / "output.md").write_text("partial", encoding="utf-8")
+            await asyncio.Event().wait()
+
+    class Client:
+        async def get_skill(self, skill_name, *, target_uri):
+            assert skill_name == "wiki"
+            assert target_uri == "viking://agent/skills"
+            return {
+                "root_uri": "viking://agent/skills/wiki",
+                "content": "---\nname: wiki\ndescription: Write Wiki\n---\nWrite it.",
+                "files": [],
+            }
+
+        async def close(self):
+            return None
+
+    async def create_client(**kwargs):
+        del kwargs
+        return Client()
+
+    async def no_op(*args, **kwargs):
+        del args, kwargs
+
+    async def build_sources(*args, **kwargs):
+        del args, kwargs
+        return []
+
+    async def build_catalog(*args, **kwargs):
+        del args, kwargs
+        return [], {}
+
+    async def salvage(*, client, request, workspace):
+        del client
+        assert request.to == "viking://resources/wiki"
+        assert (workspace / "output.md").read_text() == "partial"
+        observed.append("salvage")
+        return CompileResult(
+            **{
+                "from": request.from_,
+                "to": request.to,
+                "skill": request.skill,
+                "created": [f"{request.to}/output.md"],
+                "page_count": 1,
+                "warnings": ["partial output"],
+            }
+        )
+
+    monkeypatch.setattr("vikingbot.compile.service.SandboxManager", FakeSandboxManager)
+    monkeypatch.setattr("vikingbot.compile.service.SkillsLoader", FakeSkillsLoader)
+    monkeypatch.setattr("vikingbot.compile.service.AgentLoop", FakeRequestLoop)
+    monkeypatch.setattr("vikingbot.compile.service.VikingClient.create", create_client)
+
+    host_loop = SimpleNamespace(
+        config=TaskConfig(),
+        bus=None,
+        provider=None,
+        model=None,
+        temperature=0,
+        max_iterations=1,
+        memory_window=1,
+        brave_api_key=None,
+        exa_api_key=None,
+        gen_image_model=None,
+        exec_config=None,
+    )
+    service = BotCompileService(agent_loop=host_loop)
+    monkeypatch.setattr(service, "_materialize_skill", no_op)
+    monkeypatch.setattr(service, "_check_requirements", no_op)
+    monkeypatch.setattr(service, "_build_sources", build_sources)
+    monkeypatch.setattr(service, "_build_catalog", build_catalog)
+    monkeypatch.setattr(
+        service, "_build_compile_registry", lambda *args, **kwargs: (object(), set())
+    )
+    monkeypatch.setattr(service, "_salvage_workspace", salvage)
+
+    request = _sanitized_compile_request()
+    task = CompileTask(
+        task_id="cmp_deadline",
+        principal_scope="owner",
+        sanitized_request=request,
+        status="accepted",
+        stage="queued",
+        created_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    await service.store.create(task)
+    loop = asyncio.get_running_loop()
+    await asyncio.wait_for(
+        service._execute_task(
+            task.task_id,
+            request,
+            {"api_key": "secret"},
+            runtime_deadline=loop.time() + 0.01,
+        ),
+        timeout=0.01,
+    )
+
+    completed = await service.store.get(task.task_id)
+    assert completed is not None
+    assert completed.status == "completed"
+    assert completed.stage == "salvaged"
+    assert completed.result is not None
+    assert completed.result.created == ["viking://resources/wiki/output.md"]
+    assert observed == ["salvage", "cleanup"]
+    assert not (tmp_path / "compile_workspaces" / task.task_id).exists()
+
+    await service._fail(
+        task.task_id,
+        CompileFailure("INTERNAL", "late cleanup failure", stage="salvaging"),
+    )
+    still_completed = await service.store.get(task.task_id)
+    assert still_completed is not None
+    assert still_completed.status == "completed"
+    assert still_completed.result is not None
 
 
 @pytest.mark.asyncio

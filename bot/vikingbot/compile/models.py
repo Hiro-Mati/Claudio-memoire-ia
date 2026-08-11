@@ -41,7 +41,7 @@ class CompileLimits(BaseModel):
     accepted_tasks: int = 16
     accepted_tasks_per_principal: int = 4
     queue_wait_seconds: float = 5 * 60
-    task_runtime_seconds: float = 30 * 60
+    task_runtime_seconds: float = 360 * 60
     terminal_task_retention_seconds: float = 24 * 60 * 60
     terminal_task_records: int = 1000
 

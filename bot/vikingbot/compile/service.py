@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import posixpath
 import re
 import shlex
 import shutil
@@ -13,12 +15,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Mapping
+from urllib.parse import unquote
 
 from loguru import logger
 
-from openviking.core.namespace import classify_uri, uri_parts
+from openviking.core.namespace import classify_uri, relative_uri_path, uri_parts
 from openviking.core.skill_loader import SkillLoader
-from openviking.utils.path_safety import sanitize_relative_viking_path
+from openviking.session.memory.utils.link_renderer import LinkRenderer
+from openviking.utils.path_safety import (
+    safe_join_viking_uri,
+    sanitize_relative_viking_path,
+    validate_safe_viking_uri_path,
+)
 from openviking_cli.exceptions import OpenVikingError
 from vikingbot.agent.loop import AgentLoop
 from vikingbot.agent.skills import SkillsLoader
@@ -42,6 +50,7 @@ from vikingbot.compile.models import (
 )
 from vikingbot.compile.renderer import (
     WikiRenderer,
+    content_hash,
     has_unclosed_frontmatter,
     validate_declared_okf_markdown,
 )
@@ -71,10 +80,13 @@ _COMPILE_ISOLATED_EXEC_BACKENDS = frozenset(
 _SKILL_EXCLUDED_FILES = frozenset(
     {".abstract.md", ".overview.md", ".relations.json", ".source.json"}
 )
-_CATALOG_EXCLUDED_FILES = _SKILL_EXCLUDED_FILES 
+_CATALOG_EXCLUDED_FILES = _SKILL_EXCLUDED_FILES
 _CATALOG_FRONTMATTER_LINES = 128
 _TARGET_CATALOG_QUERY_CHARS = 40_000
 _REQUIREMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+_SALVAGE_LINK_RE = re.compile(
+    r"(?P<image>!?)\[(?P<label>[^\]\n]*)\]\((?P<target><[^>\n]+>|[^()\s\n]+)\)"
+)
 _WIKI_SEARCH_TAG = "ov.kind=wiki"
 _WORKSPACE_SUBMISSION_RULE_WITH_EXEC = (
     "Generate every artifact file in the task workspace with write_file or exec, then submit "
@@ -452,8 +464,16 @@ class BotCompileService:
                 return
 
             try:
+                runtime_deadline = (
+                    asyncio.get_running_loop().time() + self.limits.task_runtime_seconds
+                )
                 await asyncio.wait_for(
-                    self._execute_task(task_id, request, connection),
+                    self._execute_task(
+                        task_id,
+                        request,
+                        connection,
+                        runtime_deadline=runtime_deadline,
+                    ),
                     timeout=self.limits.task_runtime_seconds,
                 )
             except asyncio.TimeoutError:
@@ -485,8 +505,11 @@ class BotCompileService:
         task_id: str,
         request: SanitizedCompileRequest,
         connection: dict[str, Any],
+        *,
+        runtime_deadline: float | None = None,
     ) -> None:
         capabilities = self._compile_capabilities()
+        target_type = classify_uri(request.to).context_type
         session_key = SessionKey(type="compile", channel_id=task_id, chat_id=task_id)
         task_config = self.config.model_copy(
             update={
@@ -534,7 +557,6 @@ class BotCompileService:
 
             await self._set_state(task_id, status="running", stage="collecting_context")
             sources = await self._build_sources(client, request.from_)
-            target_type = classify_uri(request.to).context_type
             is_skill_target = target_type == "skill"
             if is_skill_target:
                 catalog: list[dict[str, Any]] = []
@@ -775,11 +797,256 @@ class BotCompileService:
                 task.error = None
 
             await self.store.update(task_id, complete)
+        except asyncio.CancelledError:
+            if (
+                runtime_deadline is None
+                or asyncio.get_running_loop().time() < runtime_deadline
+                or client is None
+                or target_type != "resource"
+            ):
+                raise
+            task = await self.store.get(task_id)
+            if (
+                task is None
+                or task.status in TERMINAL_STATUSES
+                or task.stage in {"writing", "refreshing"}
+            ):
+                raise
+            await self._set_state(task_id, status="committing", stage="salvaging")
+            try:
+                result = await self._salvage_workspace(
+                    client=client,
+                    request=request,
+                    workspace=workspace,
+                )
+            except Exception as exc:
+                raise CompileFailure(
+                    "DEADLINE_EXCEEDED",
+                    f"Compile reached its runtime deadline and fallback saving failed: {exc}",
+                    stage="salvaging",
+                ) from exc
+            if result is None:
+                raise CompileFailure(
+                    "DEADLINE_EXCEEDED",
+                    "Compile reached its runtime deadline before producing files to save.",
+                    stage="agent",
+                )
+
+            def complete_salvage(task: CompileTask) -> None:
+                task.status = "completed"
+                task.stage = "salvaged"
+                task.result = result
+                task.error = None
+
+            await self.store.update(task_id, complete_salvage)
         finally:
             await sandbox_manager.cleanup_session(session_key)
             if client is not None:
                 await client.close()
             shutil.rmtree(workspace_parent, ignore_errors=True)
+
+    async def _salvage_workspace(
+        self,
+        *,
+        client: VikingClient,
+        request: SanitizedCompileRequest,
+        workspace: Path,
+    ) -> CompileResult | None:
+        files: dict[str, bytes] = {}
+        total_bytes = 0
+        skipped_files = 0
+        page_files = 0
+        artifact_files = 0
+        output_keys: set[str] = set()
+        staging_prefix = f"{COMPILE_STAGING_ROOT}/"
+        wiki_prefix = f"{COMPILE_WIKI_PAGE_ROOT}/"
+        paths = sorted(
+            workspace.rglob("*"),
+            key=lambda path: (
+                path.relative_to(workspace).as_posix().startswith(staging_prefix),
+                path.as_posix(),
+            ),
+        )
+        for path in paths:
+            if path.is_symlink() or not path.is_file():
+                continue
+            relative = path.relative_to(workspace).as_posix()
+            if relative.split("/", 1)[0].casefold() == "skills":
+                continue
+            is_page = relative.startswith(wiki_prefix)
+            if relative.startswith(staging_prefix) and not is_page:
+                continue
+            output_path = relative.removeprefix(wiki_prefix)
+            try:
+                output_path = sanitize_relative_viking_path(output_path)
+                validate_safe_viking_uri_path(safe_join_viking_uri(request.to, output_path))
+                payload = path.read_bytes()
+            except (OSError, ValueError):
+                skipped_files += 1
+                continue
+            output_key = output_path.casefold()
+            if (
+                output_key in output_keys
+                or (is_page and page_files >= self.limits.output_pages)
+                or (not is_page and artifact_files >= self.limits.output_files)
+                or total_bytes + len(payload) > self.limits.output_total_bytes
+            ):
+                skipped_files += 1
+                continue
+            files[output_path] = payload
+            output_keys.add(output_key)
+            total_bytes += len(payload)
+            page_files += is_page
+            artifact_files += not is_page
+
+        if not files:
+            return None
+
+        entries = await client.tree(
+            request.to,
+            node_limit=self.limits.target_inventory_entries + 1,
+        )
+        existing: dict[str, str] = {}
+        existing_by_case: dict[str, list[str]] = {}
+        for entry in entries:
+            if not isinstance(entry, Mapping) or entry.get("isDir", entry.get("is_dir", False)):
+                continue
+            uri = str(entry.get("uri") or "").rstrip("/")
+            relative = relative_uri_path(request.to, uri)
+            if relative:
+                existing[relative] = uri
+                existing_by_case.setdefault(relative.casefold(), []).append(uri)
+
+        known_paths = {*files, *existing}
+        for path, payload in list(files.items()):
+            if not path.casefold().endswith(".md"):
+                continue
+            try:
+                content = payload.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            files[path] = self._repair_salvaged_markdown(
+                content, source_path=path, known_paths=known_paths
+            ).encode("utf-8")
+
+        operations = []
+        for path, payload in files.items():
+            existing_uri = existing.get(path)
+            if existing_uri is None:
+                matches = existing_by_case.get(path.casefold(), [])
+                existing_uri = matches[0] if len(matches) == 1 else None
+            if existing_uri is None:
+                uri = safe_join_viking_uri(request.to, path).rstrip("/")
+                precondition = {"kind": "create_if_absent"}
+            else:
+                uri = existing_uri
+                current = await client.download_bytes(uri)
+                precondition = {
+                    "kind": "replace_if_hash",
+                    "base_hash": content_hash(current),
+                }
+            operations.append(
+                {
+                    "uri": uri,
+                    "content_base64": base64.b64encode(payload).decode("ascii"),
+                    "precondition": precondition,
+                }
+            )
+
+        batch_result = await client.batch_write(
+            root_uri=request.to,
+            operations=operations,
+            wait=False,
+        )
+        warnings = [
+            "Compile reached its runtime deadline; workspace files were saved before cleanup. "
+            "This partial output did not pass the normal bundle validation."
+        ]
+        if skipped_files:
+            warnings.append(
+                f"Skipped {skipped_files} unsafe, duplicate, unreadable, or over-limit file(s)."
+            )
+        return CompileResult(
+            from_=request.from_,
+            to=request.to,
+            skill=request.skill,
+            created=list(batch_result.get("created", [])),
+            updated=list(batch_result.get("updated", [])),
+            unchanged=list(batch_result.get("unchanged", [])),
+            page_count=sum(path.casefold().endswith(".md") for path in files),
+            warnings=warnings,
+        )
+
+    @staticmethod
+    def _repair_salvaged_markdown(
+        content: str,
+        *,
+        source_path: str,
+        known_paths: set[str],
+    ) -> str:
+        known = {path for path in known_paths if path}
+        paths_by_name: dict[str, set[str]] = {}
+        for path in known:
+            paths_by_name.setdefault(posixpath.basename(path).casefold(), set()).add(path)
+
+        link_spans = {
+            (match.start() + bool(match.group("image")), match.end())
+            for match in _SALVAGE_LINK_RE.finditer(content)
+        }
+        protected = [
+            span
+            for span in LinkRenderer.protected_markdown_spans(content)
+            if span not in link_spans
+        ]
+        source_dir = posixpath.dirname(source_path)
+
+        def replace(match: re.Match[str]) -> str:
+            if any(not (match.end() <= start or match.start() >= end) for start, end in protected):
+                return match.group(0)
+
+            target = match.group("target").strip()
+            if (
+                not target
+                or target.startswith(("#", "?", "/"))
+                or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", target)
+            ):
+                return match.group(0)
+            if target.startswith("<") and target.endswith(">"):
+                target = target[1:-1]
+
+            suffix_at = min(
+                (index for token in "#?" if (index := target.find(token)) >= 0),
+                default=len(target),
+            )
+            raw_path, suffix = target[:suffix_at], target[suffix_at:]
+            decoded_path = unquote(raw_path)
+            resolved = posixpath.normpath(posixpath.join(source_dir, decoded_path))
+            if resolved in known:
+                return match.group(0)
+
+            name = posixpath.basename(decoded_path)
+            names = {name.casefold()}
+            if not posixpath.splitext(name)[1]:
+                names.add(f"{name}.md".casefold())
+            candidates = {
+                path
+                for name in names
+                for path in paths_by_name.get(name, set())
+                if path.casefold() != source_path.casefold()
+            }
+            if len(candidates) != 1:
+                return match.group("label")
+            candidate = next(iter(candidates))
+
+            corrected = posixpath.relpath(candidate, source_dir or ".")
+            if corrected == ".":
+                return match.group("label")
+            if "/" not in corrected and not corrected.startswith("."):
+                corrected = f"./{corrected}"
+            corrected = corrected.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+            return f"{match.group('image')}[{match.group('label')}]({corrected}{suffix})"
+
+        return _SALVAGE_LINK_RE.sub(replace, content)
 
     @staticmethod
     async def _tag_wiki_files(
@@ -1389,6 +1656,8 @@ Selected Skill:
 
     async def _fail(self, task_id: str, failure: CompileFailure) -> None:
         def mutate(task: CompileTask) -> None:
+            if task.status in TERMINAL_STATUSES:
+                return
             task.status = "failed"
             task.stage = failure.stage
             task.result = None
