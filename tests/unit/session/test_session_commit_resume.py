@@ -44,7 +44,8 @@ class _MemoryVikingFS:
             raise FileNotFoundError(uri)
         return self.files[uri]
 
-    async def write_file(self, uri, content, ctx=None):
+    async def write_file(self, uri, content, ctx=None, lease_ref=None):
+        del lease_ref
         self.files[uri] = content
 
 

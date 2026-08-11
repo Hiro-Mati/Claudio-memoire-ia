@@ -74,7 +74,9 @@ logger = get_logger(__name__)
 _ARCHIVE_WAIT_POLL_SECONDS = 0.2
 _ARCHIVE_WAIT_MAX_POLL_SECONDS = 2.0
 _ARCHIVE_WAIT_JITTER_RATIO = 0.1
+# Reaching this age triggers a liveness check; it is not a hard task timeout.
 _ARCHIVE_WAIT_TIMEOUT_SECONDS = 1800.0
+_ARCHIVE_QUEUE_SNAPSHOT_CACHE_SECONDS = 1.0
 _ARCHIVE_RECOVERY_SCAN_CACHE_SECONDS = 1.0
 _ARCHIVE_RECOVERY_SCAN_ITEM_DELAY_SECONDS = 0.1
 _ARCHIVE_RECOVERY_UNPACED_ITEMS = 4
@@ -452,6 +454,24 @@ class _Phase2PredecessorPlan:
     used_recovery_scan: bool = False
 
 
+@dataclass(frozen=True)
+class _SessionCommitQueueSnapshot:
+    """One durable view of unacknowledged SessionCommit work."""
+
+    task_ids: frozenset[str]
+    archive_uris: frozenset[str]
+    mount_point: str
+
+
+@dataclass(frozen=True)
+class _ArchiveQueueLiveness:
+    """Best-effort liveness verdict for one pending archive's Phase-2 task."""
+
+    state: Literal["active", "missing", "unknown"]
+    task_id: str = ""
+    reason: str = ""
+
+
 # SessionCommit workers create a fresh ``Session`` object per queue item. Keep
 # process-local coordination at module scope so concurrent items for the same
 # session can share terminal notifications and exceptional recovery scans.
@@ -464,6 +484,8 @@ _ARCHIVE_RECOVERY_SCAN_CACHE: Dict[
     tuple[int, str], tuple[float, int, tuple[ArchiveState, ...]]
 ] = {}
 _ARCHIVE_RECOVERY_SCAN_SEMAPHORES: Dict[int, asyncio.Semaphore] = {}
+_ARCHIVE_QUEUE_SNAPSHOT_TASKS: Dict[tuple[int, str], asyncio.Task[_SessionCommitQueueSnapshot]] = {}
+_ARCHIVE_QUEUE_SNAPSHOT_CACHE: Dict[tuple[int, str], tuple[float, _SessionCommitQueueSnapshot]] = {}
 
 
 @dataclass
@@ -1629,6 +1651,7 @@ class Session:
         keep_recent_turn_count: int,
         retained_message_token_budget: int,
         min_raw_tail_steps: int,
+        queue_mount_point: str = "",
         agent_evolution_enabled: bool = True,
         agent_memory_skip_reason: Optional[str] = None,
         lease_ref: Optional[Any] = None,
@@ -1648,6 +1671,8 @@ class Session:
             "retained_message_token_budget": retained_message_token_budget,
             "min_raw_tail_steps": min_raw_tail_steps,
         }
+        if queue_mount_point:
+            payload["queue_mount_point"] = queue_mount_point
         await self._merge_archive_meta(
             archive_uri,
             {
@@ -1850,6 +1875,7 @@ class Session:
         from openviking.service.task_tracker import get_task_tracker
         from openviking.storage.queuefs import QueueManager, get_queue_manager
         from openviking.storage.queuefs.session_commit_msg import SessionCommitMsg
+        from openviking.utils.agfs_utils import resolve_queuefs_mount_point
 
         trace_id = tracer.get_trace_id()
         keep_recent_count = max(0, int(keep_recent_count or 0))
@@ -2083,6 +2109,7 @@ class Session:
                     keep_recent_turn_count=effective_keep_turns if turn_mode else 0,
                     retained_message_token_budget=effective_token_budget if turn_mode else 0,
                     min_raw_tail_steps=effective_min_tail,
+                    queue_mount_point=resolve_queuefs_mount_point(),
                     agent_evolution_enabled=agent_evolution_enabled,
                     agent_memory_skip_reason=agent_memory_skip_reason,
                     lease_ref=lease,
@@ -4209,7 +4236,7 @@ class Session:
         timeout: float,
         blocked_archive_index: int,
     ) -> Optional[ArchiveState]:
-        """Wait on one blocker, then fail a presumed orphan after the deadline."""
+        """Wait on one blocker and only fail it after confirmed QueueFS loss."""
         event_key, event = self._get_archive_terminal_event(archive["archive_uri"])
         delay = max(0.0, _ARCHIVE_WAIT_POLL_SECONDS)
         try:
@@ -4223,34 +4250,66 @@ class Session:
 
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    # Re-read immediately before publishing the terminal marker;
-                    # a predecessor may have completed at the timeout boundary.
+                    # Time alone does not prove that a long-running Phase 2 is
+                    # orphaned. Re-read its marker, then consult local task work
+                    # and the durable QueueFS message before replaying raw data.
                     state = await self._read_archive_state(archive, verify_directory=True)
                     if state is None or state.state != "pending":
                         return state
-                    logger.error(
-                        "Archive %s stayed pending for over %.0fs while blocking "
-                        "archive_%03d Phase 2; its queue item is presumed lost. "
-                        "Marking it failed so its raw messages can be replayed.",
+                    liveness = await self._check_archive_queue_liveness(archive["archive_uri"])
+                    if liveness.state == "missing":
+                        # The liveness check performs I/O. Close the race with a
+                        # predecessor that became terminal while it was in flight.
+                        state = await self._read_archive_state(archive, verify_directory=True)
+                        if state is None or state.state != "pending":
+                            return state
+                        logger.error(
+                            "Archive %s stayed pending for over %.0fs while blocking "
+                            "archive_%03d Phase 2, and its QueueFS task %s is no "
+                            "longer recoverable (%s). Marking it failed so its raw "
+                            "messages can be replayed.",
+                            archive["archive_id"],
+                            timeout,
+                            blocked_archive_index,
+                            liveness.task_id or "<unknown>",
+                            liveness.reason or "missing queue work",
+                        )
+                        await self._write_failed_marker(
+                            archive["archive_uri"],
+                            stage="phase2_orphan_recovery",
+                            error=(
+                                f"Archive stayed pending for over {timeout:.0f}s and "
+                                "its Phase 2 QueueFS work is no longer recoverable: "
+                                f"{liveness.reason or 'missing queue work'}"
+                            ),
+                            blocked_by=f"archive_{blocked_archive_index:03d}",
+                        )
+                        raise TimeoutError(
+                            f"Timed out after {timeout:.0f}s waiting for "
+                            f"{archive['archive_id']} to finish before "
+                            f"archive_{blocked_archive_index:03d} Phase 2; QueueFS "
+                            "confirmed it was orphaned, so it was marked failed "
+                            "for raw replay by a later commit"
+                        )
+
+                    logger.warning(
+                        "Archive %s is still pending after %.0fs while blocking "
+                        "archive_%03d Phase 2; continuing low-frequency wait because "
+                        "its QueueFS task is %s (%s).",
                         archive["archive_id"],
                         timeout,
                         blocked_archive_index,
+                        liveness.state,
+                        liveness.reason or "no conclusive liveness signal",
                     )
-                    await self._write_failed_marker(
-                        archive["archive_uri"],
-                        stage="phase2_wait_timeout",
-                        error=(
-                            f"Archive stayed pending for over {timeout:.0f}s; "
-                            "its Phase 2 queue item is presumed lost"
-                        ),
-                        blocked_by=f"archive_{blocked_archive_index:03d}",
+                    # Marker polling remains exponentially backed off. Do not
+                    # repeat the extra liveness lookup until another full window.
+                    deadline = time.monotonic() + max(
+                        timeout,
+                        _ARCHIVE_WAIT_MAX_POLL_SECONDS,
+                        0.001,
                     )
-                    raise TimeoutError(
-                        f"Timed out after {timeout:.0f}s waiting for "
-                        f"{archive['archive_id']} to finish before "
-                        f"archive_{blocked_archive_index:03d} Phase 2; it was "
-                        "marked failed for raw replay by a later commit"
-                    )
+                    remaining = deadline - time.monotonic()
 
                 jitter = 1.0 + random.uniform(
                     -_ARCHIVE_WAIT_JITTER_RATIO,
@@ -4272,6 +4331,222 @@ class Session:
                 )
         finally:
             self._release_archive_terminal_event(event_key, event)
+
+    async def _get_session_commit_queue_snapshot(
+        self,
+    ) -> _SessionCommitQueueSnapshot:
+        """Read unacknowledged SessionCommit work with cache and singleflight.
+
+        This path only runs after a predecessor has already waited for the full
+        liveness window, so a one-second cached view necessarily postdates the
+        archive's Phase 1 publication and is safe to share across waiters.
+        """
+        from openviking.storage.queuefs import QueueManager, get_queue_manager
+
+        manager = get_queue_manager()
+        mount_point = str(getattr(manager, "mount_point", "") or "").rstrip("/")
+        loop = asyncio.get_running_loop()
+        key = (id(loop), mount_point)
+        now = time.monotonic()
+        with _ARCHIVE_COORDINATION_GUARD:
+            cached = _ARCHIVE_QUEUE_SNAPSHOT_CACHE.get(key)
+            if cached is not None and cached[0] > now:
+                return cached[1]
+
+            task = _ARCHIVE_QUEUE_SNAPSHOT_TASKS.get(key)
+            if task is None:
+                queue = manager.get_queue(QueueManager.SESSION_COMMIT)
+
+                async def read_snapshot() -> _SessionCommitQueueSnapshot:
+                    task_ids: set[str] = set()
+                    archive_uris: set[str] = set()
+                    for message in await queue.snapshot():
+                        payload: Any = message
+                        if isinstance(message, dict) and "data" in message:
+                            payload = message.get("data")
+                        if isinstance(payload, str):
+                            try:
+                                payload = json.loads(payload)
+                            except (TypeError, ValueError):
+                                continue
+                        if not isinstance(payload, dict):
+                            continue
+                        task_id = payload.get("task_id")
+                        archive_uri = payload.get("archive_uri")
+                        if isinstance(task_id, str) and task_id:
+                            task_ids.add(task_id)
+                        if isinstance(archive_uri, str) and archive_uri:
+                            archive_uris.add(archive_uri.rstrip("/"))
+
+                    snapshot = _SessionCommitQueueSnapshot(
+                        task_ids=frozenset(task_ids),
+                        archive_uris=frozenset(archive_uris),
+                        mount_point=mount_point,
+                    )
+                    with _ARCHIVE_COORDINATION_GUARD:
+                        _ARCHIVE_QUEUE_SNAPSHOT_CACHE[key] = (
+                            time.monotonic() + _ARCHIVE_QUEUE_SNAPSHOT_CACHE_SECONDS,
+                            snapshot,
+                        )
+                    return snapshot
+
+                task = loop.create_task(read_snapshot())
+                _ARCHIVE_QUEUE_SNAPSHOT_TASKS[key] = task
+
+                def clear_finished_snapshot(finished: asyncio.Task) -> None:
+                    with _ARCHIVE_COORDINATION_GUARD:
+                        if _ARCHIVE_QUEUE_SNAPSHOT_TASKS.get(key) is finished:
+                            _ARCHIVE_QUEUE_SNAPSHOT_TASKS.pop(key, None)
+
+                task.add_done_callback(clear_finished_snapshot)
+
+        return await asyncio.shield(task)
+
+    async def _check_archive_queue_liveness(
+        self,
+        archive_uri: str,
+    ) -> _ArchiveQueueLiveness:
+        """Check local work first, then use QueueFS only when it is inconclusive."""
+        try:
+            phase1 = await self._read_phase1_meta(archive_uri)
+        except Exception as exc:
+            logger.warning(
+                "Could not read Phase 1 task metadata for archive %s: %s",
+                archive_uri,
+                exc,
+            )
+            return _ArchiveQueueLiveness(
+                state="unknown",
+                reason="archive Phase 1 task metadata is unavailable",
+            )
+
+        queue_message = phase1.get("queue_message") if isinstance(phase1, dict) else None
+        task_id = queue_message.get("task_id") if isinstance(queue_message, dict) else None
+        task_id = task_id if isinstance(task_id, str) else ""
+        expected_mount = str(phase1.get("queue_mount_point") or "").rstrip("/")
+        normalized_archive_uri = archive_uri.rstrip("/")
+
+        manager = None
+        current_mount = ""
+        try:
+            from openviking.storage.queuefs import get_queue_manager
+
+            manager = get_queue_manager()
+            current_mount = str(getattr(manager, "mount_point", "") or "").rstrip("/")
+            has_task_work = getattr(manager, "has_task_work", None)
+            if task_id and callable(has_task_work) and has_task_work(task_id):
+                return _ArchiveQueueLiveness(
+                    state="active",
+                    task_id=task_id,
+                    reason="process-local task work is still active",
+                )
+        except Exception as exc:
+            logger.warning(
+                "Could not inspect local QueueFS task work for archive %s: %s",
+                archive_uri,
+                exc,
+            )
+
+        snapshot_available = False
+        snapshot_authoritative = False
+        durable_absent = False
+        # A stored worker mount is only queryable by the same worker. Shared
+        # queues and legacy archives without this field can use the current view.
+        can_query_current_queue = not expected_mount or expected_mount == current_mount
+        if manager is not None and can_query_current_queue:
+            try:
+                snapshot = await self._get_session_commit_queue_snapshot()
+                snapshot_available = True
+                snapshot_authoritative = (
+                    expected_mount == snapshot.mount_point
+                    if expected_mount
+                    else snapshot.mount_point == "/queue"
+                )
+
+                def snapshot_contains_work(
+                    candidate: _SessionCommitQueueSnapshot,
+                ) -> bool:
+                    return bool(
+                        (task_id and task_id in candidate.task_ids)
+                        or normalized_archive_uri in candidate.archive_uris
+                    )
+
+                if snapshot_contains_work(snapshot):
+                    return _ArchiveQueueLiveness(
+                        state="active",
+                        task_id=task_id,
+                        reason="durable QueueFS work is still unacknowledged",
+                    )
+
+                durable_absent = snapshot_authoritative
+            except Exception as exc:
+                logger.warning(
+                    "Could not inspect durable SessionCommit QueueFS work for archive %s: %s",
+                    archive_uri,
+                    exc,
+                )
+
+        task = None
+        tracker_available = False
+        if task_id:
+            try:
+                from openviking.service.task_tracker import get_task_tracker
+
+                task = await get_task_tracker().get(
+                    task_id,
+                    account_id=self.ctx.account_id,
+                    user_id=self.ctx.user.user_id,
+                )
+                tracker_available = True
+            except Exception as exc:
+                logger.warning(
+                    "Could not inspect task tracker state for archive %s task %s: %s",
+                    archive_uri,
+                    task_id,
+                    exc,
+                )
+
+        task_status = getattr(getattr(task, "status", None), "value", "")
+        if task_status == "completed":
+            # Phase 2 writes .done before completing its task. Missing .done is
+            # an integrity/visibility ambiguity, not permission to replay raw.
+            return _ArchiveQueueLiveness(
+                state="unknown",
+                task_id=task_id,
+                reason="task completed but its .done marker is not visible",
+            )
+        if task_status in {"failed", "cancelled"}:
+            return _ArchiveQueueLiveness(
+                state="missing",
+                task_id=task_id,
+                reason=f"task tracker is already terminal ({task_status})",
+            )
+        if task_status in {"pending", "running", "cancelling"} and not durable_absent:
+            return _ArchiveQueueLiveness(
+                state="active",
+                task_id=task_id,
+                reason=(
+                    f"task tracker is still {task_status}; the current QueueFS "
+                    "view cannot authoritatively disprove remote work"
+                ),
+            )
+        if durable_absent:
+            return _ArchiveQueueLiveness(
+                state="missing",
+                task_id=task_id,
+                reason="task is absent from its authoritative durable QueueFS",
+            )
+        if snapshot_available and tracker_available and task is None:
+            return _ArchiveQueueLiveness(
+                state="missing",
+                task_id=task_id,
+                reason="task is absent from both QueueFS and the task tracker",
+            )
+        return _ArchiveQueueLiveness(
+            state="unknown",
+            task_id=task_id,
+            reason="QueueFS/task-tracker state could not be confirmed",
+        )
 
     async def _resolve_phase2_predecessors_from_scan(
         self,
@@ -4390,7 +4665,11 @@ class Session:
         archive_index: int,
         timeout: float = _ARCHIVE_WAIT_TIMEOUT_SECONDS,
     ) -> bool:
-        """Compatibility wrapper around bounded predecessor resolution."""
+        """Compatibility wrapper around predecessor resolution.
+
+        ``timeout`` controls when to check QueueFS liveness; valid work may run
+        longer and continues with low-frequency marker polling.
+        """
         await self._resolve_phase2_predecessors(archive_index, timeout=timeout)
         return True
 
