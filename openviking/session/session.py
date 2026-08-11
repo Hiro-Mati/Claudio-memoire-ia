@@ -8,7 +8,10 @@ Session as Context: Sessions integrated into L0/L1/L2 system.
 import asyncio
 import inspect
 import json
+import random
 import re
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional
@@ -67,7 +70,13 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-_ARCHIVE_WAIT_POLL_SECONDS = 0.1
+_ARCHIVE_WAIT_POLL_SECONDS = 0.2
+_ARCHIVE_WAIT_MAX_POLL_SECONDS = 2.0
+_ARCHIVE_WAIT_JITTER_RATIO = 0.1
+_ARCHIVE_WAIT_TIMEOUT_SECONDS = 1800.0
+_ARCHIVE_RECOVERY_SCAN_CACHE_SECONDS = 1.0
+_ARCHIVE_RECOVERY_SCAN_ITEM_DELAY_SECONDS = 0.1
+_ARCHIVE_RECOVERY_UNPACED_ITEMS = 4
 _PHASE2_QUEUE_WAIT_TIMEOUT_SECONDS = 1800.0
 _MEMORY_EXTRACTION_MAX_RETRIES = 3
 _MEMORY_EXTRACTION_RETRY_BASE_DELAY_SECONDS = 1.0
@@ -76,6 +85,7 @@ _AGENT_TRAINING_REQUIRED_MEMORY_TYPES = frozenset({"cases", "trajectories"})
 _SESSION_PHASE1_LOCK_TIMEOUT_SECONDS = 30.0
 _MEMORY_STEP_NAMES = ("long_term", "execution")
 _CUMULATIVE_CHECKPOINT_VERSION = 2
+_ARCHIVE_PREDECESSOR_BARRIER_VERSION = 1
 
 
 class _ArchiveMessagesCorruptError(ValueError):
@@ -411,6 +421,29 @@ class ArchiveState:
             if match:
                 return int(match.group(1))
         return self.index
+
+
+@dataclass(frozen=True)
+class _Phase2PredecessorPlan:
+    """Bounded predecessor state needed to prepare one Phase-2 archive."""
+
+    replay_states: tuple[ArchiveState, ...] = ()
+    latest_completed: Optional[ArchiveState] = None
+    used_recovery_scan: bool = False
+
+
+# SessionCommit workers create a fresh ``Session`` object per queue item. Keep
+# process-local coordination at module scope so concurrent items for the same
+# session can share terminal notifications and exceptional recovery scans.
+_ARCHIVE_COORDINATION_GUARD = threading.Lock()
+_ARCHIVE_TERMINAL_EVENTS: Dict[
+    tuple[int, str], tuple[asyncio.AbstractEventLoop, asyncio.Event]
+] = {}
+_ARCHIVE_RECOVERY_SCAN_TASKS: Dict[tuple[int, str], asyncio.Task] = {}
+_ARCHIVE_RECOVERY_SCAN_CACHE: Dict[
+    tuple[int, str], tuple[float, int, tuple[ArchiveState, ...]]
+] = {}
+_ARCHIVE_RECOVERY_SCAN_SEMAPHORES: Dict[int, asyncio.Semaphore] = {}
 
 
 @dataclass
@@ -2224,14 +2257,18 @@ class Session:
         archive_index = self._archive_index_from_uri(archive_uri)
 
         try:
-            await self._wait_for_previous_archive_done(archive_index)
+            predecessor_plan = await self._resolve_phase2_predecessors(archive_index)
             (
                 messages,
                 coverage_start_archive,
                 coverage_end_archive,
                 covered_failed_archives,
                 completed_memory_steps,
-            ) = await self._prepare_phase2_archive_messages(archive_uri, messages)
+            ) = await self._prepare_phase2_archive_messages(
+                archive_uri,
+                messages,
+                predecessor_plan=predecessor_plan,
+            )
             if not messages:
                 raise ValueError("session commit archive has no recoverable messages")
             first_message_id = messages[0].id
@@ -2254,6 +2291,7 @@ class Session:
                             archive_uri,
                             covered_failed_archives,
                             messages,
+                            previous_completed=predecessor_plan.latest_completed,
                         )
                         if working_memory_enabled
                         else []
@@ -2262,6 +2300,7 @@ class Session:
                         await self._get_latest_completed_archive_overview(
                             exclude_archive_uri=archive_uri,
                             before_archive_index=archive_index,
+                            preferred_completed=predecessor_plan.latest_completed,
                         )
                         if working_memory_enabled
                         else ""
@@ -2717,6 +2756,7 @@ class Session:
                 "starting_message_id": first_message_id,
                 "ending_message_id": last_message_id,
                 "working_memory_enabled": working_memory_enabled,
+                "predecessor_barrier_version": _ARCHIVE_PREDECESSOR_BARRIER_VERSION,
                 "coverage_start_archive": coverage_start_archive or archive_id,
                 "coverage_end_archive": coverage_end_archive or archive_id,
                 "covered_failed_archives": list(covered_failed_archives or []),
@@ -2729,6 +2769,7 @@ class Session:
             content=content,
             ctx=self.ctx,
         )
+        self._notify_archive_terminal(archive_uri)
 
     async def _write_failed_marker(
         self,
@@ -2758,6 +2799,7 @@ class Session:
             ctx=self.ctx,
             lease_ref=lease_ref,
         )
+        self._notify_archive_terminal(archive_uri)
 
     async def get_session_context(self, token_budget: int = 128_000) -> Dict[str, Any]:
         """Get assembled session context with the latest summary archive and merged messages."""
@@ -2888,9 +2930,9 @@ class Session:
         ``failed`` archive no longer replays its raw messages. Cumulative v2
         checkpoints are restored from the terminal archive alone; only a
         terminal legacy v1 delta checkpoint invokes an older-history compatibility
-        scan. Phase 2 coverage bookkeeping is unaffected because it keeps using
-        the full ``_scan_archive_states()`` scan. Public
-        ``pre_archive_abstracts`` stay empty; abstracts are not read.
+        scan. Phase 2 resolves current-format predecessor coverage incrementally;
+        only legacy or malformed marker recovery uses a protected full scan.
+        Public ``pre_archive_abstracts`` stay empty; abstracts are not read.
         """
         archive_refs = await self._list_archive_refs()
         newer_pending: List[Dict[str, Any]] = []
@@ -3002,100 +3044,143 @@ class Session:
 
         return sorted(refs, key=lambda item: item["index"], reverse=True)
 
-    async def _scan_archive_states(self) -> List[ArchiveState]:
-        """Derive every archive state exclusively from its directory markers."""
-        states: List[ArchiveState] = []
-        refs = sorted(await self._list_archive_refs(), key=lambda item: item["index"])
-        for archive in refs:
-            done_uri = f"{archive['archive_uri']}/.done"
-            try:
-                done_exists = await self._viking_fs.exists(done_uri, ctx=self.ctx)
-            except Exception:
-                done_exists = False
-            done: Dict[str, Any] = {}
-            if done_exists:
+    @staticmethod
+    def _archive_ref(session_uri: str, index: int) -> Dict[str, Any]:
+        archive_id = f"archive_{index:03d}"
+        return {
+            "archive_id": archive_id,
+            "archive_uri": f"{session_uri}/history/{archive_id}",
+            "index": index,
+        }
+
+    async def _read_archive_state(
+        self,
+        archive: Dict[str, Any],
+        *,
+        verify_directory: bool = False,
+    ) -> Optional[ArchiveState]:
+        """Read one archive state without listing or touching sibling archives."""
+        done_uri = f"{archive['archive_uri']}/.done"
+        done: Dict[str, Any] = {}
+        done_exists = False
+        try:
+            raw_done = await self._viking_fs.read_file(done_uri, ctx=self.ctx)
+            done_exists = True
+            parsed_done = json.loads(raw_done or "{}")
+            if isinstance(parsed_done, dict):
+                done = parsed_done
+        except Exception as exc:
+            if not _is_storage_not_found(exc):
+                # Preserve the established rule that an existing but unreadable
+                # marker is terminal, while keeping the healthy path to one
+                # read instead of an exists+read pair.
                 try:
-                    raw_done = await self._viking_fs.read_file(done_uri, ctx=self.ctx)
-                    parsed_done = json.loads(raw_done or "{}")
-                    if isinstance(parsed_done, dict):
-                        done = parsed_done
-                except Exception as exc:
-                    # Marker existence still means completion, but unreadable
-                    # contents cannot extend coverage to earlier archives.
-                    logger.warning(
-                        "Unreadable archive done marker %s: %s", archive["archive_uri"], exc
-                    )
-
+                    done_exists = await self._viking_fs.exists(done_uri, ctx=self.ctx)
+                except Exception:
+                    done_exists = False
             if done_exists:
-                # Only validate overview when Working Memory required one.
-                # Otherwise leave overview empty here and let context assembly
-                # lazy-load the newest terminal completed archive's overview.
-                overview = ""
-                if done.get("working_memory_enabled") is True:
-                    overview = await self._read_archive_overview(archive["archive_uri"])
-                    if not overview.strip():
-                        # New markers distinguish an intentionally overview-less
-                        # working_memory=false commit from a missing/corrupt
-                        # required overview. The latter remains logically live and
-                        # can be rolled forward by a later successful archive.
-                        logger.warning(
-                            "Completed archive has no readable required overview: %s",
-                            archive["archive_uri"],
-                        )
-                        states.append(
-                            ArchiveState(
-                                archive_id=archive["archive_id"],
-                                archive_uri=archive["archive_uri"],
-                                index=archive["index"],
-                                state="failed",
-                                done=done,
-                                failed={
-                                    "stage": "archive_overview",
-                                    "error": "required overview is missing or unreadable",
-                                },
-                            )
-                        )
-                        continue
+                logger.warning("Unreadable archive done marker %s: %s", archive["archive_uri"], exc)
 
-                # working_memory=false legitimately writes .done without an
-                # overview. Legacy markers lack the explicit flag, so retain
-                # their established completed semantics for compatibility.
-                states.append(
-                    ArchiveState(
+        if done_exists:
+            # Only validate overview when Working Memory required one.
+            overview = ""
+            if done.get("working_memory_enabled") is True:
+                overview = await self._read_archive_overview(archive["archive_uri"])
+                if not overview.strip():
+                    # A required but unreadable overview keeps the raw archive
+                    # recoverable even though the physical .done marker exists.
+                    logger.warning(
+                        "Completed archive has no readable required overview: %s",
+                        archive["archive_uri"],
+                    )
+                    return ArchiveState(
                         archive_id=archive["archive_id"],
                         archive_uri=archive["archive_uri"],
                         index=archive["index"],
-                        state="completed",
-                        overview=overview,
+                        state="failed",
                         done=done,
+                        failed={
+                            "stage": "archive_overview",
+                            "error": "required overview is missing or unreadable",
+                        },
                     )
-                )
-                continue
 
-            failed: Dict[str, Any] = {}
-            failed_uri = f"{archive['archive_uri']}/.failed.json"
-            try:
-                failed_exists = await self._viking_fs.exists(failed_uri, ctx=self.ctx)
-            except Exception:
-                failed_exists = False
-            if failed_exists:
-                try:
-                    parsed_failed = json.loads(
-                        await self._viking_fs.read_file(failed_uri, ctx=self.ctx) or "{}"
-                    )
-                    if isinstance(parsed_failed, dict):
-                        failed = parsed_failed
-                except Exception as exc:
-                    logger.warning("Unreadable archive failed marker %s: %s", failed_uri, exc)
-            states.append(
-                ArchiveState(
-                    archive_id=archive["archive_id"],
-                    archive_uri=archive["archive_uri"],
-                    index=archive["index"],
-                    state="failed" if failed_exists else "pending",
-                    failed=failed,
-                )
+            # working_memory=false legitimately writes .done without an
+            # overview. Legacy markers lack the explicit flag and retain their
+            # established completed semantics.
+            return ArchiveState(
+                archive_id=archive["archive_id"],
+                archive_uri=archive["archive_uri"],
+                index=archive["index"],
+                state="completed",
+                overview=overview,
+                done=done,
             )
+
+        failed_uri = f"{archive['archive_uri']}/.failed.json"
+        failed: Dict[str, Any] = {}
+        failed_exists = False
+        try:
+            raw_failed = await self._viking_fs.read_file(failed_uri, ctx=self.ctx)
+            failed_exists = True
+            parsed_failed = json.loads(raw_failed or "{}")
+            if isinstance(parsed_failed, dict):
+                failed = parsed_failed
+        except Exception as exc:
+            if not _is_storage_not_found(exc):
+                try:
+                    failed_exists = await self._viking_fs.exists(failed_uri, ctx=self.ctx)
+                except Exception:
+                    failed_exists = False
+            if failed_exists:
+                logger.warning("Unreadable archive failed marker %s: %s", failed_uri, exc)
+
+        if failed_exists:
+            return ArchiveState(
+                archive_id=archive["archive_id"],
+                archive_uri=archive["archive_uri"],
+                index=archive["index"],
+                state="failed",
+                failed=failed,
+            )
+
+        if verify_directory:
+            try:
+                if not await self._viking_fs.exists(archive["archive_uri"], ctx=self.ctx):
+                    return None
+            except Exception:
+                return None
+
+        return ArchiveState(
+            archive_id=archive["archive_id"],
+            archive_uri=archive["archive_uri"],
+            index=archive["index"],
+            state="pending",
+        )
+
+    async def _scan_archive_states(
+        self,
+        *,
+        per_archive_delay: float = 0.0,
+    ) -> List[ArchiveState]:
+        """Derive every archive state exclusively from its directory markers."""
+        states: List[ArchiveState] = []
+        refs = sorted(await self._list_archive_refs(), key=lambda item: item["index"])
+        for offset, archive in enumerate(refs):
+            state = await self._read_archive_state(archive)
+            if state is not None:
+                states.append(state)
+            if per_archive_delay > 0 and offset + 1 < len(refs):
+                # Recovery scans can start together after a fleet restart. A
+                # small jitter keeps different processes from issuing their
+                # next metadata burst on the same fixed cadence.
+                await asyncio.sleep(
+                    per_archive_delay
+                    * random.uniform(
+                        1.0 - _ARCHIVE_WAIT_JITTER_RATIO,
+                        1.0 + _ARCHIVE_WAIT_JITTER_RATIO,
+                    )
+                )
         return states
 
     @staticmethod
@@ -3251,11 +3336,15 @@ class Session:
         exclude_archive_uri: Optional[str] = None,
         before_archive_index: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Return the newest readable completed archive summary."""
-        for archive in await self._get_completed_archive_refs(
-            exclude_archive_uri,
-            before_archive_index,
-        ):
+        """Return the newest readable completed summary without a full state scan."""
+        exclude = exclude_archive_uri.rstrip("/") if exclude_archive_uri else None
+        for archive in await self._list_archive_refs():  # newest → oldest
+            if exclude and archive["archive_uri"] == exclude:
+                continue
+            if before_archive_index is not None and archive["index"] >= before_archive_index:
+                continue
+            if await self._archive_terminal_state(archive["archive_uri"]) != "completed":
+                continue
             overview = await self._read_archive_overview(archive["archive_uri"])
             if not overview:
                 continue
@@ -3276,8 +3365,24 @@ class Session:
         self,
         exclude_archive_uri: Optional[str] = None,
         before_archive_index: Optional[int] = None,
+        preferred_completed: Optional[ArchiveState] = None,
     ) -> str:
         """Return the newest completed archive overview, skipping incomplete archives."""
+        if (
+            preferred_completed is not None
+            and preferred_completed.state == "completed"
+            and (before_archive_index is None or preferred_completed.index < before_archive_index)
+            and (
+                not exclude_archive_uri
+                or preferred_completed.archive_uri != exclude_archive_uri.rstrip("/")
+            )
+        ):
+            overview = preferred_completed.overview or await self._read_archive_overview(
+                preferred_completed.archive_uri
+            )
+            if overview:
+                return overview
+
         summary = await self._get_latest_completed_archive_summary(
             exclude_archive_uri,
             before_archive_index,
@@ -3337,6 +3442,7 @@ class Session:
         anchor_ids: set[str],
         *,
         before_archive_index: Optional[int] = None,
+        preferred_completed: Optional[ArchiveState] = None,
     ) -> Dict[str, _CheckpointSnapshot]:
         """Resolve completed checkpoint history for the requested retained Turns.
 
@@ -3357,13 +3463,13 @@ class Session:
             }
             for anchor_id in anchor_ids
         }
-        refs = await self._get_completed_archive_refs(before_archive_index=before_archive_index)
-        for archive in refs:  # newest → oldest
+
+        async def ingest_archive(archive: Dict[str, Any]) -> None:
             unresolved = {
                 anchor_id for anchor_id, history in histories.items() if not history["resolved"]
             }
             if not unresolved:
-                break
+                return
             grouped = self._checkpoint_records_for_anchors(
                 await self._read_archive_meta(archive["archive_uri"]),
                 unresolved,
@@ -3400,6 +3506,37 @@ class Session:
                         "archive_uri": archive["archive_uri"],
                     }
                 )
+
+        preferred_uri = ""
+        if (
+            preferred_completed is not None
+            and preferred_completed.state == "completed"
+            and (before_archive_index is None or preferred_completed.index < before_archive_index)
+        ):
+            preferred_uri = preferred_completed.archive_uri
+            await ingest_archive(
+                {
+                    "archive_id": preferred_completed.archive_id,
+                    "archive_uri": preferred_completed.archive_uri,
+                    "index": preferred_completed.index,
+                }
+            )
+
+        unresolved = {
+            anchor_id for anchor_id, history in histories.items() if not history["resolved"]
+        }
+        if unresolved:
+            for archive in await self._list_archive_refs():  # newest → oldest
+                if before_archive_index is not None and archive["index"] >= before_archive_index:
+                    continue
+                if archive["archive_uri"] == preferred_uri:
+                    continue
+                state = await self._read_archive_state(archive)
+                if state is None or state.state != "completed":
+                    continue
+                await ingest_archive(archive)
+                if all(history["resolved"] for history in histories.values()):
+                    break
 
         snapshots: Dict[str, _CheckpointSnapshot] = {}
         for anchor_id, history in histories.items():
@@ -3438,6 +3575,8 @@ class Session:
         archive_uri: str,
         covered_failed_archives: List[str],
         messages: List[Message],
+        *,
+        previous_completed: Optional[ArchiveState] = None,
     ) -> List[_CheckpointRequest]:
         """Collect and validate partial-Turn checkpoint work owned by this Phase 2.
 
@@ -3551,6 +3690,7 @@ class Session:
         previous_by_anchor = await self._get_effective_completed_checkpoints(
             {request.turn_anchor_message_id for request in requests},
             before_archive_index=self._archive_index_from_uri(archive_uri),
+            preferred_completed=previous_completed,
         )
         return [
             _CheckpointRequest(
@@ -3743,44 +3883,382 @@ class Session:
             raise ValueError(f"Invalid archive URI: {archive_uri}")
         return int(match.group(1))
 
-    async def _wait_for_previous_archive_done(self, archive_index: int) -> bool:
-        """Wait until every earlier archive reaches a terminal state."""
-        if archive_index <= 1 or not self._viking_fs:
-            return True
+    @staticmethod
+    def _has_authoritative_coverage(state: ArchiveState) -> bool:
+        """Whether a completed marker can terminate a predecessor walk."""
+        if state.state != "completed":
+            return False
+        try:
+            barrier_version = int(state.done.get("predecessor_barrier_version", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        if barrier_version < _ARCHIVE_PREDECESSOR_BARRIER_VERSION:
+            return False
+        start = state.done.get("coverage_start_archive")
+        end = state.done.get("coverage_end_archive")
+        covered_failed = state.done.get("covered_failed_archives")
+        if not isinstance(start, str) or not isinstance(end, str):
+            return False
+        start_match = re.fullmatch(r"archive_(\d+)", start)
+        end_match = re.fullmatch(r"archive_(\d+)", end)
+        if not start_match or not end_match or not isinstance(covered_failed, list):
+            return False
+        start_index = int(start_match.group(1))
+        end_index = int(end_match.group(1))
+        return 1 <= start_index <= end_index == state.index
+
+    def _get_archive_terminal_event(
+        self,
+        archive_uri: str,
+    ) -> tuple[tuple[int, str], asyncio.Event]:
+        loop = asyncio.get_running_loop()
+        key = (id(loop), archive_uri)
+        with _ARCHIVE_COORDINATION_GUARD:
+            registered = _ARCHIVE_TERMINAL_EVENTS.get(key)
+            if registered is None:
+                event = asyncio.Event()
+                _ARCHIVE_TERMINAL_EVENTS[key] = (loop, event)
+            else:
+                event = registered[1]
+        return key, event
+
+    @staticmethod
+    def _release_archive_terminal_event(key: tuple[int, str], event: asyncio.Event) -> None:
+        with _ARCHIVE_COORDINATION_GUARD:
+            registered = _ARCHIVE_TERMINAL_EVENTS.get(key)
+            if registered is not None and registered[1] is event:
+                _ARCHIVE_TERMINAL_EVENTS.pop(key, None)
+
+    @staticmethod
+    def _notify_archive_terminal(archive_uri: str) -> None:
+        notifications: List[tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
+        with _ARCHIVE_COORDINATION_GUARD:
+            for key, registered in list(_ARCHIVE_TERMINAL_EVENTS.items()):
+                if key[1] != archive_uri:
+                    continue
+                _ARCHIVE_TERMINAL_EVENTS.pop(key, None)
+                notifications.append(registered)
+            for key in list(_ARCHIVE_RECOVERY_SCAN_CACHE):
+                if key[1] == archive_uri.rsplit("/history/", 1)[0]:
+                    _ARCHIVE_RECOVERY_SCAN_CACHE.pop(key, None)
+
+        for loop, event in notifications:
+            if loop.is_closed():
+                continue
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                continue
+
+    def _invalidate_archive_recovery_cache(self) -> None:
+        with _ARCHIVE_COORDINATION_GUARD:
+            for key in list(_ARCHIVE_RECOVERY_SCAN_CACHE):
+                if key[1] == self._session_uri:
+                    _ARCHIVE_RECOVERY_SCAN_CACHE.pop(key, None)
+
+    @staticmethod
+    async def _pace_archive_recovery(processed_items: int) -> None:
+        """Smooth large exceptional walks without delaying the common short tail."""
+        if processed_items <= _ARCHIVE_RECOVERY_UNPACED_ITEMS:
+            return
+        await asyncio.sleep(
+            _ARCHIVE_RECOVERY_SCAN_ITEM_DELAY_SECONDS
+            * random.uniform(
+                1.0 - _ARCHIVE_WAIT_JITTER_RATIO,
+                1.0 + _ARCHIVE_WAIT_JITTER_RATIO,
+            )
+        )
+
+    async def _scan_archive_states_for_recovery(
+        self,
+        archive_index: int,
+    ) -> List[ArchiveState]:
+        """Singleflight and rate-limit the exceptional full-history scan."""
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
+        key = (loop_id, self._session_uri)
+        required_generation = archive_index - 1
+        generation_retried = False
 
         while True:
-            earlier_states = [
-                state for state in await self._scan_archive_states() if state.index < archive_index
-            ]
-            pending_states = [state for state in earlier_states if state.state == "pending"]
-            if not pending_states:
-                non_completed = [state for state in earlier_states if state.state == "failed"]
-                if non_completed:
-                    logger.info(
-                        "Earlier archives reached terminal non-completed states; "
-                        "continuing with raw replay: %s",
-                        [state.archive_id for state in non_completed],
-                    )
-                return True
+            now = time.monotonic()
+            with _ARCHIVE_COORDINATION_GUARD:
+                cached = _ARCHIVE_RECOVERY_SCAN_CACHE.get(key)
+                if (
+                    cached is not None
+                    and cached[0] > now
+                    and cached[1] >= required_generation
+                ):
+                    return list(cached[2])
 
-            # A new-format intent without ready status may be left by a
-            # process interruption. Reconcile it under the session lock rather
-            # than waiting forever for a queue item that may never have existed.
-            reconciled = False
-            for state in pending_states:
+                task = _ARCHIVE_RECOVERY_SCAN_TASKS.get(key)
+                if task is None:
+                    semaphore = _ARCHIVE_RECOVERY_SCAN_SEMAPHORES.get(loop_id)
+                    if semaphore is None:
+                        # One exceptional scan per process event loop keeps corrupt
+                        # or legacy sessions from forming a metadata-read stampede.
+                        semaphore = asyncio.Semaphore(1)
+                        _ARCHIVE_RECOVERY_SCAN_SEMAPHORES[loop_id] = semaphore
+
+                    async def run_scan(
+                        scan_semaphore: asyncio.Semaphore,
+                    ) -> List[ArchiveState]:
+                        async with scan_semaphore:
+                            states = await self._scan_archive_states(
+                                per_archive_delay=_ARCHIVE_RECOVERY_SCAN_ITEM_DELAY_SECONDS
+                            )
+                        max_index = max((state.index for state in states), default=0)
+                        with _ARCHIVE_COORDINATION_GUARD:
+                            _ARCHIVE_RECOVERY_SCAN_CACHE[key] = (
+                                time.monotonic() + _ARCHIVE_RECOVERY_SCAN_CACHE_SECONDS,
+                                max_index,
+                                tuple(states),
+                            )
+                        return states
+
+                    task = loop.create_task(run_scan(semaphore))
+                    _ARCHIVE_RECOVERY_SCAN_TASKS[key] = task
+
+                    def clear_finished_scan(finished: asyncio.Task) -> None:
+                        with _ARCHIVE_COORDINATION_GUARD:
+                            if _ARCHIVE_RECOVERY_SCAN_TASKS.get(key) is finished:
+                                _ARCHIVE_RECOVERY_SCAN_TASKS.pop(key, None)
+
+                    task.add_done_callback(clear_finished_scan)
+
+            states = list(await asyncio.shield(task))
+            if max((state.index for state in states), default=0) >= required_generation:
+                return states
+
+            # The listing may have raced creation/publication of the immediate
+            # predecessor. Retry one paced scan, but never spin on a stale or
+            # unhealthy ``ls`` response: after that, directly probe the one
+            # predecessor required by this caller and return the bounded result.
+            if generation_retried:
+                self._invalidate_archive_recovery_cache()
+                predecessor = await self._read_archive_state(
+                    self._archive_ref(self._session_uri, required_generation),
+                    verify_directory=True,
+                )
+                if predecessor is not None and all(
+                    state.index != predecessor.index for state in states
+                ):
+                    states.append(predecessor)
+                    states.sort(key=lambda state: state.index)
+                return states
+
+            generation_retried = True
+            self._invalidate_archive_recovery_cache()
+            with _ARCHIVE_COORDINATION_GUARD:
+                if _ARCHIVE_RECOVERY_SCAN_TASKS.get(key) is task:
+                    _ARCHIVE_RECOVERY_SCAN_TASKS.pop(key, None)
+            await asyncio.sleep(
+                _ARCHIVE_WAIT_POLL_SECONDS
+                * random.uniform(
+                    1.0 - _ARCHIVE_WAIT_JITTER_RATIO,
+                    1.0 + _ARCHIVE_WAIT_JITTER_RATIO,
+                )
+            )
+
+    async def _wait_for_archive_terminal(
+        self,
+        archive: Dict[str, Any],
+        *,
+        deadline: float,
+        timeout: float,
+        blocked_archive_index: int,
+    ) -> Optional[ArchiveState]:
+        """Wait on one blocker, then fail a presumed orphan after the deadline."""
+        event_key, event = self._get_archive_terminal_event(archive["archive_uri"])
+        delay = max(0.0, _ARCHIVE_WAIT_POLL_SECONDS)
+        try:
+            while True:
+                # The caller already established that the archive directory
+                # exists. Steady-state polling only needs the two terminal
+                # markers; avoid a third directory stat on every interval.
+                state = await self._read_archive_state(archive)
+                if state.state != "pending":
+                    return state
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # Re-read immediately before publishing the terminal marker;
+                    # a predecessor may have completed at the timeout boundary.
+                    state = await self._read_archive_state(archive, verify_directory=True)
+                    if state is None or state.state != "pending":
+                        return state
+                    logger.error(
+                        "Archive %s stayed pending for over %.0fs while blocking "
+                        "archive_%03d Phase 2; its queue item is presumed lost. "
+                        "Marking it failed so its raw messages can be replayed.",
+                        archive["archive_id"],
+                        timeout,
+                        blocked_archive_index,
+                    )
+                    await self._write_failed_marker(
+                        archive["archive_uri"],
+                        stage="phase2_wait_timeout",
+                        error=(
+                            f"Archive stayed pending for over {timeout:.0f}s; "
+                            "its Phase 2 queue item is presumed lost"
+                        ),
+                        blocked_by=f"archive_{blocked_archive_index:03d}",
+                    )
+                    raise TimeoutError(
+                        f"Timed out after {timeout:.0f}s waiting for "
+                        f"{archive['archive_id']} to finish before "
+                        f"archive_{blocked_archive_index:03d} Phase 2; it was "
+                        "marked failed for raw replay by a later commit"
+                    )
+
+                jitter = 1.0 + random.uniform(
+                    -_ARCHIVE_WAIT_JITTER_RATIO,
+                    _ARCHIVE_WAIT_JITTER_RATIO,
+                )
+                poll_timeout = min(remaining, max(0.001, delay * jitter))
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=poll_timeout)
+                except TimeoutError:
+                    pass
+                else:
+                    # Event.set() is level-triggered. Consume this notification
+                    # so a temporarily stale cross-layer marker read cannot turn
+                    # the next iterations into a no-sleep metadata hot loop.
+                    event.clear()
+                delay = min(
+                    _ARCHIVE_WAIT_MAX_POLL_SECONDS,
+                    max(_ARCHIVE_WAIT_POLL_SECONDS, delay * 2),
+                )
+        finally:
+            self._release_archive_terminal_event(event_key, event)
+
+    async def _resolve_phase2_predecessors_from_scan(
+        self,
+        archive_index: int,
+        *,
+        timeout: float,
+    ) -> _Phase2PredecessorPlan:
+        """Compatibility recovery for legacy, missing, or malformed marker chains."""
+        states = await self._scan_archive_states_for_recovery(archive_index)
+        earlier_by_index = {
+            state.index: state for state in states if state.index < archive_index
+        }
+        pending_states = sorted(
+            (state for state in earlier_by_index.values() if state.state == "pending"),
+            key=lambda state: state.index,
+        )
+
+        # The exceptional scan is a snapshot. Resolve each blocker directly
+        # from that snapshot instead of rescanning all history after every
+        # terminal transition. A blocker that already finished is a one-read
+        # fast path; a real pending blocker uses the bounded event/backoff wait.
+        for blocker in pending_states:
+            phase1 = await self._read_phase1_meta(blocker.archive_uri)
+            if phase1 and phase1.get("status") != "ready":
+                await self._ensure_phase1_ready(blocker.archive_uri)
+            terminal = await self._wait_for_archive_terminal(
+                self._archive_ref(self._session_uri, blocker.index),
+                # Time spent behind the recovery-scan throttle, or waiting for
+                # an older blocker, must not age this blocker into an orphan.
+                deadline=time.monotonic() + timeout,
+                timeout=timeout,
+                blocked_archive_index=archive_index,
+            )
+            if terminal is None:
+                earlier_by_index.pop(blocker.index, None)
+            else:
+                earlier_by_index[blocker.index] = terminal
+
+        earlier_states = [earlier_by_index[index] for index in sorted(earlier_by_index)]
+        covered = self._covered_archive_ids(earlier_states)
+        replay_states = tuple(
+            state
+            for state in earlier_states
+            if state.state == "failed" and state.archive_id not in covered
+        )
+        completed = [state for state in earlier_states if state.state == "completed"]
+        return _Phase2PredecessorPlan(
+            replay_states=replay_states,
+            latest_completed=max(completed, key=lambda state: state.index, default=None),
+            used_recovery_scan=True,
+        )
+
+    async def _resolve_phase2_predecessors(
+        self,
+        archive_index: int,
+        timeout: float = _ARCHIVE_WAIT_TIMEOUT_SECONDS,
+    ) -> _Phase2PredecessorPlan:
+        """Resolve only the predecessor chain needed by the current Phase 2.
+
+        A current-format completed marker has authoritative transitive coverage,
+        so the normal path is O(1). Failed predecessors are walked backward and
+        replayed. Only a legacy marker or a directory gap enters the protected
+        full-history compatibility path.
+        """
+        if archive_index <= 1 or not self._viking_fs:
+            return _Phase2PredecessorPlan()
+
+        timeout = max(0.0, float(timeout))
+        deadline = time.monotonic() + timeout
+        failed_newest_first: List[ArchiveState] = []
+        previous_index = archive_index - 1
+        while previous_index >= 1:
+            archive = self._archive_ref(self._session_uri, previous_index)
+            state = await self._read_archive_state(archive, verify_directory=True)
+            if state is None:
+                return await self._resolve_phase2_predecessors_from_scan(
+                    archive_index,
+                    timeout=timeout,
+                )
+
+            if state.state == "pending":
                 phase1 = await self._read_phase1_meta(state.archive_uri)
-                if not phase1 or phase1.get("status") == "ready":
-                    continue
-                await self._ensure_phase1_ready(state.archive_uri)
-                reconciled = True
-            if reconciled:
+                if phase1 and phase1.get("status") != "ready":
+                    await self._ensure_phase1_ready(state.archive_uri)
+                await self._wait_for_archive_terminal(
+                    archive,
+                    deadline=deadline,
+                    timeout=timeout,
+                    blocked_archive_index=archive_index,
+                )
                 continue
-            await asyncio.sleep(_ARCHIVE_WAIT_POLL_SECONDS)
+
+            if state.state == "failed":
+                failed_newest_first.append(state)
+                await self._pace_archive_recovery(len(failed_newest_first))
+                previous_index -= 1
+                continue
+
+            if not self._has_authoritative_coverage(state):
+                return await self._resolve_phase2_predecessors_from_scan(
+                    archive_index,
+                    timeout=timeout,
+                )
+
+            return _Phase2PredecessorPlan(
+                replay_states=tuple(reversed(failed_newest_first)),
+                latest_completed=state,
+            )
+
+        return _Phase2PredecessorPlan(
+            replay_states=tuple(reversed(failed_newest_first)),
+        )
+
+    async def _wait_for_previous_archive_done(
+        self,
+        archive_index: int,
+        timeout: float = _ARCHIVE_WAIT_TIMEOUT_SECONDS,
+    ) -> bool:
+        """Compatibility wrapper around bounded predecessor resolution."""
+        await self._resolve_phase2_predecessors(archive_index, timeout=timeout)
+        return True
 
     async def _prepare_phase2_archive_messages(
         self,
         archive_uri: str,
         current_messages: List[Message],
+        *,
+        predecessor_plan: Optional[_Phase2PredecessorPlan] = None,
     ) -> tuple[List[Message], str, str, List[str], Dict[str, set[str]]]:
         """Roll earlier failed raw archives into current Phase 2 input.
 
@@ -3789,20 +4267,48 @@ class Session:
         reached a terminal state.
         """
         current_index = self._archive_index_from_uri(archive_uri)
-        states = await self._scan_archive_states()
-        covered = self._covered_archive_ids(states)
-        replay_states = [
-            state
-            for state in states
-            if state.index < current_index
-            and state.archive_id not in covered
-            and state.state == "failed"
-        ]
+        if predecessor_plan is None:
+            # Keep direct internal callers compatible; the production Phase-2
+            # path supplies the already-resolved plan and performs no rescan.
+            states = await self._scan_archive_states()
+            covered = self._covered_archive_ids(states)
+            replay_states = [
+                state
+                for state in states
+                if state.index < current_index
+                and state.archive_id not in covered
+                and state.state == "failed"
+            ]
+        else:
+            replay_states = list(predecessor_plan.replay_states)
 
         combined: List[Message] = []
         completed_memory_steps: Dict[str, set[str]] = {}
-        for state in replay_states:
-            combined.extend(await self._read_archive_messages(state.archive_uri))
+        for position, state in enumerate(replay_states, start=1):
+            await self._pace_archive_recovery(position)
+            # A terminally-failed earlier archive can have a missing or corrupt
+            # messages.jsonl (legacy "no messages" data, or #3417's own
+            # archive_read terminal path). Tolerate that exactly like
+            # _get_uncovered_archive_messages does, otherwise every subsequent
+            # commit's Phase 2 re-raises here and stays permanently poisoned.
+            # Real storage failures still propagate.
+            try:
+                replayed = await self._read_archive_messages(state.archive_uri)
+            except _ArchiveMessagesCorruptError:
+                logger.warning(
+                    "Skipping failed archive %s in Phase-2 replay: messages.jsonl is corrupt",
+                    state.archive_uri,
+                )
+                continue
+            except Exception as exc:
+                if not _is_storage_not_found(exc):
+                    raise
+                logger.warning(
+                    "Skipping failed archive %s in Phase-2 replay: messages.jsonl is missing",
+                    state.archive_uri,
+                )
+                continue
+            combined.extend(replayed)
             marker = state.failed
             self._merge_completed_memory_steps(
                 completed_memory_steps,
