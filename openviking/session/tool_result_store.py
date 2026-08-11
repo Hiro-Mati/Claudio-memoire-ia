@@ -134,6 +134,7 @@ class ToolResultStore:
         preview_chars: int,
         mime_type: str = "text/plain",
         synopsis: Optional[ToolResultSynopsis] = None,
+        lease_ref: Optional[Dict[str, Any]] = None,
     ) -> StoredToolResult:
         digest = sha256_text(content)
         tool_result_id = build_tool_result_id(tool_id, digest)
@@ -191,11 +192,14 @@ class ToolResultStore:
             "output_uri": output_uri,
             "offset_unit": "unicode_code_point",
         }
-        await self._viking_fs.write_file(output_uri, content, ctx=self._ctx)
+        write_kwargs = {"ctx": self._ctx}
+        if lease_ref is not None:
+            write_kwargs["lease_ref"] = lease_ref
+        await self._viking_fs.write_file(output_uri, content, **write_kwargs)
         await self._viking_fs.write_file(
             metadata_uri,
             json.dumps(metadata, ensure_ascii=False, indent=2),
-            ctx=self._ctx,
+            **write_kwargs,
         )
         return StoredToolResult(
             tool_result_id=tool_result_id,

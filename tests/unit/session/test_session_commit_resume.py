@@ -83,9 +83,9 @@ async def test_resume_queued_commit_continues_phase2(monkeypatch):
     session._run_memory_extraction.assert_awaited_once()
     assert session._run_memory_extraction.await_args.kwargs["task_id"] == "task-1"
     assert session._run_memory_extraction.await_args.kwargs["agent_evolution_enabled"] is True
-    assert [
-        item.id for item in session._run_memory_extraction.await_args.kwargs["messages"]
-    ] == ["archived"]
+    assert [item.id for item in session._run_memory_extraction.await_args.kwargs["messages"]] == [
+        "archived"
+    ]
 
 
 @pytest.mark.asyncio
@@ -136,9 +136,7 @@ async def test_session_context_skips_pending_archive_with_missing_messages(monke
         session,
         "_list_archive_refs",
         AsyncMock(
-            return_value=[
-                {"archive_id": "archive_001", "archive_uri": archive_uri, "index": 1}
-            ]
+            return_value=[{"archive_id": "archive_001", "archive_uri": archive_uri, "index": 1}]
         ),
     )
 

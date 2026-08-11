@@ -963,6 +963,7 @@ class Session:
         group_id: str,
         group_original_chars: int,
         synopsis: Optional[ToolResultSynopsis] = None,
+        lease_ref: Optional[Dict[str, Any]] = None,
     ) -> None:
         store = self._tool_result_store()
         original_output = part.tool_output or ""
@@ -983,6 +984,7 @@ class Session:
                     preview_chars=preview_chars,
                     mime_type=part.tool_output_mime_type or "text/plain",
                     synopsis=synopsis,
+                    lease_ref=lease_ref,
                 )
             )
         except Exception as exc:
@@ -1033,7 +1035,12 @@ class Session:
         part.tool_output_group_original_chars = group_original_chars
         part.tool_output_group_budget_chars = cfg.assistant_turn_inline_budget_chars
 
-    def _externalize_large_tool_output_group(self, messages: List[Message]) -> None:
+    def _externalize_large_tool_output_group(
+        self,
+        messages: List[Message],
+        *,
+        lease_ref: Optional[Dict[str, Any]] = None,
+    ) -> None:
         cfg = self._tool_output_externalization_config
         if not cfg.enabled:
             return
@@ -1162,6 +1169,7 @@ class Session:
                 group_id=group_id,
                 group_original_chars=group_original_chars,
                 synopsis=synopsis,
+                lease_ref=lease_ref,
             )
 
     def _externalize_large_tool_outputs(self, msg: Message) -> None:
@@ -1900,7 +1908,10 @@ class Session:
                 # physical assistant message. This catches N small tool outputs
                 # whose aggregate exceeds the configured inline budget.
                 for turn in build_turns(self._messages):
-                    self._externalize_large_tool_output_group(turn.messages)
+                    self._externalize_large_tool_output_group(
+                        turn.messages,
+                        lease_ref=lease,
+                    )
                 retention_plan = plan_retention(
                     self._messages,
                     keep_recent_turn_count=effective_keep_turns,
@@ -4011,11 +4022,7 @@ class Session:
             now = time.monotonic()
             with _ARCHIVE_COORDINATION_GUARD:
                 cached = _ARCHIVE_RECOVERY_SCAN_CACHE.get(key)
-                if (
-                    cached is not None
-                    and cached[0] > now
-                    and cached[1] >= required_generation
-                ):
+                if cached is not None and cached[0] > now and cached[1] >= required_generation:
                     return list(cached[2])
 
                 task = _ARCHIVE_RECOVERY_SCAN_TASKS.get(key)
@@ -4415,9 +4422,7 @@ class Session:
     ) -> _Phase2PredecessorPlan:
         """Compatibility recovery for legacy, missing, or malformed marker chains."""
         states = await self._scan_archive_states_for_recovery(archive_index)
-        earlier_by_index = {
-            state.index: state for state in states if state.index < archive_index
-        }
+        earlier_by_index = {state.index: state for state in states if state.index < archive_index}
         pending_states = sorted(
             (state for state in earlier_by_index.values() if state.state == "pending"),
             key=lambda state: state.index,

@@ -17,9 +17,11 @@ from openviking_cli.exceptions import NotFoundError
 class MemoryVikingFS:
     def __init__(self):
         self.files = {}
+        self.write_lease_refs = {}
 
-    async def write_file(self, uri, content, *, ctx=None):  # noqa: ANN001
+    async def write_file(self, uri, content, *, ctx=None, lease_ref=None):  # noqa: ANN001
         self.files[uri] = content
+        self.write_lease_refs[uri] = lease_ref
 
     async def append_file(self, uri, content, *, ctx=None):  # noqa: ANN001
         self.files[uri] = self.files.get(uri, "") + content
@@ -144,3 +146,29 @@ async def test_list_tool_results_filters_tool_name_before_limit():
     result = await store.list(tool_name="target", limit=1)
 
     assert result["tool_results"] == [{"tool_result_id": "tr_target", "tool_name": "target"}]
+
+
+async def test_tool_result_store_reuses_held_session_lease():
+    viking_fs = MemoryVikingFS()
+    store = ToolResultStore(
+        viking_fs,
+        "viking://session/reuse-lease",
+        "reuse-lease",
+        ctx=None,
+    )
+    lease_ref = {"lease_id": "session-phase-1"}
+
+    result = await store.write(
+        content="large tool output",
+        tool_id="call-1",
+        tool_name="fetch",
+        message_id="message-1",
+        user_id="user-1",
+        peer_id=None,
+        created_at=None,
+        preview_chars=8,
+        lease_ref=lease_ref,
+    )
+
+    assert viking_fs.write_lease_refs[result.output_uri] is lease_ref
+    assert viking_fs.write_lease_refs[result.metadata_uri] is lease_ref

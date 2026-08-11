@@ -403,7 +403,7 @@ async def test_current_coverage_predecessor_avoids_full_history_scan(
     client,
     monkeypatch,
 ):
-    session = client(session_id="phase2_bounded_predecessor_test")
+    session = client.session(session_id="phase2_bounded_predecessor_test")
     await session.ensure_exists()
     await _write_archive(
         session,
@@ -448,7 +448,7 @@ async def test_predecessor_plan_reuses_overview_and_cumulative_checkpoint(
     client,
     monkeypatch,
 ):
-    session = client(session_id="phase2_predecessor_compression_reuse_test")
+    session = client.session(session_id="phase2_predecessor_compression_reuse_test")
     await session.ensure_exists()
     anchor = _text_message("u1", "user", "investigate the outage")
     previous_uri = await _write_archive(
@@ -520,7 +520,7 @@ async def test_predecessor_walk_replays_only_contiguous_failed_chain(
     client,
     monkeypatch,
 ):
-    session = client(session_id="phase2_failed_predecessor_chain_test")
+    session = client.session(session_id="phase2_failed_predecessor_chain_test")
     await session.ensure_exists()
     await _write_archive(
         session,
@@ -578,7 +578,7 @@ async def test_pending_predecessor_uses_terminal_notification_without_full_scan(
     client,
     monkeypatch,
 ):
-    session = client(session_id="phase2_predecessor_notification_test")
+    session = client.session(session_id="phase2_predecessor_notification_test")
     await session.ensure_exists()
     await _write_archive(
         session,
@@ -630,7 +630,7 @@ async def test_pending_predecessor_timeout_keeps_unconfirmed_work_pending(
     monkeypatch,
     liveness_state,
 ):
-    session = client(session_id=f"phase2_predecessor_{liveness_state}_timeout_test")
+    session = client.session(session_id=f"phase2_predecessor_{liveness_state}_timeout_test")
     await session.ensure_exists()
     pending_uri = await _write_archive(
         session,
@@ -678,7 +678,7 @@ async def test_pending_predecessor_timeout_marks_confirmed_orphan_failed_for_raw
     client,
     monkeypatch,
 ):
-    session = client(session_id="phase2_predecessor_orphan_timeout_test")
+    session = client.session(session_id="phase2_predecessor_orphan_timeout_test")
     await session.ensure_exists()
     orphan_uri = await _write_archive(
         session,
@@ -723,7 +723,7 @@ async def test_pending_predecessor_rechecks_terminal_after_orphan_lookup(
     client,
     monkeypatch,
 ):
-    session = client(session_id="phase2_predecessor_orphan_race_test")
+    session = client.session(session_id="phase2_predecessor_orphan_race_test")
     await session.ensure_exists()
     pending_uri = await _write_archive(
         session,
@@ -764,7 +764,7 @@ async def test_archive_queue_liveness_uses_local_index_without_snapshot(
     client,
     monkeypatch,
 ):
-    session = client(session_id="archive_queue_local_index_test")
+    session = client.session(session_id="archive_queue_local_index_test")
 
     async def phase1(_archive_uri):
         return {
@@ -799,7 +799,7 @@ async def test_legacy_archive_liveness_matches_durable_work_by_archive_uri(
     client,
     monkeypatch,
 ):
-    session = client(session_id="legacy_archive_queue_uri_match_test")
+    session = client.session(session_id="legacy_archive_queue_uri_match_test")
     archive_uri = f"{session.uri}/history/archive_001"
 
     async def phase1(_archive_uri):
@@ -857,7 +857,7 @@ async def test_archive_queue_liveness_respects_worker_authority(
     expected_state,
     expected_snapshot_calls,
 ):
-    session = client(session_id=f"archive_queue_liveness_{uuid4()}")
+    session = client.session(session_id=f"archive_queue_liveness_{uuid4()}")
     snapshot_calls = 0
 
     async def phase1(_archive_uri):
@@ -907,7 +907,7 @@ async def test_session_commit_queue_snapshot_is_singleflight_and_cached(
     client,
     monkeypatch,
 ):
-    session = client(session_id="archive_queue_snapshot_singleflight_test")
+    session = client.session(session_id="archive_queue_snapshot_singleflight_test")
     snapshot_started = asyncio.Event()
     release_snapshot = asyncio.Event()
     snapshot_calls = 0
@@ -955,16 +955,14 @@ async def test_session_commit_queue_snapshot_is_singleflight_and_cached(
     assert snapshot_calls == 1
     assert first_result == second_result == cached_result
     assert first_result.task_ids == frozenset({"task-1"})
-    assert first_result.archive_uris == frozenset(
-        {"viking://session/s1/history/archive_001"}
-    )
+    assert first_result.archive_uris == frozenset({"viking://session/s1/history/archive_001"})
 
 
 async def test_terminal_notification_does_not_hot_loop_on_stale_marker_read(
     client,
     monkeypatch,
 ):
-    session = client(session_id="phase2_terminal_notification_stale_read_test")
+    session = client.session(session_id="phase2_terminal_notification_stale_read_test")
     await session.ensure_exists()
     archive = session._archive_ref(session.uri, 1)
     read_calls = 0
@@ -1007,7 +1005,7 @@ async def test_legacy_recovery_scan_is_singleflight_per_session(
     client,
     monkeypatch,
 ):
-    session = client(session_id="phase2_recovery_scan_singleflight_test")
+    session = client.session(session_id="phase2_recovery_scan_singleflight_test")
     await session.ensure_exists()
     await _write_archive(
         session,
@@ -1044,7 +1042,7 @@ async def test_stale_recovery_listing_has_only_one_bounded_rescan(
     client,
     monkeypatch,
 ):
-    session = client(session_id="phase2_stale_recovery_listing_test")
+    session = client.session(session_id="phase2_stale_recovery_listing_test")
     await session.ensure_exists()
     scan_calls = 0
 
@@ -2329,10 +2327,10 @@ async def test_phase2_meta_merge_serializes_with_concurrent_append(
     allow_phase2_save = asyncio.Event()
     original_save_meta = phase2._save_meta
 
-    async def delayed_save_meta():
+    async def delayed_save_meta(*, lease_ref=None):
         phase2_inside_save.set()
         await allow_phase2_save.wait()
-        await original_save_meta()
+        await original_save_meta(lease_ref=lease_ref)
 
     monkeypatch.setattr(phase2, "_save_meta", delayed_save_meta)
     merge_task = asyncio.create_task(
@@ -2373,10 +2371,10 @@ async def test_add_waits_for_commit_root_rewrite_and_remains_live(
     allow_commit_rewrite = asyncio.Event()
     original_write = committing._write_to_agfs_async
 
-    async def delayed_root_write(messages):
+    async def delayed_root_write(messages, *, lease_ref=None):
         commit_inside_rewrite.set()
         await allow_commit_rewrite.wait()
-        await original_write(messages)
+        await original_write(messages, lease_ref=lease_ref)
 
     class CapturingQueueManager:
         async def enqueue(self, *_args, **_kwargs):
@@ -2464,8 +2462,8 @@ async def test_phase1_root_rewrite_failure_marks_orphan_archive_failed(
     session.add_message("assistant", [TextPart("retained tail")])
     original_write = session._write_to_agfs_async
 
-    async def write_then_fail(messages):
-        await original_write(messages)
+    async def write_then_fail(messages, *, lease_ref=None):
+        await original_write(messages, lease_ref=lease_ref)
         raise RuntimeError("synthetic root rewrite failure")
 
     monkeypatch.setattr(session, "_write_to_agfs_async", write_then_fail)
@@ -2595,6 +2593,8 @@ async def test_stale_worker_uses_lock_snapshot_memory_policy_for_queue_message(
     monkeypatch,
 ):
     stale_session = client.session(session_id="stale_memory_policy_snapshot_test")
+    await stale_session.ensure_exists()
+    stale_session._agent_evolution_enabled_provider = lambda: False
     stale_session.add_message("user", [TextPart("archive with persisted policy")])
     updater = client.session(session_id=stale_session.session_id)
     await updater.load()
