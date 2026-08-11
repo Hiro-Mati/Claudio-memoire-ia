@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from vikingbot.agent.loop import AgentLoop
+from vikingbot.agent.loop import AgentIterationLimitExceeded, AgentLoop
 from vikingbot.agent.tools.base import Tool, ToolContext
 from vikingbot.agent.tools.compile import CompileScopedTool, SubmitWikiBundleTool
 from vikingbot.agent.tools.registry import ToolRegistry
@@ -109,9 +109,33 @@ def test_compile_limit_defaults_match_the_resource_envelope():
     limits = CompileLimits()
 
     assert limits.concurrent_tasks == 2
+    assert limits.task_runtime_seconds == 40 * 60
     assert limits.target_inventory_entries == 2000
     assert limits.target_catalog_pages == 10
     assert DirectBackendConfig().allow_compile_exec is False
+
+
+def test_compile_runtime_timeout_accepts_one_day_but_requires_positive_finite_seconds():
+    request = CompileRequest.model_validate(
+        {
+            "from": ["viking://resources/source"],
+            "to": "viking://resources/wiki",
+            "skill": "viking://agent/skills/wiki",
+            "runtime_timeout_seconds": 24 * 60 * 60,
+        }
+    )
+    assert request.runtime_timeout_seconds == 24 * 60 * 60
+
+    for invalid in (0, float("inf"), float("nan")):
+        with pytest.raises(ValueError):
+            CompileRequest.model_validate(
+                {
+                    "from": ["viking://resources/source"],
+                    "to": "viking://resources/wiki",
+                    "skill": "viking://agent/skills/wiki",
+                    "runtime_timeout_seconds": invalid,
+                }
+            )
 
 
 def test_wiki_page_requires_exactly_one_body_source():
@@ -1338,6 +1362,42 @@ async def test_structured_wrapper_delegates_to_only_existing_loop_without_fallba
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("iteration", "error"),
+    [(1, ValueError), (50, AgentIterationLimitExceeded)],
+)
+async def test_structured_wrapper_distinguishes_iteration_exhaustion(iteration, error):
+    registry = ToolRegistry()
+    registry.register(
+        SubmitWikiBundleTool(
+            source_ids=set(),
+            catalog_uris=set(),
+            target_uri="viking://resources/wiki",
+            limits=CompileLimits(),
+        )
+    )
+
+    class FakeLoop:
+        max_iterations = 50
+
+        async def _run_agent_loop(self, **kwargs):
+            del kwargs
+            return None, None, [], {}, iteration
+
+    with pytest.raises(error):
+        await AgentLoop.run_structured_task(
+            FakeLoop(),
+            system_prompt="system",
+            user_prompt="user",
+            session_key=SessionKey(type="compile", channel_id="cmp", chat_id="cmp"),
+            tool_registry=registry,
+            openviking_tool_names=set(),
+            stop_tool_names=["submit_wiki_bundle"],
+            openviking_connection=None,
+        )
+
+
+@pytest.mark.asyncio
 async def test_request_normalization_uses_default_reason_and_canonical_skill(monkeypatch):
     class Client:
         created = set()
@@ -1380,6 +1440,7 @@ async def test_request_normalization_uses_default_reason_and_canonical_skill(mon
                 "to": "viking://resources/wiki",
                 "skill": "viking://agent/skills/wiki/SKILL.md",
                 "reason": "   ",
+                "runtime_timeout_seconds": 24 * 60 * 60,
             }
         ),
         connection={"api_key": "secret"},
@@ -1388,6 +1449,7 @@ async def test_request_normalization_uses_default_reason_and_canonical_skill(mon
     assert normalized.to == "viking://resources/wiki"
     assert normalized.skill == "viking://agent/skills/wiki"
     assert normalized.reason == DEFAULT_COMPILE_REASON
+    assert normalized.runtime_timeout_seconds == 24 * 60 * 60
 
     Client.created.clear()
     Client.skill_content = "---\nname: wiki\n---\nCompile it"
@@ -2508,6 +2570,40 @@ async def test_compile_queue_wait_has_a_deadline(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_compile_uses_request_runtime_timeout(monkeypatch, tmp_path: Path):
+    service = _compile_service(
+        tmp_path,
+        auth_mode="api_key",
+        backend=SandboxBackend.AIOSANDBOX,
+    )
+    request = _sanitized_compile_request().model_copy(update={"runtime_timeout_seconds": 0.01})
+    task = CompileTask(
+        task_id="cmp_runtime",
+        principal_scope="owner",
+        sanitized_request=request,
+        status="accepted",
+        stage="queued",
+        created_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    await service.store.create(task)
+    observed = []
+
+    async def execute(*args, runtime_deadline, **kwargs):
+        del args, kwargs
+        observed.append(runtime_deadline - asyncio.get_running_loop().time())
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(service, "_execute_task", execute)
+    await service._run_task(task.task_id, request, {"api_key": "secret"})
+
+    failed = await service.store.get(task.task_id)
+    assert observed and 0 < observed[0] <= 0.02
+    assert failed is not None and failed.status == "failed"
+    assert failed.error is not None and failed.error.code == "DEADLINE_EXCEEDED"
+
+
+@pytest.mark.asyncio
 async def test_timeout_salvage_copies_workspace_and_repairs_links(tmp_path: Path):
     service = _compile_service(
         tmp_path,
@@ -2630,7 +2726,10 @@ async def test_timeout_salvage_copies_workspace_and_repairs_links(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_runtime_deadline_salvages_before_workspace_cleanup(monkeypatch, tmp_path: Path):
+@pytest.mark.parametrize("cutoff", ["runtime", "iterations"])
+async def test_compile_cutoff_salvages_before_workspace_cleanup(
+    monkeypatch, tmp_path: Path, cutoff: str
+):
     observed = []
 
     class TaskConfig:
@@ -2681,6 +2780,8 @@ async def test_runtime_deadline_salvages_before_workspace_cleanup(monkeypatch, t
         async def run_structured_task(self, **kwargs):
             del kwargs
             (self.workspace / "output.md").write_text("partial", encoding="utf-8")
+            if cutoff == "iterations":
+                raise AgentIterationLimitExceeded(1)
             await asyncio.Event().wait()
 
     class Client:
@@ -2711,10 +2812,11 @@ async def test_runtime_deadline_salvages_before_workspace_cleanup(monkeypatch, t
         del args, kwargs
         return [], {}
 
-    async def salvage(*, client, request, workspace):
+    async def salvage(*, client, request, workspace, reason):
         del client
         assert request.to == "viking://resources/wiki"
         assert (workspace / "output.md").read_text() == "partial"
+        assert ("runtime deadline" if cutoff == "runtime" else "1-iteration limit") in reason
         observed.append("salvage")
         return CompileResult(
             **{
@@ -2757,7 +2859,7 @@ async def test_runtime_deadline_salvages_before_workspace_cleanup(monkeypatch, t
 
     request = _sanitized_compile_request()
     task = CompileTask(
-        task_id="cmp_deadline",
+        task_id=f"cmp_{cutoff}",
         principal_scope="owner",
         sanitized_request=request,
         status="accepted",
@@ -2767,15 +2869,16 @@ async def test_runtime_deadline_salvages_before_workspace_cleanup(monkeypatch, t
     )
     await service.store.create(task)
     loop = asyncio.get_running_loop()
-    await asyncio.wait_for(
-        service._execute_task(
-            task.task_id,
-            request,
-            {"api_key": "secret"},
-            runtime_deadline=loop.time() + 0.01,
-        ),
-        timeout=0.01,
+    execute = service._execute_task(
+        task.task_id,
+        request,
+        {"api_key": "secret"},
+        runtime_deadline=loop.time() + (0.01 if cutoff == "runtime" else 60),
     )
+    if cutoff == "runtime":
+        await asyncio.wait_for(execute, timeout=0.01)
+    else:
+        await execute
 
     completed = await service.store.get(task.task_id)
     assert completed is not None

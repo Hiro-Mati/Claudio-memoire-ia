@@ -142,6 +142,7 @@ data: {"event":"response","data":{"content":"当前知识库包含……","respo
 | `to` | string | 是 | - | 目标 Resource 或 Memory 目录，或受支持的 Skill namespace |
 | `skill` | string | 是 | - | Skill 目录或其 `SKILL.md` URI |
 | `reason` | string | 否 | Skill 驱动的默认值 | 本次 Compile 的补充指令 |
+| `runtime_timeout_seconds` | number | 否 | 2400 | 正数且有限的服务端运行时限，不设置最大值 |
 
 **HTTP API**
 
@@ -172,7 +173,7 @@ ov compile \
   --wait
 ```
 
-`--wait` 会轮询状态接口，直到任务进入终态。`--timeout` 只限制本地等待时间，不会取消服务端任务。
+`--wait` 会轮询状态接口，直到任务进入终态。`--timeout` 只限制本地等待时间，不会取消服务端任务；`--runtime-timeout` 用于设置本次任务的 `runtime_timeout_seconds`。达到该时限或 AgentLoop 的 50 轮限制时，会在清理前保存符合条件的 Resource 阶段性产物。
 
 `direct` backend 会以 Bot 宿主机权限执行 Compile 的 `exec` 命令。`bot.sandbox.backends.direct.allow_compile_exec` 默认为 `false`，此时 Compile 不会暴露 `exec`，但普通 Wiki 和产物文件整理仍可通过文件工具运行。声明了 `requires.bins` 或 `requires.env` 的 Skill 会在执行任何命令探测前以 `SKILL_CAPABILITY_UNAVAILABLE` 失败。将该选项设为 `true` 是明确的不安全 opt-in；依赖 CLI 的 Skill 推荐使用具备文件系统和网络策略的隔离 backend。超过 admission 上限时返回 `429 RESOURCE_EXHAUSTED`。
 

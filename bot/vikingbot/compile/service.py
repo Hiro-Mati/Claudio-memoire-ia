@@ -28,7 +28,7 @@ from openviking.utils.path_safety import (
     validate_safe_viking_uri_path,
 )
 from openviking_cli.exceptions import OpenVikingError
-from vikingbot.agent.loop import AgentLoop
+from vikingbot.agent.loop import AgentIterationLimitExceeded, AgentLoop
 from vikingbot.agent.skills import SkillsLoader
 from vikingbot.agent.tools.compile import CompileScopedTool, SubmitWikiBundleTool
 from vikingbot.agent.tools.registry import ToolRegistry
@@ -345,6 +345,7 @@ class BotCompileService:
                 "to": target,
                 "reason": (request.reason or "").strip() or DEFAULT_COMPILE_REASON,
                 "skill": canonical_skill,
+                "runtime_timeout_seconds": request.runtime_timeout_seconds,
             }
         )
 
@@ -464,9 +465,10 @@ class BotCompileService:
                 return
 
             try:
-                runtime_deadline = (
-                    asyncio.get_running_loop().time() + self.limits.task_runtime_seconds
+                runtime_timeout = (
+                    request.runtime_timeout_seconds or self.limits.task_runtime_seconds
                 )
+                runtime_deadline = asyncio.get_running_loop().time() + runtime_timeout
                 await asyncio.wait_for(
                     self._execute_task(
                         task_id,
@@ -474,7 +476,7 @@ class BotCompileService:
                         connection,
                         runtime_deadline=runtime_deadline,
                     ),
-                    timeout=self.limits.task_runtime_seconds,
+                    timeout=runtime_timeout,
                 )
             except asyncio.TimeoutError:
                 task = await self.store.get(task_id)
@@ -655,6 +657,18 @@ class BotCompileService:
                     stop_tool_names=["submit_wiki_bundle"],
                     openviking_connection=connection,
                 )
+            except AgentIterationLimitExceeded as exc:
+                if target_type != "resource":
+                    raise CompileFailure("AGENT_OUTPUT_INVALID", str(exc), stage="agent") from exc
+                await self._complete_salvaged_task(
+                    task_id=task_id,
+                    client=client,
+                    request=request,
+                    workspace=workspace,
+                    reason=f"reached its {exc.max_iterations}-iteration limit",
+                    failure_code="AGENT_OUTPUT_INVALID",
+                )
+                return
             except ValueError as exc:
                 raise CompileFailure("AGENT_OUTPUT_INVALID", str(exc), stage="agent") from exc
 
@@ -812,38 +826,58 @@ class BotCompileService:
                 or task.stage in {"writing", "refreshing"}
             ):
                 raise
-            await self._set_state(task_id, status="committing", stage="salvaging")
-            try:
-                result = await self._salvage_workspace(
-                    client=client,
-                    request=request,
-                    workspace=workspace,
-                )
-            except Exception as exc:
-                raise CompileFailure(
-                    "DEADLINE_EXCEEDED",
-                    f"Compile reached its runtime deadline and fallback saving failed: {exc}",
-                    stage="salvaging",
-                ) from exc
-            if result is None:
-                raise CompileFailure(
-                    "DEADLINE_EXCEEDED",
-                    "Compile reached its runtime deadline before producing files to save.",
-                    stage="agent",
-                )
-
-            def complete_salvage(task: CompileTask) -> None:
-                task.status = "completed"
-                task.stage = "salvaged"
-                task.result = result
-                task.error = None
-
-            await self.store.update(task_id, complete_salvage)
+            await self._complete_salvaged_task(
+                task_id=task_id,
+                client=client,
+                request=request,
+                workspace=workspace,
+                reason="reached its runtime deadline",
+                failure_code="DEADLINE_EXCEEDED",
+            )
         finally:
             await sandbox_manager.cleanup_session(session_key)
             if client is not None:
                 await client.close()
             shutil.rmtree(workspace_parent, ignore_errors=True)
+
+    async def _complete_salvaged_task(
+        self,
+        *,
+        task_id: str,
+        client: VikingClient,
+        request: SanitizedCompileRequest,
+        workspace: Path,
+        reason: str,
+        failure_code: str,
+    ) -> None:
+        await self._set_state(task_id, status="committing", stage="salvaging")
+        try:
+            result = await self._salvage_workspace(
+                client=client,
+                request=request,
+                workspace=workspace,
+                reason=reason,
+            )
+        except Exception as exc:
+            raise CompileFailure(
+                failure_code,
+                f"Compile {reason} and fallback saving failed: {exc}",
+                stage="salvaging",
+            ) from exc
+        if result is None:
+            raise CompileFailure(
+                failure_code,
+                f"Compile {reason} before producing files to save.",
+                stage="agent",
+            )
+
+        def complete(task: CompileTask) -> None:
+            task.status = "completed"
+            task.stage = "salvaged"
+            task.result = result
+            task.error = None
+
+        await self.store.update(task_id, complete)
 
     async def _salvage_workspace(
         self,
@@ -851,6 +885,7 @@ class BotCompileService:
         client: VikingClient,
         request: SanitizedCompileRequest,
         workspace: Path,
+        reason: str = "reached its runtime deadline",
     ) -> CompileResult | None:
         files: dict[str, bytes] = {}
         total_bytes = 0
@@ -959,7 +994,7 @@ class BotCompileService:
             wait=False,
         )
         warnings = [
-            "Compile reached its runtime deadline; workspace files were saved before cleanup. "
+            f"Compile {reason}; workspace files were saved before cleanup. "
             "This partial output did not pass the normal bundle validation."
         ]
         if skipped_files:

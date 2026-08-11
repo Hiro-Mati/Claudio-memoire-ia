@@ -145,6 +145,7 @@ Start an asynchronous, Skill-driven Compile task. VikingBot loads the selected S
 | `to` | string | Yes | - | Target Resource or Memory directory, or a supported Skill namespace |
 | `skill` | string | Yes | - | Skill directory or its `SKILL.md` URI |
 | `reason` | string | No | Skill-driven default | Additional instructions for this Compile run |
+| `runtime_timeout_seconds` | number | No | 2400 | Positive finite server runtime limit; no maximum is imposed |
 
 **HTTP API**
 
@@ -175,7 +176,7 @@ ov compile \
   --wait
 ```
 
-`--wait` polls the status endpoint until the task reaches a terminal state. `--timeout` limits only the local wait and does not cancel the server task.
+`--wait` polls the status endpoint until the task reaches a terminal state. `--timeout` limits only the local wait and does not cancel the server task. `--runtime-timeout` sets `runtime_timeout_seconds` for this run. Reaching that deadline or the 50-iteration AgentLoop limit saves eligible partial Resource output before cleanup.
 
 The `direct` backend runs Compile `exec` commands with the Bot host's permissions. `bot.sandbox.backends.direct.allow_compile_exec` defaults to `false`, so Compile omits `exec` while ordinary Wiki and artifact generation can still run through file tools. A Skill that declares `requires.bins` or `requires.env` fails with `SKILL_CAPABILITY_UNAVAILABLE` before any command probe runs. Setting the option to `true` is an explicit unsafe opt-in; isolated backends with filesystem and network policies are recommended for CLI-dependent Skills. Admission overflow returns `429 RESOURCE_EXHAUSTED`.
 
