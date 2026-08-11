@@ -12,7 +12,12 @@ from openviking.message import Message, TextPart, ToolPart
 from openviking.models.vlm.base import ToolCall, VLMResponse
 from openviking.service.task_tracker import get_task_tracker
 from openviking.session.memory.constants import AGENT_EVOLUTION_MEMORY_TYPES
-from openviking.session.session import Session, _ArchiveSummaryResult, _CheckpointRequest
+from openviking.session.session import (
+    ArchiveState,
+    Session,
+    _ArchiveSummaryResult,
+    _CheckpointRequest,
+)
 
 
 async def _write_archive(
@@ -340,9 +345,26 @@ async def test_phase2_waits_for_all_earlier_pending_archives(
         2,
         [_text_message("u2", "user", "completed two")],
         overview="# Summary\n\ncomplete",
-        done={"starting_message_id": "u2", "ending_message_id": "u2"},
+        done={
+            "starting_message_id": "u2",
+            "ending_message_id": "u2",
+            # Coverage written by an older build is not enough to prove that
+            # every predecessor crossed the new sequencing barrier.
+            "coverage_start_archive": "archive_001",
+            "coverage_end_archive": "archive_002",
+            "covered_failed_archives": ["archive_001"],
+        },
     )
     monkeypatch.setattr("openviking.session.session._ARCHIVE_WAIT_POLL_SECONDS", 0.01)
+    original_scan = session._scan_archive_states
+    scan_calls = 0
+
+    async def counted_scan(*, per_archive_delay=0.0):
+        nonlocal scan_calls
+        scan_calls += 1
+        return await original_scan(per_archive_delay=0.0)
+
+    monkeypatch.setattr(session, "_scan_archive_states", counted_scan)
 
     waiter = asyncio.create_task(session._wait_for_previous_archive_done(3))
     await asyncio.sleep(0.03)
@@ -354,6 +376,7 @@ async def test_phase2_waits_for_all_earlier_pending_archives(
         ctx=session.ctx,
     )
     assert await asyncio.wait_for(waiter, timeout=0.5)
+    assert scan_calls == 1
 
 
 async def test_missing_previous_archive_directory_does_not_block_phase2(
@@ -371,6 +394,366 @@ async def test_missing_previous_archive_directory_does_not_block_phase2(
         session._wait_for_previous_archive_done(2),
         timeout=0.5,
     )
+
+
+async def test_current_coverage_predecessor_avoids_full_history_scan(
+    client,
+    monkeypatch,
+):
+    session = client(session_id="phase2_bounded_predecessor_test")
+    await session.ensure_exists()
+    await _write_archive(
+        session,
+        99,
+        [_text_message("u99", "user", "completed predecessor")],
+        done={
+            "starting_message_id": "u99",
+            "ending_message_id": "u99",
+            "working_memory_enabled": False,
+            "predecessor_barrier_version": 1,
+            "coverage_start_archive": "archive_099",
+            "coverage_end_archive": "archive_099",
+            "covered_failed_archives": [],
+        },
+    )
+
+    async def unexpected_full_scan(*_args, **_kwargs):
+        raise AssertionError("current-format predecessor must not scan archive history")
+
+    original_read_file = session._viking_fs.read_file
+    marker_reads: list[str] = []
+
+    async def counted_read_file(uri, *args, **kwargs):
+        if uri.endswith("/.done") or uri.endswith("/.failed.json"):
+            marker_reads.append(uri)
+        return await original_read_file(uri, *args, **kwargs)
+
+    monkeypatch.setattr(session, "_scan_archive_states", unexpected_full_scan)
+    monkeypatch.setattr(session, "_list_archive_refs", unexpected_full_scan)
+    monkeypatch.setattr(session._viking_fs, "read_file", counted_read_file)
+
+    plan = await session._resolve_phase2_predecessors(100)
+
+    assert plan.latest_completed is not None
+    assert plan.latest_completed.archive_id == "archive_099"
+    assert plan.replay_states == ()
+    assert not plan.used_recovery_scan
+    assert marker_reads == [f"{plan.latest_completed.archive_uri}/.done"]
+
+
+async def test_predecessor_plan_reuses_overview_and_cumulative_checkpoint(
+    client,
+    monkeypatch,
+):
+    session = client(session_id="phase2_predecessor_compression_reuse_test")
+    await session.ensure_exists()
+    anchor = _text_message("u1", "user", "investigate the outage")
+    previous_uri = await _write_archive(
+        session,
+        1,
+        [anchor, _text_message("a1", "assistant", "first archived step")],
+        overview="# Working Memory\n\nPool saturation was confirmed.",
+        meta={
+            "checkpoints": [
+                {
+                    "checkpoint_version": 2,
+                    "turn_anchor_message_id": "u1",
+                    "source_message_ids": ["a1"],
+                    "abstract": "Pool saturation was confirmed.",
+                }
+            ]
+        },
+        done={
+            "starting_message_id": "u1",
+            "ending_message_id": "a1",
+            "working_memory_enabled": True,
+            "predecessor_barrier_version": 1,
+            "coverage_start_archive": "archive_001",
+            "coverage_end_archive": "archive_001",
+            "covered_failed_archives": [],
+        },
+    )
+    current_source = _text_message("a2", "assistant", "second archived step")
+    current_uri = await _write_archive(
+        session,
+        2,
+        [anchor, current_source],
+        meta={
+            "retention_plan": {
+                "partial_turn": True,
+                "turn_anchor_message_id": "u1",
+                "checkpoint_source_message_ids": ["a2"],
+                "retained_message_token_budget": 6000,
+                "estimated_active_tokens": 100,
+            }
+        },
+    )
+
+    plan = await session._resolve_phase2_predecessors(2)
+
+    async def unexpected_history_list(*_args, **_kwargs):
+        raise AssertionError("preferred compression state must not list archive history")
+
+    monkeypatch.setattr(session, "_list_archive_refs", unexpected_history_list)
+    requests = await session._collect_checkpoint_requests_for_phase2(
+        current_uri,
+        [],
+        [anchor, current_source],
+        previous_completed=plan.latest_completed,
+    )
+    overview = await session._get_latest_completed_archive_overview(
+        before_archive_index=2,
+        preferred_completed=plan.latest_completed,
+    )
+
+    assert plan.latest_completed is not None
+    assert plan.latest_completed.archive_uri == previous_uri
+    assert requests[0].previous_checkpoint_source_message_ids == ("a1",)
+    assert requests[0].previous_checkpoint_abstract == "Pool saturation was confirmed."
+    assert overview == "# Working Memory\n\nPool saturation was confirmed."
+
+
+async def test_predecessor_walk_replays_only_contiguous_failed_chain(
+    client,
+    monkeypatch,
+):
+    session = client(session_id="phase2_failed_predecessor_chain_test")
+    await session.ensure_exists()
+    await _write_archive(
+        session,
+        1,
+        [_text_message("u1", "user", "completed base")],
+        done={
+            "starting_message_id": "u1",
+            "ending_message_id": "u1",
+            "working_memory_enabled": False,
+            "predecessor_barrier_version": 1,
+            "coverage_start_archive": "archive_001",
+            "coverage_end_archive": "archive_001",
+            "covered_failed_archives": [],
+        },
+    )
+    await _write_archive(
+        session,
+        2,
+        [_text_message("u2", "user", "failed two")],
+        failed=True,
+    )
+    await _write_archive(
+        session,
+        3,
+        [_text_message("u3", "user", "failed three")],
+        failed=True,
+    )
+    current = _text_message("u4", "user", "current four")
+    current_uri = await _write_archive(session, 4, [current], meta={})
+
+    async def unexpected_full_scan(*_args, **_kwargs):
+        raise AssertionError("bounded failed chain must not scan archive history")
+
+    monkeypatch.setattr(session, "_scan_archive_states", unexpected_full_scan)
+    monkeypatch.setattr(session, "_list_archive_refs", unexpected_full_scan)
+
+    plan = await session._resolve_phase2_predecessors(4)
+    messages, start, end, failed, _steps = await session._prepare_phase2_archive_messages(
+        current_uri,
+        [current],
+        predecessor_plan=plan,
+    )
+
+    assert [state.archive_id for state in plan.replay_states] == [
+        "archive_002",
+        "archive_003",
+    ]
+    assert [message.id for message in messages] == ["u2", "u3", "u4"]
+    assert start == "archive_002"
+    assert end == "archive_004"
+    assert failed == ["archive_002", "archive_003"]
+
+
+async def test_pending_predecessor_uses_terminal_notification_without_full_scan(
+    client,
+    monkeypatch,
+):
+    session = client(session_id="phase2_predecessor_notification_test")
+    await session.ensure_exists()
+    await _write_archive(
+        session,
+        1,
+        [_text_message("u1", "user", "completed base")],
+        done={
+            "starting_message_id": "u1",
+            "ending_message_id": "u1",
+            "working_memory_enabled": False,
+            "predecessor_barrier_version": 1,
+            "coverage_start_archive": "archive_001",
+            "coverage_end_archive": "archive_001",
+            "covered_failed_archives": [],
+        },
+    )
+    pending_uri = await _write_archive(
+        session,
+        2,
+        [_text_message("u2", "user", "pending predecessor")],
+    )
+
+    async def unexpected_full_scan(*_args, **_kwargs):
+        raise AssertionError("pending predecessor polling must stay O(1)")
+
+    monkeypatch.setattr(session, "_scan_archive_states", unexpected_full_scan)
+    monkeypatch.setattr(session, "_list_archive_refs", unexpected_full_scan)
+    monkeypatch.setattr("openviking.session.session._ARCHIVE_WAIT_POLL_SECONDS", 10.0)
+    monkeypatch.setattr("openviking.session.session._ARCHIVE_WAIT_MAX_POLL_SECONDS", 10.0)
+
+    waiter = asyncio.create_task(session._resolve_phase2_predecessors(3))
+    await asyncio.sleep(0.02)
+    assert not waiter.done()
+
+    await session._write_failed_marker(
+        pending_uri,
+        stage="synthetic",
+        error="wake the direct successor",
+    )
+    plan = await asyncio.wait_for(waiter, timeout=0.5)
+
+    assert [state.archive_id for state in plan.replay_states] == ["archive_002"]
+    assert plan.latest_completed is not None
+    assert plan.latest_completed.archive_id == "archive_001"
+
+
+async def test_pending_predecessor_timeout_marks_orphan_failed_for_raw_replay(
+    client,
+    monkeypatch,
+):
+    session = client(session_id="phase2_predecessor_orphan_timeout_test")
+    await session.ensure_exists()
+    orphan_uri = await _write_archive(
+        session,
+        1,
+        [_text_message("u1", "user", "orphaned pending predecessor")],
+    )
+    monkeypatch.setattr("openviking.session.session._ARCHIVE_WAIT_POLL_SECONDS", 0.01)
+    monkeypatch.setattr("openviking.session.session._ARCHIVE_WAIT_MAX_POLL_SECONDS", 0.02)
+
+    with pytest.raises(TimeoutError, match="archive_001"):
+        await asyncio.wait_for(
+            session._wait_for_previous_archive_done(2, timeout=0.05),
+            timeout=1.0,
+        )
+
+    failed = json.loads(
+        await session._viking_fs.read_file(f"{orphan_uri}/.failed.json", ctx=session.ctx)
+    )
+    assert failed["stage"] == "phase2_wait_timeout"
+    assert failed["blocked_by"] == "archive_002"
+
+    plan = await session._resolve_phase2_predecessors(2, timeout=0.05)
+    assert [state.archive_id for state in plan.replay_states] == ["archive_001"]
+
+
+async def test_terminal_notification_does_not_hot_loop_on_stale_marker_read(
+    client,
+    monkeypatch,
+):
+    session = client(session_id="phase2_terminal_notification_stale_read_test")
+    await session.ensure_exists()
+    archive = session._archive_ref(session.uri, 1)
+    read_calls = 0
+
+    async def temporarily_stale_state(*_args, **_kwargs):
+        nonlocal read_calls
+        read_calls += 1
+        return ArchiveState(
+            archive_id=archive["archive_id"],
+            archive_uri=archive["archive_uri"],
+            index=archive["index"],
+            state="pending" if read_calls <= 2 else "failed",
+        )
+
+    monkeypatch.setattr(session, "_read_archive_state", temporarily_stale_state)
+    monkeypatch.setattr("openviking.session.session._ARCHIVE_WAIT_POLL_SECONDS", 0.05)
+    monkeypatch.setattr("openviking.session.session._ARCHIVE_WAIT_MAX_POLL_SECONDS", 0.05)
+    monkeypatch.setattr("openviking.session.session._ARCHIVE_WAIT_JITTER_RATIO", 0.0)
+
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    waiter = asyncio.create_task(
+        session._wait_for_archive_terminal(
+            archive,
+            deadline=loop.time() + 1.0,
+            timeout=1.0,
+            blocked_archive_index=2,
+        )
+    )
+    await asyncio.sleep(0.01)
+    session._notify_archive_terminal(archive["archive_uri"])
+    state = await asyncio.wait_for(waiter, timeout=0.5)
+
+    assert state is not None and state.state == "failed"
+    assert read_calls == 3
+    assert loop.time() - started_at >= 0.04
+
+
+async def test_legacy_recovery_scan_is_singleflight_per_session(
+    client,
+    monkeypatch,
+):
+    session = client(session_id="phase2_recovery_scan_singleflight_test")
+    await session.ensure_exists()
+    await _write_archive(
+        session,
+        1,
+        [_text_message("u1", "user", "legacy predecessor")],
+        done={"starting_message_id": "u1", "ending_message_id": "u1"},
+    )
+
+    original_scan = session._scan_archive_states
+    scan_started = asyncio.Event()
+    allow_scan = asyncio.Event()
+    scan_calls = 0
+
+    async def delayed_scan(*, per_archive_delay=0.0):
+        nonlocal scan_calls
+        scan_calls += 1
+        scan_started.set()
+        await allow_scan.wait()
+        return await original_scan(per_archive_delay=0.0)
+
+    monkeypatch.setattr(session, "_scan_archive_states", delayed_scan)
+    first = asyncio.create_task(session._resolve_phase2_predecessors(2))
+    second = asyncio.create_task(session._resolve_phase2_predecessors(2))
+    await asyncio.wait_for(scan_started.wait(), timeout=0.5)
+    allow_scan.set()
+    first_plan, second_plan = await asyncio.gather(first, second)
+
+    assert scan_calls == 1
+    assert first_plan.used_recovery_scan
+    assert second_plan.used_recovery_scan
+
+
+async def test_stale_recovery_listing_has_only_one_bounded_rescan(
+    client,
+    monkeypatch,
+):
+    session = client(session_id="phase2_stale_recovery_listing_test")
+    await session.ensure_exists()
+    scan_calls = 0
+
+    async def stale_scan(*, per_archive_delay=0.0):
+        nonlocal scan_calls
+        scan_calls += 1
+        return []
+
+    monkeypatch.setattr(session, "_scan_archive_states", stale_scan)
+    monkeypatch.setattr("openviking.session.session._ARCHIVE_WAIT_POLL_SECONDS", 0.0)
+
+    states = await asyncio.wait_for(
+        session._scan_archive_states_for_recovery(2),
+        timeout=0.5,
+    )
+
+    assert states == []
+    assert scan_calls == 2
 
 
 async def test_phase2_roll_forward_writes_coverage_and_calls_existing_summary_once(
@@ -436,6 +819,7 @@ async def test_phase2_roll_forward_writes_coverage_and_calls_existing_summary_on
     assert done["coverage_start_archive"] == "archive_001"
     assert done["coverage_end_archive"] == "archive_002"
     assert done["covered_failed_archives"] == ["archive_001"]
+    assert done["predecessor_barrier_version"] == 1
     assert context["latest_archive_overview"].endswith("Both rounds are covered.")
     assert context["messages"] == []
 
