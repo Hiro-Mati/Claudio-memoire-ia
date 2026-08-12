@@ -50,7 +50,8 @@
   },
   "skills": [
     "./skills/install-openviking-memory",
-    "./skills/openviking-context-database"
+    "./skills/openviking-context-database",
+    "./skills/ov-experience-memory"
   ],
   "setup": {
     "providers": [
