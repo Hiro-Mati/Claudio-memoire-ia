@@ -475,6 +475,8 @@ class SubmitWikiBundleTool(Tool):
             raise ValueError("page limit exceeded")
         if len(bundle.files) > self.limits.output_files:
             raise ValueError("file limit exceeded")
+        if len(bundle.pages) + len(bundle.files) > self.limits.output_operations:
+            raise ValueError("combined output operation limit exceeded")
         if not bundle.pages and bundle.links:
             raise ValueError("empty bundle must not contain links")
         if target_type == "skill" and (bundle.pages or bundle.links):

@@ -108,10 +108,16 @@ def test_compile_bundle_schema_distinguishes_wiki_pages_and_artifact_files():
 def test_compile_limit_defaults_match_the_resource_envelope():
     limits = CompileLimits()
 
-    assert limits.concurrent_tasks == 2
+    assert limits.concurrent_tasks == 10
+    assert limits.accepted_tasks == 40
+    assert limits.accepted_tasks_per_principal == 10
+    assert limits.queue_wait_seconds == 60 * 60
     assert limits.task_runtime_seconds == 40 * 60
     assert limits.target_inventory_entries == 2000
     assert limits.target_catalog_pages == 10
+    assert limits.output_pages == 128
+    assert limits.output_files == 128
+    assert limits.output_operations == 256
     assert DirectBackendConfig().allow_compile_exec is False
 
 
@@ -466,6 +472,37 @@ def test_renderer_adds_raw_text_and_workspace_binary_to_same_bundle():
         "viking://resources/wiki/evidence/figures/figure1.png",
     ]
     assert rendered.wiki_uris == ["viking://resources/wiki/overview.md"]
+
+
+@pytest.mark.asyncio
+async def test_compile_rejects_combined_output_operation_overflow():
+    limits = CompileLimits(output_pages=2, output_files=2, output_operations=3)
+    bundle_data = {
+        "pages": [_page(1, "One"), _page(2, "Two")],
+        "files": [
+            {"path": "one.txt", "content": "one"},
+            {"path": "two.txt", "content": "two"},
+        ],
+    }
+    tool = SubmitWikiBundleTool(
+        source_ids={"src_1"},
+        catalog_uris=set(),
+        target_uri="viking://resources/wiki",
+        limits=limits,
+    )
+
+    result = await tool.execute(ToolContext(), **bundle_data)
+
+    assert "combined output operation limit exceeded" in result
+    bundle = WikiBundleDraft.model_validate(bundle_data)
+    with pytest.raises(ValueError, match="combined output operation limit"):
+        WikiRenderer(limits).render(
+            bundle=bundle,
+            target_uri="viking://resources/wiki",
+            source_roots={"src_1": "viking://resources/source"},
+            catalog_uris=set(),
+            existing_raw={},
+        )
 
 
 def test_renderer_accepts_minimal_okf_artifact_with_unknown_fields():
@@ -2723,6 +2760,51 @@ async def test_timeout_salvage_copies_workspace_and_repairs_links(tmp_path: Path
     assert "`[Code](missing.md)`" in topic
     assert result.warnings and "partial output" in result.warnings[0]
     assert any("Skipped" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_timeout_salvage_respects_combined_output_operation_limit(tmp_path: Path):
+    limits = CompileLimits(output_pages=2, output_files=2, output_operations=3)
+    service = _compile_service(
+        tmp_path,
+        auth_mode="api_key",
+        backend=SandboxBackend.DIRECT,
+        limits=limits,
+    )
+    workspace = tmp_path / "workspace"
+    page_root = workspace / "__compile_staging__" / "wiki_pages"
+    page_root.mkdir(parents=True)
+    (workspace / "a.txt").write_text("a", encoding="utf-8")
+    (workspace / "b.txt").write_text("b", encoding="utf-8")
+    (page_root / "c.md").write_text("c", encoding="utf-8")
+    (page_root / "d.md").write_text("d", encoding="utf-8")
+
+    class Client:
+        operations = []
+
+        async def tree(self, uri, *, node_limit):
+            del uri, node_limit
+            return []
+
+        async def batch_write(self, *, root_uri, operations, wait):
+            del root_uri, wait
+            self.operations = operations
+            return {
+                "created": [operation["uri"] for operation in operations],
+                "updated": [],
+                "unchanged": [],
+            }
+
+    client = Client()
+    result = await service._salvage_workspace(
+        client=client,
+        request=_sanitized_compile_request(),
+        workspace=workspace,
+    )
+
+    assert result is not None
+    assert len(client.operations) == limits.output_operations
+    assert result.warnings and any("Skipped 1" in warning for warning in result.warnings)
 
 
 @pytest.mark.asyncio

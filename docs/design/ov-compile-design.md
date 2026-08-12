@@ -552,7 +552,7 @@ Bot 当前没有通用的持久化后台任务管理器，因此这里实现一�
 
 运行中任务目录可以保存有大小限制的 Skill 快照、catalog 和 draft，但不能保存用户凭证。任务进入终态后删除 workspace、Skill snapshot 和 draft；task/result/error JSON 最长保留 24 小时且最多保留 1,000 条，启动和任务结束时都会清理。
 
-VikingBot 使用独立的 compile 并发限制，并对同一 canonical 目标目录串行执行。accepted task 最多排队 5 分钟，取得 target lock 和全局执行 slot 后才开始计算 30 分钟 runtime。该锁只减少同一 Bot 进程内的浪费；跨进程或人工写入冲突仍由 batch-write 的 tree lock 和 content hash 检查解决。v1 task store 以单个 VikingBot gateway 进程为部署边界，不承诺多副本共享 task 查询。
+VikingBot 使用独立的 compile 并发限制，并对同一 canonical 目标目录串行执行。accepted task 最多排队 60 分钟，取得 target lock 和全局执行 slot 后才开始计算 40 分钟 runtime。该锁只减少同一 Bot 进程内的浪费；跨进程或人工写入冲突仍由 batch-write 的 tree lock 和 content hash 检查解决。v1 task store 以单个 VikingBot gateway 进程为部署边界，不承诺多副本共享 task 查询。
 
 VikingBot 启动时把 store 中所有非终态任务统一标记为 `BOT_RESTARTED`，包括处于 committing 的任务；因为 API key 不落盘，重启后不能安全恢复原任务。用户可以重新提交，batch-write 通过最终 content hash 跳过已落盘内容并继续收敛。
 
@@ -567,12 +567,12 @@ v1 先使用集中定义、可测试的 `CompileLimits`，不把常量散落在 
 | target inventory entries / relevance catalog pages | 2,000 / 10 |
 | initial prompt characters | 200,000 |
 | tool URI count / 单次结果 / 任务累计结果 | 32 / 1 MiB / 8 MiB |
-| output pages / 最终总大小 | 64 / 4 MiB |
-| concurrent Compile tasks / task runtime | 2 / 30 min |
-| accepted tasks（全局 / 单 principal）/ queue wait | 16 / 4 / 5 min |
+| output pages / files / combined operations / 最终总大小 | 128 / 128 / 256 / 4 MiB |
+| concurrent Compile tasks / task runtime | 10 / 40 min |
+| accepted tasks（全局 / 单 principal）/ queue wait | 40 / 10 / 60 min |
 | terminal task retention / records | 24 h / 1,000 |
 
-OpenViking batch-write 自己还要设置独立的 request 上限，至少覆盖 Compile 的 64 pages / 4 MiB，但不能信任 Bot 已经做过限制。超限统一返回 `RESOURCE_EXHAUSTED`。
+OpenViking batch-write 自己还要设置独立的 request 上限，至少覆盖 Compile 的 256 combined operations / 4 MiB，但不能信任 Bot 已经做过限制。超限统一返回 `RESOURCE_EXHAUSTED`。
 
 ## 11. 错误处理
 

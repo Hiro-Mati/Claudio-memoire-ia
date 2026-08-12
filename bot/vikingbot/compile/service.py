@@ -924,6 +924,7 @@ class BotCompileService:
                 output_key in output_keys
                 or (is_page and page_files >= self.limits.output_pages)
                 or (not is_page and artifact_files >= self.limits.output_files)
+                or len(files) >= self.limits.output_operations
                 or total_bytes + len(payload) > self.limits.output_total_bytes
             ):
                 skipped_files += 1

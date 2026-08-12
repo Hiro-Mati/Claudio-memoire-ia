@@ -370,6 +370,8 @@ class WikiRenderer:
             raise ValueError("Wiki bundle exceeds the page limit")
         if len(bundle.files) > self.limits.output_files:
             raise ValueError("Wiki bundle exceeds the file limit")
+        if len(bundle.pages) + len(bundle.files) > self.limits.output_operations:
+            raise ValueError("Wiki bundle exceeds the combined output operation limit")
         if not bundle.pages and bundle.links:
             raise ValueError("an empty Wiki bundle cannot contain links")
         target_type = context_type_for_uri(target_uri)
