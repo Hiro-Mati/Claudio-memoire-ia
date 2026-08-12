@@ -600,6 +600,173 @@ async def test_streaming_memory_updater_batches_non_append_only_submits(monkeypa
     assert sorted(result1.metadata["unscoped_written_uris"]) == sorted([op1.uris[0], op2.uris[0]])
 
 
+@pytest.mark.asyncio
+async def test_streaming_memory_updater_continues_case_queue_after_one_merge_failure(monkeypatch):
+    registry = _registry()
+    registry.get("cases").operation_mode = "upsert"
+    bad_case_name = "bad_case"
+    merge_attempts: list[str] = []
+    applied_uris: list[str] = []
+
+    async def fake_merge_requests(self, requests):
+        del self
+        assert len(requests) == 1
+        operation = requests[0].operations.upsert_operations[0]
+        case_name = operation.memory_fields["case_name"]
+        merge_attempts.append(case_name)
+        if case_name == bad_case_name:
+            raise MemoryMergePlanError("synthetic bad case merge")
+        return ResolvedOperations(
+            upsert_operations=[operation],
+            delete_file_contents=[],
+            errors=[],
+        )
+
+    async def fake_apply_operations(self, *, operations, request, messages):
+        del self, request, messages
+        result = MemoryUpdateResult()
+        for operation in operations.upsert_operations:
+            for uri in operation.uris or []:
+                applied_uris.append(uri)
+                result.add_written(uri)
+        return result
+
+    monkeypatch.setattr(StreamingMemoryUpdater, "_merge_requests", fake_merge_requests)
+    monkeypatch.setattr(StreamingMemoryUpdater, "_apply_operations", fake_apply_operations)
+
+    updater = StreamingMemoryUpdater(
+        registry=registry,
+        config=StreamingMemoryUpdaterConfig(
+            max_operations_per_update=8,
+            max_wait_seconds=1.0,
+            timer_check_interval_seconds=0.01,
+        ),
+    )
+    names = [f"good_case_{index}" for index in range(8)]
+    names.insert(6, bad_case_name)
+    requests = [
+        MemoryUpdateRequest(
+            operations=ResolvedOperations(
+                upsert_operations=[_case_op(name)],
+                delete_file_contents=[],
+                errors=[],
+            ),
+            messages=[Message(id=f"m-{name}", role="user", parts=[TextPart(name)])],
+            ctx=_ctx(),
+        )
+        for name in names
+    ]
+
+    outcomes = await asyncio.gather(
+        *(updater.submit(request) for request in requests),
+        return_exceptions=True,
+    )
+    await updater.close()
+
+    failures = [outcome for outcome in outcomes if isinstance(outcome, Exception)]
+    successes = [
+        outcome for outcome in outcomes if isinstance(outcome, StreamingMemoryUpdateResult)
+    ]
+    assert merge_attempts == names
+    assert len(failures) == 1
+    assert str(failures[0]) == "synthetic bad case merge"
+    assert len(successes) == 8
+
+    bad_uri = _case_op(bad_case_name).uris[0]
+    good_uris = {_case_op(name).uris[0] for name in names if name != bad_case_name}
+    assert bad_uri not in applied_uris
+    assert set(applied_uris) == good_uris
+    assert len(applied_uris) == len(good_uris)
+    assert all(
+        outcome.apply_result.written_uris
+        == [requests[index].operations.upsert_operations[0].uris[0]]
+        for index, outcome in enumerate(outcomes)
+        if isinstance(outcome, StreamingMemoryUpdateResult)
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_memory_updater_bisects_merge_failure_before_apply(monkeypatch):
+    bad_note_name = "bad_note"
+    merge_attempts: list[list[str]] = []
+    applied_uris: list[str] = []
+
+    async def fake_merge_requests(self, requests):
+        del self
+        operations = [
+            operation for request in requests for operation in request.operations.upsert_operations
+        ]
+        names = [operation.memory_fields["note_name"] for operation in operations]
+        merge_attempts.append(names)
+        if bad_note_name in names:
+            raise MemoryMergePlanError("synthetic bad note merge")
+        return ResolvedOperations(
+            upsert_operations=operations,
+            delete_file_contents=[],
+            errors=[],
+        )
+
+    async def fake_apply_operations(self, *, operations, request, messages):
+        del self, request, messages
+        # Bisection must finish before the first write-capable apply begins.
+        assert [bad_note_name] in merge_attempts
+        result = MemoryUpdateResult()
+        for operation in operations.upsert_operations:
+            for uri in operation.uris or []:
+                applied_uris.append(uri)
+                result.add_written(uri)
+        return result
+
+    monkeypatch.setattr(StreamingMemoryUpdater, "_merge_requests", fake_merge_requests)
+    monkeypatch.setattr(StreamingMemoryUpdater, "_apply_operations", fake_apply_operations)
+
+    updater = StreamingMemoryUpdater(
+        registry=_registry(),
+        config=StreamingMemoryUpdaterConfig(
+            max_operations_per_update=8,
+            max_wait_seconds=1.0,
+            timer_check_interval_seconds=0.01,
+        ),
+    )
+    names = [f"good_note_{index}" for index in range(8)]
+    names.insert(6, bad_note_name)
+    requests = [
+        MemoryUpdateRequest(
+            operations=ResolvedOperations(
+                upsert_operations=[_note_op(name)],
+                delete_file_contents=[],
+                errors=[],
+            ),
+            messages=[Message(id=f"m-{name}", role="user", parts=[TextPart(name)])],
+            ctx=_ctx(),
+        )
+        for name in names
+    ]
+
+    outcomes = await asyncio.gather(
+        *(updater.submit(request) for request in requests),
+        return_exceptions=True,
+    )
+    await updater.close()
+
+    failures = [outcome for outcome in outcomes if isinstance(outcome, Exception)]
+    successes = [
+        outcome for outcome in outcomes if isinstance(outcome, StreamingMemoryUpdateResult)
+    ]
+    assert merge_attempts[0] == names[:8]
+    assert [bad_note_name] in merge_attempts
+    assert names[8:] in merge_attempts
+    assert len(failures) == 1
+    assert str(failures[0]) == "synthetic bad note merge"
+    assert len(successes) == 8
+
+    bad_uri = _note_op(bad_note_name).uris[0]
+    good_uris = {_note_op(name).uris[0] for name in names if name != bad_note_name}
+    assert bad_uri not in applied_uris
+    assert set(applied_uris) == good_uris
+    assert len(applied_uris) == len(good_uris)
+
+
 def test_scope_memory_update_result_to_submitter_filters_shared_batch_by_source():
     from openviking.session.memory.streaming_memory_updater import (
         scope_memory_update_result_to_submitter,
