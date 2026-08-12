@@ -1,12 +1,12 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Unified document parser backed by AnyDoc."""
+"""Unified AnyDoc parser for Office documents and EPUB files."""
 
 import asyncio
 import html
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Union
@@ -28,7 +28,6 @@ class _RenderedDocument:
     warnings: list[str]
     assets_referenced: int
     images_extracted: int
-    meta: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -712,11 +711,9 @@ class _AnyDocMarkdownRenderer:
 
 
 class AnyDocParser(BaseParser):
-    """Parse document formats through AnyDoc and build their context tree."""
+    """Parse the existing Office/EPUB formats through AnyDoc's document model."""
 
     _SUPPORTED_EXTENSIONS = [".doc", ".docx", ".pptx", ".xls", ".xlsx", ".xlsm", ".epub"]
-    _PARSER_NAME = "AnyDocParser"
-    _PARSER_VERSION = "1.0"
 
     def __init__(self, config: Optional[ParserConfig] = None):
         from openviking.parse.parsers.markdown import MarkdownParser
@@ -757,8 +754,8 @@ class AnyDocParser(BaseParser):
             **markdown_kwargs,
         )
         result.source_format = path.suffix.lower().lstrip(".")
-        result.parser_name = self._PARSER_NAME
-        result.parser_version = self._PARSER_VERSION
+        result.parser_name = "AnyDocParser"
+        result.parser_version = "1.0"
         result.parse_time = time.time() - started
         result.warnings.extend(rendered.warnings)
         result.meta.update(
@@ -769,7 +766,6 @@ class AnyDocParser(BaseParser):
                 "assets_referenced": rendered.assets_referenced,
                 "images_extracted": rendered.images_extracted,
                 "intermediate_markdown_length": len(rendered.markdown),
-                **rendered.meta,
             }
         )
         return result
@@ -782,109 +778,6 @@ class AnyDocParser(BaseParser):
         selected_format = detected_format or anydoc.format_from_extension(path.suffix)
         if selected_format is None:
             raise anydoc.UnsupportedError(f"Unrecognized document format: {path.name}")
-
-        if selected_format == "pdf":
-            conversion = anydoc.pdf_to_markdown_with_images(data)
-            images_by_name: dict[str, Any] = {}
-            for image in conversion.images:
-                filename = Path(image.filename)
-                if (
-                    filename.name != image.filename
-                    or "/" in image.filename
-                    or "\\" in image.filename
-                    or filename.suffix.lower() != ".png"
-                ):
-                    raise ValueError(
-                        f"AnyDoc returned an invalid PDF image filename: {image.filename!r}"
-                    )
-                if image.filename in images_by_name:
-                    raise ValueError(
-                        f"AnyDoc returned duplicate PDF image filename: {image.filename!r}"
-                    )
-                images_by_name[image.filename] = image
-
-            referenced_images = {
-                match.group(2)
-                for match in self._markdown_parser._image_pattern.finditer(conversion.markdown)
-            }
-            unreferenced_images = images_by_name.keys() - referenced_images
-            if unreferenced_images:
-                filenames = ", ".join(sorted(unreferenced_images))
-                raise ValueError(f"AnyDoc returned PDF images absent from Markdown: {filenames}")
-
-            image_paths: dict[str, Optional[str]] = {}
-            warnings: list[str] = []
-            rendered_warnings: set[tuple[int, str]] = set()
-            images_extracted = 0
-
-            for image in images_by_name.values():
-                filename = Path(image.filename)
-                image_paths[image.filename] = None
-                if is_valid_image(image.data, filename):
-                    try:
-                        saved_path = storage.save_image(
-                            resource_name,
-                            image.data,
-                            filename=filename.stem,
-                            extension=filename.suffix,
-                        )
-                        image_paths[image.filename] = saved_path.relative_to(
-                            storage.media_dir
-                        ).as_posix()
-                        images_extracted += 1
-                    except Exception as exc:
-                        warnings.append(f"Failed to save PDF image {image.filename}: {exc}")
-                else:
-                    warnings.append(f"PDF image {image.filename} is not ingestable")
-
-                for warning_code in image.warnings:
-                    warning_key = (image.page, warning_code)
-                    if warning_key not in rendered_warnings:
-                        rendered_warnings.add(warning_key)
-                        warnings.append(
-                            f"PDF page {image.page} image rendering warning: {warning_code}"
-                        )
-
-            def replace_image(match: re.Match[str]) -> str:
-                target = match.group(2)
-                if target not in image_paths:
-                    return match.group(0)
-                saved_path = image_paths[target]
-                return f"![{match.group(1)}]({saved_path})" if saved_path else match.group(1)
-
-            markdown = self._markdown_parser._image_pattern.sub(replace_image, conversion.markdown)
-            if not markdown.strip():
-                raise anydoc.MalformedError(f"No meaningful content extracted from {path.name}")
-
-            ocr_reasons = {
-                reason.page: list(reason.reasons) for reason in conversion.ocr_reasons_by_page
-            }
-            for page in conversion.pages_needing_ocr:
-                reasons = ocr_reasons.get(page, [])
-                suffix = f": {', '.join(reasons)}" if reasons else ""
-                warnings.append(f"PDF page {page} requires OCR{suffix}")
-            if conversion.has_encoding_issues:
-                warnings.append("PDF contains broken font encodings; extracted text may be garbled")
-
-            return _RenderedDocument(
-                markdown=markdown,
-                detected_format=detected_format or selected_format,
-                warnings=warnings,
-                assets_referenced=len(conversion.images),
-                images_extracted=images_extracted,
-                meta={
-                    "total_pages": conversion.page_count,
-                    "pages_needing_ocr": list(conversion.pages_needing_ocr),
-                    "ocr_reasons_by_page": [
-                        {"page": page, "reasons": reasons} for page, reasons in ocr_reasons.items()
-                    ],
-                    "pages_with_tables": list(conversion.pages_with_tables),
-                    "pages_with_columns": list(conversion.pages_with_columns),
-                    "is_complex_layout": conversion.is_complex_layout,
-                    "has_encoding_issues": conversion.has_encoding_issues,
-                },
-            )
-
         document = anydoc.to_document(data, selected_format)
         renderer = _AnyDocMarkdownRenderer(
             document,
