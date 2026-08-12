@@ -11,7 +11,7 @@ OpenViking 支持多种资源类型，按照功能分类如下：
 文档类
 | 类型 | 扩展名 | 说明 |
 |------|--------|------|
-| PDF | `.pdf` | 由 pdf-inspector 提取分页文本、标题、表格和阅读顺序，pdfplumber 在每页正文后提取图片；需要 OCR 的页面会保留并给出明确警告 |
+| PDF | `.pdf` | 通过 AnyDoc 提取文本、标题、表格和图片；图片按原始位置写入 Markdown，并返回需要 OCR 的页面和编码异常等诊断信息 |
 | Markdown | `.md`, `.markdown`, `.mdown`, `.mkd` | 原生支持，会提取结构并分段存储 |
 | HTML | `.html`, `.htm` | 清理导航/广告后提取内容，转换为 Markdown |
 | Word | `.doc`, `.docx` | 通过 AnyDoc 将文本、标题、表格和嵌入图片的原始位置转换为 Markdown |

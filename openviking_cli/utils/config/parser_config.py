@@ -137,23 +137,7 @@ class ParserConfig:
 
 @dataclass
 class PDFConfig(ParserConfig):
-    """Configuration for local PDF parsing."""
-
-    # Image extraction configuration
-    image_resolution: int = 300  # Rendering DPI for extracted image regions
-
-    def validate(self) -> None:
-        """
-        Validate configuration.
-
-        Raises:
-            ValueError: If configuration is invalid
-        """
-        # Validate base class fields
-        super().validate()
-
-        if self.image_resolution <= 0:
-            raise ValueError("image_resolution must be positive")
+    """Configuration for PDF parsing."""
 
 
 @dataclass
@@ -707,7 +691,7 @@ def load_parser_configs_from_dict(config_dict: Dict[str, Any]) -> Dict[str, Pars
 
     Examples:
         >>> configs = load_parser_configs_from_dict({
-        ...     "pdf": {"image_resolution": 300},
+        ...     "pdf": {"max_section_size": 4000},
         ...     "code": {"github_raw_domain": "raw.githubusercontent.com"}
         ... })
         >>> pdf_config = configs["pdf"]

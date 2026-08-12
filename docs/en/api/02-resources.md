@@ -12,7 +12,7 @@ OpenViking supports various resource types, categorized by functionality:
 
 | Type | Extensions | Description |
 |------|------------|-------------|
-| PDF | `.pdf` | Uses pdf-inspector for page text, headings, tables, and reading order; pdfplumber extracts images after each page's text. Pages that require OCR are kept with explicit warnings |
+| PDF | `.pdf` | Uses AnyDoc to extract text, headings, tables, and images. Images stay at their original Markdown positions, with diagnostics for pages requiring OCR and broken encodings |
 | Markdown | `.md`, `.markdown`, `.mdown`, `.mkd` | Native support, extracts structure and stores in segments |
 | HTML | `.html`, `.htm` | Cleans navigation/ads and extracts content, converts to Markdown |
 | Word | `.doc`, `.docx` | Uses AnyDoc to preserve text, headings, tables, and embedded image positions in Markdown |
