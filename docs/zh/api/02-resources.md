@@ -11,7 +11,7 @@ OpenViking 支持多种资源类型，按照功能分类如下：
 文档类
 | 类型 | 扩展名 | 说明 |
 |------|--------|------|
-| PDF | `.pdf` | 支持本地解析和 MinerU API 转换 |
+| PDF | `.pdf` | 本地提取文本、表格、图片和文档结构 |
 | Markdown | `.md`, `.markdown`, `.mdown`, `.mkd` | 原生支持，会提取结构并分段存储 |
 | HTML | `.html`, `.htm` | 清理导航/广告后提取内容，转换为 Markdown |
 | Word | `.docx` | 提取文本、标题、表格并转换为 Markdown |

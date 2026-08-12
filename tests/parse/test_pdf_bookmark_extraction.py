@@ -4,7 +4,7 @@
 Tests for PDF bookmark/outline extraction in PDFParser.
 
 Verifies that _extract_bookmarks correctly extracts bookmark entries
-and that _convert_local injects them as markdown headings.
+and that PDF conversion injects them as markdown headings.
 """
 
 from contextlib import nullcontext
@@ -90,7 +90,7 @@ class _FakeImagePage:
 
 
 class _FakePage:
-    """Minimal pdfplumber page stub for _convert_local tests."""
+    """Minimal pdfplumber page stub for PDF conversion tests."""
 
     def __init__(self, text: str):
         self._text = text
@@ -267,11 +267,11 @@ class TestExtractBookmarks:
         assert bookmarks == []
 
 
-class TestConvertLocalBookmarks:
-    """Test bookmark injection behavior in local PDF conversion."""
+class TestConvertPDFBookmarks:
+    """Test bookmark injection behavior in PDF conversion."""
 
     @pytest.mark.asyncio
-    async def test_convert_local_skips_unresolved_bookmarks(self):
+    async def test_convert_to_markdown_skips_unresolved_bookmarks(self):
         parser = PDFParser()
         fake_pdf = SimpleNamespace(pages=[_FakePage("Page one"), _FakePage("Page two")])
         fake_pdfplumber = SimpleNamespace(open=lambda _path: nullcontext(fake_pdf))
@@ -287,7 +287,7 @@ class TestConvertLocalBookmarks:
                 ],
             ),
         ):
-            markdown, meta = await parser._convert_local(
+            markdown, meta = await parser._convert_to_markdown(
                 "dummy.pdf", storage=MagicMock(), resource_name="dummy"
             )
 
@@ -300,7 +300,7 @@ class TestConvertLocalBookmarks:
         assert meta["heading_source"] == "bookmarks"
 
     @pytest.mark.asyncio
-    async def test_convert_local_falls_back_to_font_when_bookmarks_unresolved(self):
+    async def test_convert_to_markdown_falls_back_to_font_when_bookmarks_unresolved(self):
         parser = PDFParser()
         fake_pdf = SimpleNamespace(pages=[_FakePage("Page one"), _FakePage("Page two")])
         fake_pdfplumber = SimpleNamespace(open=lambda _path: nullcontext(fake_pdf))
@@ -318,7 +318,7 @@ class TestConvertLocalBookmarks:
                 return_value=[{"level": 1, "title": "Font Heading", "page_num": 2}],
             ),
         ):
-            markdown, meta = await parser._convert_local(
+            markdown, meta = await parser._convert_to_markdown(
                 "dummy.pdf", storage=MagicMock(), resource_name="dummy"
             )
 
@@ -331,7 +331,7 @@ class TestConvertLocalBookmarks:
         assert meta["heading_source"] == "font_analysis"
 
     @pytest.mark.asyncio
-    async def test_convert_local_skips_images_stacked_on_same_bbox(self):
+    async def test_convert_to_markdown_skips_images_stacked_on_same_bbox(self):
         """Two image XObjects at the same spot must render (and save) only once."""
         parser = PDFParser()
         stacked = {"x0": 0.0, "top": 0.1, "x1": 595.0, "bottom": 841.9}
@@ -349,7 +349,7 @@ class TestConvertLocalBookmarks:
             patch.object(parser, "_detect_headings_by_font", return_value=[]),
             patch.object(parser, "_extract_image_from_page", return_value=b"png") as extract,
         ):
-            markdown, meta = await parser._convert_local(
+            markdown, meta = await parser._convert_to_markdown(
                 "dummy.pdf", storage=storage, resource_name="dummy"
             )
 
@@ -361,7 +361,7 @@ class TestConvertLocalBookmarks:
         assert markdown.count("![Page 1 Image") == 1
 
     @pytest.mark.asyncio
-    async def test_convert_local_skips_images_rendering_to_same_bytes(self):
+    async def test_convert_to_markdown_skips_images_rendering_to_same_bytes(self):
         """Distinct bboxes that still render identically are caught by the hash."""
         parser = PDFParser()
         page = _FakePage("Page one")
@@ -381,7 +381,7 @@ class TestConvertLocalBookmarks:
             patch.object(parser, "_detect_headings_by_font", return_value=[]),
             patch.object(parser, "_extract_image_from_page", return_value=b"png") as extract,
         ):
-            _markdown, meta = await parser._convert_local(
+            _markdown, meta = await parser._convert_to_markdown(
                 "dummy.pdf", storage=storage, resource_name="dummy"
             )
 
@@ -392,7 +392,7 @@ class TestConvertLocalBookmarks:
         assert meta["images_deduplicated"] == 1
 
     @pytest.mark.asyncio
-    async def test_convert_local_keeps_distinct_images_and_repeats_across_pages(self):
+    async def test_convert_to_markdown_keeps_distinct_images_and_repeats_across_pages(self):
         """Dedup is per-page: a logo on every page survives on every page."""
         parser = PDFParser()
         logo = {"x0": 0.0, "top": 0.0, "x1": 50.0, "bottom": 50.0}
@@ -423,7 +423,7 @@ class TestConvertLocalBookmarks:
                 ],
             ),
         ):
-            _markdown, meta = await parser._convert_local(
+            _markdown, meta = await parser._convert_to_markdown(
                 "dummy.pdf", storage=storage, resource_name="dummy"
             )
 
@@ -431,7 +431,7 @@ class TestConvertLocalBookmarks:
         assert meta["images_deduplicated"] == 0
 
     @pytest.mark.asyncio
-    async def test_convert_local_closes_page_after_each_page(self):
+    async def test_convert_to_markdown_closes_page_after_each_page(self):
         parser = PDFParser()
         pages = [_FakePage("Page one"), _FakePage("Page two")]
         fake_pdf = SimpleNamespace(pages=pages)
@@ -442,7 +442,9 @@ class TestConvertLocalBookmarks:
             patch.object(parser, "_extract_bookmarks", return_value=[]),
             patch.object(parser, "_detect_headings_by_font", return_value=[]),
         ):
-            await parser._convert_local("dummy.pdf", storage=MagicMock(), resource_name="dummy")
+            await parser._convert_to_markdown(
+                "dummy.pdf", storage=MagicMock(), resource_name="dummy"
+            )
 
         assert [page.close_count for page in pages] == [1, 1]
         assert [page.flush_count for page in pages] == [1, 1]

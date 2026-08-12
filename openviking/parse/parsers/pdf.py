@@ -3,13 +3,8 @@
 """
 PDF parser for OpenViking.
 
-Unified parser that converts PDF to Markdown then parses the result.
-Supports dual strategy:
-- Local: pdfplumber for direct conversion
-- Remote: MinerU API for advanced conversion
-
-This design simplifies PDF handling by delegating structure analysis
-to the MarkdownParser after conversion.
+Converts PDF to Markdown with pdfplumber, then delegates structure analysis
+to the MarkdownParser.
 """
 
 import asyncio
@@ -37,30 +32,15 @@ logger = get_logger(__name__)
 
 class PDFParser(BaseParser):
     """
-    PDF parser with dual conversion strategy.
+    PDF parser backed by pdfplumber.
 
     Converts PDF → Markdown → ParseResult using MarkdownParser.
     When available, extracts PDF bookmarks/outlines and injects them as
     markdown headings so MarkdownParser can build a hierarchical directory
     structure instead of flat numbered files.
 
-    Strategies:
-    - "local": Use pdfplumber for text and table extraction
-    - "mineru": Use MinerU API for advanced PDF processing
-    - "auto": Try local first, fallback to MinerU if configured
-
     Examples:
-        >>> # Local parsing
-        >>> parser = PDFParser(PDFConfig(strategy="local"))
-        >>> result = await parser.parse("document.pdf")
-
-        >>> # Remote API parsing
-        >>> config = PDFConfig(
-        ...     strategy="mineru",
-        ...     mineru_endpoint="https://api.example.com/convert",
-        ...     mineru_api_key="key"
-        ... )
-        >>> parser = PDFParser(config)
+        >>> parser = PDFParser(PDFConfig())
         >>> result = await parser.parse("document.pdf")
     """
 
@@ -69,7 +49,7 @@ class PDFParser(BaseParser):
         Initialize PDF parser.
 
         Args:
-            config: PDFConfig instance (defaults to auto strategy)
+            config: PDFConfig instance
         """
         self.config = config or PDFConfig()
         self.config.validate()
@@ -103,7 +83,7 @@ class PDFParser(BaseParser):
 
         Raises:
             FileNotFoundError: If PDF file doesn't exist
-            ValueError: If conversion fails with all strategies
+            ValueError: If PDF conversion fails
         """
         start_time = time.time()
         pdf_path = Path(source)
@@ -146,10 +126,9 @@ class PDFParser(BaseParser):
             # Step 3: Update metadata for PDF origin
             result.source_format = "pdf"  # Override markdown format
             result.parser_name = "PDFParser"
-            result.parser_version = "2.0"
+            result.parser_version = "3.0"
             result.parse_time = time.time() - start_time
             result.meta.update(conversion_meta)
-            result.meta["pdf_strategy"] = self.config.strategy
             result.meta["intermediate_markdown_length"] = len(markdown_content)
             result.meta["intermediate_markdown_preview"] = markdown_content[:500]
 
@@ -175,60 +154,31 @@ class PDFParser(BaseParser):
     async def _convert_to_markdown(
         self,
         pdf_path: Path,
+        storage=None,
         resource_name: Optional[str] = None,
     ) -> tuple[str, Dict[str, Any]]:
         """
-        Convert PDF to Markdown using configured strategy.
+        Convert PDF to Markdown with pdfplumber without blocking the event loop.
 
         Args:
             pdf_path: Path to PDF file
+            storage: Optional storage instance for extracted images
             resource_name: Optional resource name for organizing saved images
 
         Returns:
             Tuple of (markdown_content, metadata_dict)
-
-        Raises:
-            ValueError: If all conversion strategies fail
         """
-        if self.config.strategy == "local":
-            return await self._convert_local(pdf_path, resource_name=resource_name)
+        return await asyncio.to_thread(
+            self._convert_to_markdown_sync,
+            pdf_path,
+            storage,
+            resource_name,
+        )
 
-        elif self.config.strategy == "mineru":
-            return await self._convert_mineru(pdf_path, resource_name=resource_name)
-
-        elif self.config.strategy == "auto":
-            # Try local first
-            try:
-                return await self._convert_local(pdf_path, resource_name=resource_name)
-            except Exception as e:
-                logger.warning(f"Local conversion failed: {e}")
-
-                # Fallback to MinerU if configured
-                if self.config.mineru_endpoint:
-                    logger.info("Falling back to MinerU API")
-                    return await self._convert_mineru(pdf_path, resource_name=resource_name)
-                else:
-                    raise ValueError(
-                        f"Local conversion failed and no MinerU endpoint configured: {e}"
-                    )
-
-        else:
-            raise ValueError(f"Unknown strategy: {self.config.strategy}")
-
-    async def _convert_local(
+    def _convert_to_markdown_sync(
         self, pdf_path: Path, storage=None, resource_name: Optional[str] = None
     ) -> tuple[str, Dict[str, Any]]:
-        # pdfplumber / pdfminer 的解析与图片/表格提取通常是 CPU/IO 密集且为同步实现，
-        # 放到线程池中执行，避免阻塞事件循环。
-        return await asyncio.to_thread(self._convert_local_sync, pdf_path, storage, resource_name)
-
-    def _convert_local_sync(
-        self, pdf_path: Path, storage=None, resource_name: Optional[str] = None
-    ) -> tuple[str, Dict[str, Any]]:
-        """同步版：用 pdfplumber 将 PDF 转 Markdown。
-
-        该方法会在 :meth:`_convert_local` 中通过 asyncio.to_thread 调用。
-        """
+        """Convert PDF to Markdown synchronously with pdfplumber."""
         pdfplumber = lazy_import("pdfplumber")
 
         # Import storage utilities
@@ -242,7 +192,6 @@ class PDFParser(BaseParser):
 
         parts = []
         meta = {
-            "strategy": "local",
             "library": "pdfplumber",
             "pages_processed": 0,
             "images_extracted": 0,
@@ -678,83 +627,6 @@ class PDFParser(BaseParser):
         except Exception as e:
             logger.debug(f"Image extraction error: {e}")
             return None
-
-    async def _convert_mineru(
-        self,
-        pdf_path: Path,
-        resource_name: Optional[str] = None,
-    ) -> tuple[str, Dict[str, Any]]:
-        """
-        Convert PDF to Markdown using MinerU API.
-
-        Args:
-            pdf_path: Path to PDF file
-            resource_name: Optional resource name (unused in MinerU conversion)
-
-        Returns:
-            Tuple of (markdown_content, metadata)
-
-        Raises:
-            ImportError: If httpx not installed
-            Exception: If API call fails
-        """
-        httpx = lazy_import("httpx")
-
-        if not self.config.mineru_endpoint:
-            raise ValueError("MinerU endpoint not configured")
-
-        meta = {
-            "strategy": "mineru",
-            "endpoint": self.config.mineru_endpoint,
-            "api_version": None,
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=self.config.mineru_timeout) as client:
-                # Prepare file upload
-                with open(pdf_path, "rb") as f:
-                    files = {"file": (pdf_path.name, f, "application/pdf")}
-
-                    # Prepare headers
-                    headers = {}
-                    if self.config.mineru_api_key:
-                        headers["Authorization"] = f"Bearer {self.config.mineru_api_key}"
-
-                    # Prepare request params
-                    params = self.config.mineru_params or {}
-
-                    # Make API request
-                    logger.info(f"Calling MinerU API: {self.config.mineru_endpoint}")
-                    response = await client.post(
-                        self.config.mineru_endpoint,
-                        files=files,
-                        headers=headers,
-                        params=params,
-                    )
-                    response.raise_for_status()
-
-                # Parse response
-                result = response.json()
-                markdown_content = result.get("markdown", "")
-
-                # Extract metadata from response
-                meta["api_version"] = result.get("version")
-                meta["processing_time"] = result.get("processing_time")
-                meta["total_pages"] = result.get("total_pages")
-
-                if not markdown_content:
-                    logger.warning(f"MinerU returned empty content for {pdf_path}")
-
-                logger.info(
-                    f"MinerU conversion: {meta.get('total_pages', '?')} pages → "
-                    f"{len(markdown_content)} chars"
-                )
-
-                return markdown_content, meta
-
-        except Exception as e:
-            logger.error(f"MinerU API call failed: {e}")
-            raise
 
     def _format_table_markdown(self, table: List[List[Optional[str]]]) -> str:
         """

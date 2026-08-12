@@ -12,7 +12,7 @@ OpenViking supports various resource types, categorized by functionality:
 
 | Type | Extensions | Description |
 |------|------------|-------------|
-| PDF | `.pdf` | Supports local parsing and MinerU API conversion |
+| PDF | `.pdf` | Locally extracts text, tables, images, and document structure |
 | Markdown | `.md`, `.markdown`, `.mdown`, `.mkd` | Native support, extracts structure and stores in segments |
 | HTML | `.html`, `.htm` | Cleans navigation/ads and extracts content, converts to Markdown |
 | Word | `.docx` | Extracts text, headings, tables and converts to Markdown |

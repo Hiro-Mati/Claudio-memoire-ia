@@ -140,26 +140,12 @@ class PDFConfig(ParserConfig):
     """
     Configuration for PDF parsing.
 
-    Supports three strategies:
-    - "local": Use pdfplumber for local PDF→Markdown conversion
-    - "mineru": Use MinerU API for remote PDF→Markdown conversion
-    - "auto": Try local first, fallback to MinerU if available
-
     Attributes:
-        strategy: Parsing strategy ("local" | "mineru" | "auto")
-        mineru_endpoint: MinerU API endpoint URL
-        mineru_api_key: MinerU API authentication key
-        mineru_timeout: MinerU request timeout in seconds
-        mineru_params: Additional MinerU API parameters
+        heading_detection: Heading detection mode
+        font_heading_min_delta: Minimum font size delta from body text
+        max_heading_levels: Maximum heading levels for font analysis
+        image_resolution: Rendering DPI for extracted image regions
     """
-
-    strategy: str = "auto"  # "local" | "mineru" | "auto"
-
-    # MinerU API configuration
-    mineru_endpoint: Optional[str] = None  # API endpoint URL
-    mineru_api_key: Optional[str] = None  # API authentication key
-    mineru_timeout: float = 300.0  # Request timeout in seconds (5 minutes)
-    mineru_params: Optional[dict] = None  # Additional API parameters
 
     # Heading detection configuration
     heading_detection: str = "auto"  # "bookmarks" | "font" | "auto" | "none"
@@ -180,18 +166,6 @@ class PDFConfig(ParserConfig):
         super().validate()
 
         # Validate PDF-specific fields
-        if self.strategy not in ("local", "mineru", "auto"):
-            raise ValueError(
-                f"Invalid strategy '{self.strategy}'. Must be 'local', 'mineru', or 'auto'"
-            )
-
-        if self.strategy == "mineru":
-            if not self.mineru_endpoint:
-                raise ValueError("mineru_endpoint is required when strategy='mineru'")
-
-        if self.mineru_timeout <= 0:
-            raise ValueError("mineru_timeout must be positive")
-
         if self.heading_detection not in ("bookmarks", "font", "auto", "none"):
             raise ValueError(f"Invalid heading_detection: {self.heading_detection}")
 
@@ -840,7 +814,7 @@ def load_parser_configs_from_dict(config_dict: Dict[str, Any]) -> Dict[str, Pars
 
     Examples:
         >>> configs = load_parser_configs_from_dict({
-        ...     "pdf": {"strategy": "auto"},
+        ...     "pdf": {"heading_detection": "auto"},
         ...     "code": {"github_raw_domain": "raw.githubusercontent.com"}
         ... })
         >>> pdf_config = configs["pdf"]
