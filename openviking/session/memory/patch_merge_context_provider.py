@@ -147,8 +147,8 @@ class PatchMergeContextProvider(SessionExtractContextProvider):
 When merging `experiences`, every synthesized upsert must keep the skill-loader
 format: put the full runtime-facing Markdown in the `constraint` field, with
 exactly these top-level sections: `## Situation`, `## Reminder`, `## Procedure`,
-and `## Anti-pattern`. Do not output only a production reminder such as
-`# name` plus `## 规则`; convert that content into the four sections. Preserve
+`## Verification`, `## Fallback`, and `## Anti-pattern`. Do not output only a production reminder such as
+`# name` plus `## 规则`; convert that content into the six sections. Preserve
 source-binding, applicability, scope ambiguity, canonical value/source-field
 rules, and anti-patterns from the strongest patches.
 """

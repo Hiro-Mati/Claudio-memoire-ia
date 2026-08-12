@@ -293,6 +293,35 @@ async def test_experience_gradient_estimator_skips_success_trajectories():
 
 
 @pytest.mark.asyncio
+async def test_experience_gradient_estimator_skips_internal_platform_failure_before_llm():
+    analysis = _analysis(passed=False, outcome="failure")
+    trajectory = analysis.trajectories[0]
+    trajectory.name = "sandbox_output_trace_timeout"
+    trajectory.retrieval_anchor = "Stage: rollout execution trace collection"
+    trajectory.content = (
+        "## Execution\n"
+        "SandboxTraceError: sandbox declared deliverables but output-file trace was not ready.\n"
+        "## Evaluation\n"
+        "External feedback: MAIN_AGENT_STD_FAILED.\n"
+        "## Result\n"
+        "No rollout trace was collected."
+    )
+    estimator = FakeExperienceGradientEstimator({})
+    context = _context()
+
+    gradients = await estimator.estimate(analysis, _experience_set(), context)
+
+    assert gradients == []
+    assert estimator.calls == []
+    expected = {
+        "trajectory_uri": trajectory.uri,
+        "reason": "source trajectory is an internal platform failure, not a user-task decision",
+    }
+    assert context.metadata["experience_source_rejections"] == [expected]
+    assert analysis.metadata["experience_source_rejections"] == [expected]
+
+
+@pytest.mark.asyncio
 async def test_experience_gradient_estimator_converts_experience_operations():
     analysis = _analysis(passed=False, outcome="failure")
     old_file = MemoryFile(

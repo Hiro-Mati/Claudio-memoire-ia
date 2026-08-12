@@ -43,6 +43,7 @@ from openviking.session.train.gates import (
     build_gate_retry_instruction,
     candidate_retry_draft,
     default_policy_gate_runner,
+    experience_source_rejection_reason,
     make_gate_audit_attempt,
     mark_experience_gradients_post_validated,
 )
@@ -172,6 +173,20 @@ class ExperienceGradientEstimator:
         requests: list[ExperienceGradientEstimateRequest] = []
         for trajectory in analysis.trajectories:
             if not _should_update_experience_from_trajectory(trajectory):
+                continue
+            source_rejection = experience_source_rejection_reason(trajectory)
+            if source_rejection:
+                rejection = {
+                    "trajectory_uri": trajectory.uri,
+                    "reason": source_rejection,
+                }
+                context.metadata.setdefault("experience_source_rejections", []).append(rejection)
+                analysis.metadata.setdefault("experience_source_rejections", []).append(rejection)
+                logger.info(
+                    "Skipping Experience extraction from ineligible source trajectory %s: %s",
+                    trajectory.uri,
+                    source_rejection,
+                )
                 continue
             requests.append(
                 ExperienceGradientEstimateRequest(

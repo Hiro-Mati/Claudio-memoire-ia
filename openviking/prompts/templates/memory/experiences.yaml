@@ -19,6 +19,12 @@ content_template: |
   ## Procedure
   {{ procedure }}
 
+  ## Verification
+  {{ verification }}
+
+  ## Fallback
+  {{ fallback }}
+
   ## Anti-pattern
   {{ anti_pattern }}
 
@@ -60,11 +66,15 @@ fields:
       - Reject generic slogans such as "check all requirements", "ensure full compliance", or
         "review carefully". Replace them with one concrete runtime boundary, one observable or
         independently verifiable fact, and one corrective action.
+      - Do not disguise the same broad rule as "extract/map/cross-reference all explicit user
+        requirements" or a 100% coverage checklist. Requirements with different evidence,
+        decision boundaries, or repairs are different failure patterns and must not be bundled.
       - Focus on the first materially outcome-changing mistake and the minimal prevention or
         recovery action at that boundary.
-      - Treat trajectory memories as factual evidence, not authoritative conclusions.
-        Prefer their `Timeline`, `Outcome Checks`, `Observed Problem`, `Evidence References`, and
-        `Raw Evidence` when inferring a repair.
+      - Treat trajectory memories as factual evidence, not authoritative conclusions. Inspect the
+        chronological `Execution`, factual `Evaluation`, and final `Result`. Locate the earliest
+        observable agent decision or missing check that separates the produced result from the
+        required result; do not infer hidden reasoning.
       - When both successful and non-successful trajectories are available for the same or
         similar task pattern, compare them before writing an experience: find which
         observation, decision, action, verification, or output differs at the first material
@@ -84,13 +94,17 @@ fields:
         cause unknown.
       - Bind every reminder to a concrete evidence source and decision boundary. Advisory signals
         may guide inspection but cannot independently justify an experience.
-      - Treat a `rollout_evaluation` direct source as authoritative evidence of outcome and
-        requirement compliance. It may justify learning what result must be prevented or repaired.
-        Infer why the agent reached that result only when the trajectory exposes the relevant
-        observation, decision, action, verification, or output boundary.
-      - When evaluation proves a reusable failed requirement but the internal cause is unknown,
-        write a prevention or verification reminder at the earliest observable boundary instead of
-        inventing hidden reasoning.
+      - Treat a `rollout_evaluation` direct source as authoritative evidence only for the observed
+        outcome and requirement compliance. It may trigger inspection, but it cannot by itself
+        justify an experience. Create or update an experience only when the trajectory also exposes
+        an agent-controllable observation, decision, action, verification, or output boundary and a
+        concrete replacement behavior.
+      - Output no experience change when the failure is caused only by missing required input,
+        an unavailable external service, tool or infrastructure failure, or an evaluator-only
+        requirement that is not present in the user request, authoritative source, or runtime
+        contract. Do not turn these failures into extra checks, artifacts, or hidden requirements.
+      - When the internal cause is unknown, output no experience change. Do not replace a missing
+        causal explanation with a generic prevention or verification reminder.
       - Preserve the nearest correct behavior and state the closest non-applicable situation so
         the reminder does not block valid paths in other domains.
       - `Does not apply when` must describe a task-pattern mismatch, not the current temporal
@@ -103,6 +117,27 @@ fields:
         helper script filenames with values read from the runtime request, source, or available tools.
         Prefer semantic capabilities and source roles over exact tool identifiers when the tool name
         is not itself part of the runtime contract.
+      - Apply a transfer test before writing: replace the source task's entities, dates, amounts,
+        filenames, and other instance values with different valid values from the same task family.
+        The Situation discriminator, decision rule, actions, verification relationship, and fallback
+        must still be correct. If the lesson only makes sense for the original instance, output no
+        experience change instead of paraphrasing that task.
+      - Do not promote a retry count, polling interval, timeout window, sample size, spot-check count,
+        or other control number observed in one trajectory into a permanent rule. Bind it to an
+        explicit future user/tool policy when one exists; otherwise use a bounded retry with an
+        observable stop condition and verify the decisive result directly.
+      - Never create Experience for internal sandbox trace capture, post-run trace retrieval,
+        evaluator transport, orchestration bookkeeping, or similar platform infrastructure failures.
+        These are operational incidents, not reusable user-task decisions.
+      - Determine source eligibility before generalizing wording. If the trajectory's actual failure
+        is an internal execution, trace, evaluation-transport, or orchestration incident, output no
+        change even when it could be paraphrased as a generic external-service or artifact workflow.
+        A real user-requested asynchronous export remains eligible only when the agent can observe
+        and change a user-task action under the service's public runtime contract.
+      - Before creating a new Experience, compare its root decision, evidence source, decision
+        boundary, corrective action, verification relationship, and fallback with candidate
+        Experiences. Update the single compatible candidate instead of creating a synonym. Keep
+        separate Experiences only when one of those dimensions materially conflicts.
       - Never infer output language solely from audience geography. Follow explicit language
         instructions first; otherwise preserve the user's language choice or ask when the choice
         materially affects the deliverable. Do not describe any audience as "implying" a language.
@@ -133,8 +168,14 @@ fields:
       - Describe internal-process leakage semantically. Do not copy platform names, hidden
         directories, internal manifest filenames, or control metadata literals into the reusable
         runtime rule.
-      - Keep the experience concise: no setup chatter, no policy dumps, no full paths, no raw IDs,
-        no hidden answers. Use semantic roles instead of case literals.
+      - Keep the complete rendered experience compact (normally 140-320 English words or an
+        equivalently concise amount in another language): no setup chatter, policy dumps, full
+        paths, raw IDs, hidden answers, or repeated rules. Use semantic roles instead of case
+        literals.
+      - The rendered Experience must use only future-runtime language. Never mention evaluation
+        criteria, rubric, evaluator, benchmark, score, request/case/execution IDs, or imply that
+        the agent can observe those concepts during a real user task. Rewrite such evidence as the
+        concrete source/output discrepancy visible in the trajectory, or output no change.
       - Use imperative, machine-readable bullets. No introductory or closing paragraphs.
 
     merge_op: patch
@@ -153,10 +194,52 @@ fields:
     description: |
       Natural-language content must be written in {{ language }}. Keep tool names, schema
       fields, Python identifiers, and quoted runtime values unchanged.
-      Write only the bullet body for `## Procedure`; the storage template adds the heading.
-      - Before/when <candidate decision/action/output boundary>: <check the decisive evidence>
-      - If <bad condition>: <apply the smallest corrective or recovery action>
-      - Else: <proceed without rewriting unrelated workflow steps>
+      Write only 2-5 ordered action steps for `## Procedure`; the storage template adds the heading.
+      Each step must implement the same root-cause repair. Bind values from the future request,
+      authoritative source, or observable tool result rather than copying source-case literals.
+      1. At <earliest decision boundary>: <inspect and bind the decisive runtime evidence>.
+      2. Before <material action or generation>: <apply the replacement decision rule>.
+      3. If needed: <perform the smallest repair without disturbing already-correct work>.
+    merge_op: patch
+
+  - name: verification
+    type: string
+    description: |
+      Natural-language content must be written in {{ language }}. Keep tool names, schema
+      fields, Python identifiers, and quoted runtime values unchanged.
+      Write only 2-5 bullets for `## Verification`; the storage template adds the heading.
+      - State the expected business, data, content, or task relationship that must hold.
+      - Verify it from authoritative input or an independently observable result. The generated
+        output must not prove itself; successful save, conversion, or parser exit is not enough.
+      - For saved artifacts, reopen, render, recalculate, or reparse the actual persisted artifact
+        when that is the only reliable way to verify the result.
+      - If the check fails, use the observed mismatch to identify the specific failed component,
+        such as source-field mapping, unit conversion, calculation formula, cumulative dependency,
+        state transition, or persisted output. Repair only that component and preserve already-correct
+        work.
+      - Repeat the same check with the same relevant inputs after repair, and state the observable
+        relationship or result that must hold before the work is accepted. Do not use vague language
+        such as "fix the formula" or "check again" without naming the repair target and recheck.
+        Do not create an extra user deliverable unless the user requested one.
+    merge_op: patch
+
+  - name: fallback
+    type: string
+    description: |
+      Natural-language content must be written in {{ language }}. Keep tool names, schema
+      fields, Python identifiers, and quoted runtime values unchanged.
+      Write 1-3 concise bullets for `## Fallback`; the storage template adds the heading.
+      - Prefer a confirmed alternative path that still completes the requested task when the primary
+        path fails. State the observable failure that triggers the switch, the confirmed alternative,
+        the result or constraint that must remain unchanged, and how the alternative result is verified.
+      - A fallback is confirmed only when it is supported by the observed trajectory, the user request,
+        an authoritative source, or an explicit tool/runtime contract. A successful switch observed in
+        the trajectory, such as tool A failing and compatible tool B completing the same result, may be
+        recorded. Do not infer that an untried tool, source, format, or workflow will work.
+      - If no supported alternative is known, write an empty string for this field rather than inventing
+        one. Ask for missing evidence or disclose a limitation only when the runtime evidence clearly
+        shows that user input or an external decision is required. Do not make a specific tool, helper
+        filename, or extra artifact mandatory unless it is part of the runtime contract.
     merge_op: patch
 
   - name: anti_pattern

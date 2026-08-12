@@ -65,7 +65,18 @@ def _experience_fields(
     *,
     situation: str | None = None,
     reminder: str = "- Include the requested total.",
-    procedure: str = "- Check the candidate answer and add the total when missing.",
+    procedure: str = (
+        "1. Read the requested records and bind the total source.\n"
+        "2. Calculate the total before composing the answer."
+    ),
+    verification: str = (
+        "- Recompute the total independently from the source records.\n"
+        "- Compare the recomputed value with the candidate answer."
+    ),
+    fallback: str = (
+        "- If the source records are unavailable, request the missing evidence instead of "
+        "guessing the total."
+    ),
     anti_pattern: str = "- Do not omit the requested total.",
 ) -> dict[str, str]:
     return {
@@ -79,6 +90,8 @@ def _experience_fields(
         ),
         "reminder": reminder,
         "procedure": procedure,
+        "verification": verification,
+        "fallback": fallback,
         "anti_pattern": anti_pattern,
     }
 
@@ -1673,7 +1686,14 @@ def test_experience_memory_schema_is_skill_readable_without_trigger_fields():
 
     assert schema is not None
     fields = {field.name: field for field in schema.fields}
-    assert {"situation", "reminder", "procedure", "anti_pattern"} <= fields.keys()
+    assert {
+        "situation",
+        "reminder",
+        "procedure",
+        "verification",
+        "fallback",
+        "anti_pattern",
+    } <= fields.keys()
     assert "trigger_code" not in fields
     assert "## Situation" in fields["situation"].description
     assert "skill loader" in fields["situation"].description
@@ -1696,10 +1716,14 @@ def test_experience_content_template_renders_skill_readable_markdown_only():
         ),
         reminder="- Check refund eligibility.",
         procedure=(
-            "- Before refunding: verify eligibility.\n"
-            "- If ineligible: explain policy.\n"
-            "- Else: proceed."
+            "1. Before refunding, read the applicable policy and request facts.\n"
+            "2. Apply the eligibility rule to the requested refund."
         ),
+        verification=(
+            "- Compare the decision with the authoritative policy source.\n"
+            "- Reopen the persisted refund record and verify its status."
+        ),
+        fallback="- If the policy source is unavailable, ask for clarification before changing state.",
         anti_pattern=("- Do not refund without eligibility.\n- Preserve eligible refunds."),
     )
     rendered = MemoryFileUtils.write(
@@ -1719,10 +1743,14 @@ def test_experience_content_template_renders_skill_readable_markdown_only():
     assert "```python" not in rendered
     assert "## Situation" in rendered
     assert '"situation":' in rendered
+    assert '"verification":' in rendered
+    assert '"fallback":' in rendered
     assert '"anti_pattern":' in rendered
     assert '"content":' not in rendered
     parsed = MemoryFileUtils.read(rendered)
     assert parsed.extra_fields["situation"] == fields["situation"]
+    assert parsed.extra_fields["verification"] == fields["verification"]
+    assert parsed.extra_fields["fallback"] == fields["fallback"]
     assert parsed.extra_fields["anti_pattern"] == fields["anti_pattern"]
 
 

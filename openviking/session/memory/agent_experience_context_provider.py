@@ -29,6 +29,7 @@ EXPERIENCE_MEMORY_TYPE = "experiences"
 TRAJECTORY_MEMORY_TYPE = "trajectories"
 COMPARISON_TRAJ_TOP_K = 6
 COMPARISON_TRAJ_INJECT_TOP_K = 2
+SEMANTIC_EXPERIENCE_TOP_K = 5
 MAX_COMPARISON_TRAJ_CHARS = 6000
 
 
@@ -164,6 +165,7 @@ class ExperienceEvidenceLoader:
             [
                 *_case_linked_experience_uris(case_file),
                 *query.loaded_experience_uris,
+                *(await self._search_candidate_experience_uris(query, ctx)),
             ]
         )
         candidates = await self._load_candidates(candidate_uris, ctx)
@@ -172,6 +174,49 @@ class ExperienceEvidenceLoader:
             candidates=candidates,
             comparison_trajectories=comparisons,
         )
+
+    async def _search_candidate_experience_uris(
+        self,
+        query: ExperienceEvidenceQuery,
+        ctx: RequestContext,
+    ) -> list[str]:
+        """Find global semantic candidates so equivalent roots are updated, not duplicated."""
+
+        target_uri = _experience_directory_uri(query.case_uri or query.trajectory_uri)
+        search_query = "\n".join(
+            part.strip()
+            for part in (
+                query.case_name,
+                query.task_signature,
+                query.trajectory_summary[:4000],
+            )
+            if part and part.strip()
+        )
+        if not target_uri or not search_query:
+            return []
+        try:
+            result = await self._viking_fs.find(
+                search_query,
+                target_uri=target_uri,
+                limit=SEMANTIC_EXPERIENCE_TOP_K,
+                level=[2],
+                ctx=ctx,
+            )
+        except Exception as error:
+            tracer.warning(f"Failed to search candidate experiences: {error}")
+            return []
+
+        uris: list[str] = []
+        for item in getattr(result, "memories", []) or []:
+            uri = str(getattr(item, "uri", "") or "")
+            if not uri and isinstance(item, dict):
+                uri = str(item.get("uri") or "")
+            if "/memories/experiences/" not in uri or not uri.endswith(".md"):
+                continue
+            if uri.endswith("/.overview.md") or uri in uris:
+                continue
+            uris.append(uri)
+        return uris[:SEMANTIC_EXPERIENCE_TOP_K]
 
     async def _load_candidates(
         self,
@@ -314,6 +359,13 @@ def _unique_experience_uris(uris: list[str]) -> list[str]:
     return list(dict.fromkeys(uri for uri in uris if "/memories/experiences/" in str(uri or "")))
 
 
+def _experience_directory_uri(uri: str) -> str:
+    prefix, separator, _ = str(uri or "").partition("/memories/")
+    if not separator or not prefix.startswith("viking://user/"):
+        return ""
+    return f"{prefix}/memories/experiences"
+
+
 class AgentExperienceContextProvider(SessionExtractContextProvider):
     """Phase 2 provider: consolidate the new trajectory into experience memories."""
 
@@ -365,11 +417,34 @@ and which runtime source binds the rule. """
 
 - One failed or partial `new_trajectory`
 - Up to two successful `comparison_trajectory` records from the exact same case
-- Existing `candidate_experience` memories linked to the exact case or actually loaded in the
-  failed rollout
+- Existing `candidate_experience` memories linked to the exact case, actually loaded in the
+  failed rollout, or found as semantically similar reusable failure patterns
 
 Source and comparison trajectories are evidence only. Do not copy or modify trajectory text in
 the output.
+
+## Extraction algorithm
+
+For each material failure, reason in this order before producing any entry:
+1. Contract: identify the required result from the user request, authoritative input, or observable
+   runtime contract. Evaluation feedback may identify a miss, but must not become a hidden runtime
+   requirement.
+2. First controllable divergence: locate the earliest observable agent decision, action, omitted
+   check, or produced output that caused or failed to prevent that one miss. If it is unknown, skip.
+3. Replacement behavior: state the smallest future decision rule or action change that would alter
+   the result while preserving nearby correct behavior.
+4. Independent proof: define how the future agent verifies the actual result from authoritative
+   input or an independently observable artifact, and what exact check is repeated after repair.
+5. Safe fallback: define what to do when the evidence, capability, conversion, or check is
+   unavailable without fabricating data or silently weakening the user's request.
+6. Transfer test: mentally substitute different entities, dates, amounts, filenames, and valid
+   input values from the same task family. Keep the entry only when its applicability boundary,
+   decision rule, actions, verification relationship, and fallback remain correct. Otherwise skip;
+   do not paraphrase the source task into an Experience.
+
+Create separate entries when failures have different evidence, decision boundaries, repairs, or
+verification methods. Do not create an entry merely to restate requested content or list everything
+that was missed.
 
 ## Decision and output
 
@@ -390,7 +465,9 @@ Each entry must provide:
 - `supersedes`: an older experience name only when the corrected experience genuinely replaces it
 
 The storage template defines the Markdown structure and order. Do not include headings inside
-field values. {situation_guidance}Do not output `trigger_code`; it is not used by the skill loader.
+field values. {situation_guidance}The complete rendered Experience must contain Situation,
+Reminder, Procedure, Verification, Fallback, and Anti-pattern. Do not output `trigger_code`; it is
+not used by the skill loader.
 
 The system applies same-name entries as updates and new names as creates. Use `supersedes` instead
 of `delete_ids`. Keep content concise, imperative, free of case IDs and hidden answers, and use the

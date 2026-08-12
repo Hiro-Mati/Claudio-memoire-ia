@@ -4,6 +4,11 @@
 
 from openviking.telemetry import tracer
 
+from .experience_source import (
+    ExperienceSourceEligibilityGate,
+    experience_source_rejection_reason,
+)
+from .experience_structure import ExperienceStructureGate
 from .models import (
     GateAction,
     GateAuditResult,
@@ -33,6 +38,8 @@ from .runner import (
 __all__ = [
     "ExperiencePlanQualityGate",
     "ExperienceRootCausePreventionGate",
+    "ExperienceSourceEligibilityGate",
+    "ExperienceStructureGate",
     "GateAction",
     "GateAuditResult",
     "GateDecision",
@@ -46,6 +53,7 @@ __all__ = [
     "build_gate_retry_instruction",
     "candidate_retry_draft",
     "default_experience_gate_contract",
+    "experience_source_rejection_reason",
     "default_policy_gate_runner",
     "mark_experience_gradients_post_validated",
     "make_gate_audit_attempt",

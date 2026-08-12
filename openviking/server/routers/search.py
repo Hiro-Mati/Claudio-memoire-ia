@@ -16,6 +16,7 @@ from openviking.server.error_mapping import map_exception
 from openviking.server.identity import RequestContext
 from openviking.server.models import Response
 from openviking.server.telemetry import run_operation
+from openviking.service.search_service import RetrievalPurpose
 from openviking.telemetry import TelemetryRequest
 from openviking.utils.search_filters import (
     SearchContextTypeInput,
@@ -105,6 +106,7 @@ class FindRequest(BaseModel):
     until: Optional[str] = None
     time_field: Optional[TimeField] = None
     level: Optional[Union[int, str, List[int]]] = None
+    retrieval_purpose: RetrievalPurpose = "agent_recall"
     telemetry: TelemetryRequest = False
 
 
@@ -130,6 +132,7 @@ class SearchRequest(BaseModel):
     until: Optional[str] = None
     time_field: Optional[TimeField] = None
     level: Optional[Union[int, str, List[int]]] = None
+    retrieval_purpose: RetrievalPurpose = "agent_recall"
     telemetry: TelemetryRequest = False
 
 
@@ -180,6 +183,7 @@ async def find(
             score_threshold=request.score_threshold,
             filter=effective_filter,
             level=_resolve_levels(request.level) or None,
+            retrieval_purpose=request.retrieval_purpose,
         ),
     )
     result = execution.result
@@ -225,6 +229,7 @@ async def search(
             score_threshold=request.score_threshold,
             filter=effective_filter,
             level=_resolve_levels(request.level) or None,
+            retrieval_purpose=request.retrieval_purpose,
         )
 
     execution = await run_operation(

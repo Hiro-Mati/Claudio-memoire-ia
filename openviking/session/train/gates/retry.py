@@ -20,7 +20,15 @@ def default_experience_gate_contract() -> str:
 Every candidate must be grounded in the source trajectory and describe a behavior change that
 would prevent the failed behavior in a future similar case. A merged final experience is reviewed
 again when merge planning combines sources, changes an existing experience, or materially rewrites
-the candidate. If no supported preventive experience can be produced, output no changes."""
+the candidate. The final candidate must use the six-section injection contract: Situation,
+Reminder, Procedure, Verification, Fallback, and Anti-pattern. Verification must independently
+check the actual result; Fallback must preserve evidence integrity without fabricating or silently
+weakening the request. Internal execution, trace, evaluation-transport, and orchestration failures
+are ineligible sources even when they can be paraphrased as generic artifact workflows. If no
+supported preventive experience can be produced, output no changes. A candidate must also pass a
+transfer test: after replacing source-task entities, dates, amounts, filenames, and other instance
+values with different valid values from the same task family, its decision rule and verification
+relationship must remain correct."""
 
 
 def build_gate_retry_instruction(

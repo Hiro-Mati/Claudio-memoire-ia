@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import pkgutil
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +24,8 @@ from openviking.session.train.domain import (
 from openviking.session.train.gates import (
     ExperiencePlanQualityGate,
     ExperienceRootCausePreventionGate,
+    ExperienceSourceEligibilityGate,
+    ExperienceStructureGate,
     GateDecision,
     GateReport,
     GateRunner,
@@ -134,8 +137,16 @@ def _plan_item() -> PolicyPlanItem:
             "- Include the requested source-bound total in the final message.\n\n"
             "## Procedure\n"
             "- Before calling `communicate_with_user`: check whether the requested total is present.\n"
-            "- If it is missing: add the calculated total from retrieved records.\n"
+            "- Expected relation: the final answer includes the total derived from retrieved records.\n"
+            "- Independent check: calculate the total again from retrieved record prices.\n"
+            "- Repair and recheck: add the corrected total and repeat the independent calculation.\n"
             "- Else: proceed with the candidate message.\n\n"
+            "## Verification\n"
+            "- Recompute the total independently from the authoritative retrieved records.\n"
+            "- Compare that result with the actual candidate message after repair.\n\n"
+            "## Fallback\n"
+            "- If the authoritative records are unavailable, ask for the missing evidence instead "
+            "of guessing the total.\n\n"
             "## Anti-pattern\n"
             "- Do not summarize completion while omitting the requested total.\n"
             "- Preserve unrelated correct database actions.\n"
@@ -234,15 +245,264 @@ def _gradient_target(
     return target, gate
 
 
-def test_default_policy_gate_runner_only_contains_final_semantic_review():
+def test_default_policy_gate_runner_contains_structure_and_final_semantic_review():
     names = [gate.name for gate in default_policy_gate_runner().gates]
 
-    assert names == ["experience_plan_quality"]
+    assert names == [
+        "experience_source_eligibility",
+        "experience_structure",
+        "experience_plan_quality",
+    ]
 
     contract = default_experience_gate_contract()
     assert "source trajectory" in contract
     assert "prevent the failed behavior" in contract
     assert "merged final experience" in contract
+    assert "Verification" in contract
+    assert "Fallback" in contract
+    assert "ineligible sources" in contract
+
+
+@pytest.mark.asyncio
+async def test_experience_source_gate_rejects_euphemized_internal_trace_experience():
+    target, _ = _gradient_target("{}")
+    target.trajectory = Trajectory(
+        name="output_artifact_delayed",
+        uri="viking://user/u/memories/trajectories/output_artifact_delayed.md",
+        outcome="failure",
+        retrieval_anchor="Stage: post-execution trace collection",
+        content=(
+            "# output artifact delayed\n"
+            "## Execution\n"
+            "- SandboxTraceError: output-file trace not ready after task completion.\n"
+            "## Evaluation\n"
+            "- External feedback: MAIN_AGENT_STD_FAILED.\n"
+            "## Result\n"
+            "- No rollout trace was collected.\n"
+        ),
+    )
+    assert target.gradient is not None
+    target.gradient.after_file.content = target.gradient.after_file.content.replace(
+        "requested total",
+        "external artifact",
+    )
+
+    decision = await ExperienceSourceEligibilityGate().evaluate(target)
+
+    assert decision is not None
+    assert decision.action == "reject"
+    assert decision.retriable is False
+    assert "internal platform failure" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_experience_source_gate_allows_real_user_requested_async_export():
+    target, _ = _gradient_target("{}")
+    target.trajectory = Trajectory(
+        name="download_requested_export",
+        uri="viking://user/u/memories/trajectories/download_requested_export.md",
+        outcome="failure",
+        retrieval_anchor="Stage: user-requested report export",
+        content=(
+            "The user requested a report from a third-party export API. "
+            "The public API returned job_status=processing, but the agent attempted the download "
+            "instead of waiting for the documented ready state."
+        ),
+    )
+
+    decision = await ExperienceSourceEligibilityGate().evaluate(target)
+
+    assert decision is None
+
+
+@pytest.mark.asyncio
+async def test_experience_source_gate_ignores_incidental_internal_error_in_user_task_execution():
+    target, _ = _gradient_target("{}")
+    target.trajectory = Trajectory(
+        name="public_site_access_blocked",
+        uri="viking://user/u/memories/trajectories/public_site_access_blocked.md",
+        outcome="failure",
+        retrieval_anchor="Stage: public website access; Boundary: anti-bot challenge",
+        content=(
+            "# Public site access blocked\n"
+            "## Execution\n"
+            "- An optional memory lookup returned TOOL_SERVER_TOOL_EXEC_ERROR.\n"
+            "- The public site then returned an anti-bot challenge.\n"
+            "## Evaluation\n"
+            "- Required outcome failed because the public page was blocked.\n"
+            "## Result\n"
+            "- The requested public data could not be retrieved.\n"
+        ),
+    )
+
+    decision = await ExperienceSourceEligibilityGate().evaluate(target)
+
+    assert decision is None
+
+
+@pytest.mark.asyncio
+async def test_experience_structure_gate_accepts_complete_generalized_contract():
+    target, _ = _gradient_target("{}")
+    gate = ExperienceStructureGate()
+
+    decision = await gate.evaluate(target)
+
+    assert decision is None
+
+
+@pytest.mark.asyncio
+async def test_experience_structure_gate_rejects_generic_incomplete_or_leaking_draft():
+    target, _ = _gradient_target("{}")
+    assert target.gradient is not None
+    target.gradient.after_file.content = (
+        "## Situation\n- Applies when: making a file.\n\n"
+        "## Reminder\n- Check all requirements from the evaluator rubric.\n\n"
+        "## Procedure\n- Review carefully.\n\n"
+        "## Anti-pattern\n- Do not miss anything.\n"
+    )
+    gate = ExperienceStructureGate()
+
+    decision = await gate.evaluate(target)
+
+    assert decision is not None
+    assert decision.action == "reject"
+    assert decision.retriable is True
+    assert "Verification" in decision.reason
+    assert "Fallback" in decision.reason
+    assert "generic check-all" in decision.reason
+    assert "evaluation-only terminology" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_experience_structure_gate_rejects_broad_requirement_checklist():
+    target, _ = _gradient_target("{}")
+    assert target.gradient is not None
+    target.gradient.after_file.content = target.gradient.after_file.content.replace(
+        "Include the requested source-bound total in the final message.",
+        "Map all explicit user requirements before writing output.",
+    )
+
+    decision = await ExperienceStructureGate().evaluate(target)
+
+    assert decision is not None
+    assert decision.action == "reject"
+    assert "broad checklist" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_experience_structure_gate_allows_complete_source_mapping_for_one_root_cause():
+    target, _ = _gradient_target("{}")
+    assert target.gradient is not None
+    target.gradient.after_file.content = target.gradient.after_file.content.replace(
+        "Include the requested source-bound total in the final message.",
+        "List all required source data points, then map each one to a validated source column.",
+    )
+
+    decision = await ExperienceStructureGate().evaluate(target)
+
+    assert decision is None
+
+
+@pytest.mark.asyncio
+async def test_experience_structure_gate_rejects_disguised_mandatory_checklist():
+    target, _ = _gradient_target("{}")
+    assert target.gradient is not None
+    target.gradient.after_file.content = target.gradient.after_file.content.replace(
+        "Include the requested source-bound total in the final message.",
+        "Extract all explicit mandatory content requirements into a checklist.",
+    )
+
+    decision = await ExperienceStructureGate().evaluate(target)
+
+    assert decision is not None
+    assert decision.action == "reject"
+    assert "broad checklist" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_experience_structure_gate_rejects_trajectory_retry_count():
+    target, _ = _gradient_target("{}")
+    assert target.gradient is not None
+    target.gradient.after_file.content = target.gradient.after_file.content.replace(
+        "If the authoritative records are unavailable, ask for the missing evidence",
+        "After 3 failed attempts, ask for the missing evidence",
+    )
+
+    decision = await ExperienceStructureGate().evaluate(target)
+
+    assert decision is not None
+    assert decision.action == "reject"
+    assert "hard-codes a retry, polling, timeout, or sampling count" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_experience_structure_gate_rejects_trajectory_polling_window():
+    target, _ = _gradient_target("{}")
+    assert target.gradient is not None
+    target.gradient.after_file.content = target.gradient.after_file.content.replace(
+        "Before calling `communicate_with_user`: check whether the requested total is present.",
+        "Poll sandbox trace readiness every 10 seconds and stop after 6 consecutive polls.",
+    )
+
+    decision = await ExperienceStructureGate().evaluate(target)
+
+    assert decision is not None
+    assert decision.action == "reject"
+    assert "retry, polling, timeout, or sampling count" in decision.reason
+    assert "internal sandbox/trace infrastructure incident" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_experience_structure_gate_rejects_trajectory_sample_percentage():
+    target, _ = _gradient_target("{}")
+    assert target.gradient is not None
+    target.gradient.after_file.content = target.gradient.after_file.content.replace(
+        "Recompute the total independently from the authoritative retrieved records.",
+        "Re-run 10% of calculations using a separate script.",
+    )
+
+    decision = await ExperienceStructureGate().evaluate(target)
+
+    assert decision is not None
+    assert decision.action == "reject"
+    assert "retry, polling, timeout, or sampling count" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_experience_structure_gate_rejects_broad_spreadsheet_checklist():
+    target, _ = _gradient_target("{}")
+    assert target.gradient is not None
+    content = target.gradient.after_file.content.replace(
+        "Include the requested source-bound total in the final message.",
+        "Always validate all requirements, data, calculations, and formatting.",
+    ).replace(
+        "If the authoritative records are unavailable, ask for the missing evidence",
+        "If data is unavailable after 3 verified attempts, ask for the missing evidence",
+    )
+    target.gradient.after_file.content = content
+
+    decision = await ExperienceStructureGate().evaluate(target)
+
+    assert decision is not None
+    assert decision.action == "reject"
+    assert "generic check-all" in decision.reason
+    assert "hard-codes a retry, polling, timeout, or sampling count" in decision.reason
+
+
+@pytest.mark.asyncio
+async def test_experience_structure_gate_rejects_evaluation_criteria_phrase():
+    target, _ = _gradient_target("{}")
+    assert target.gradient is not None
+    target.gradient.after_file.content = target.gradient.after_file.content.replace(
+        "user request scope and retrieved record prices",
+        "failed evaluation criteria and retrieved record prices",
+    )
+
+    decision = await ExperienceStructureGate().evaluate(target)
+
+    assert decision is not None
+    assert decision.action == "reject"
+    assert "evaluation-only terminology" in decision.reason
 
 
 def test_every_concrete_experience_gate_is_enabled():
@@ -481,6 +741,8 @@ async def test_experience_gate_requires_new_delta_when_loaded_experience_still_f
     assert "empirically insufficient for the claimed failure pattern" in prompt
     assert "why the old rule did not prevent the failure" in prompt
     assert "paraphrases, stronger wording, or checklist additions" in prompt
+    assert "passes a transfer test" in prompt
+    assert "source-task paraphrase" in prompt
     assert "successful comparison trajectory may establish" in prompt
     assert "must not be used to invent a hidden cause" in prompt
     assert "an explicit tool name, field list, exhaustive loop, or verification checklist" in prompt
@@ -507,6 +769,81 @@ async def test_experience_root_cause_prevention_gate_rejects_non_preventive_expe
     assert decision.retriable is True
     assert "workflow" in decision.reason
     assert "missing final total" in decision.repair_prompt
+
+
+@pytest.mark.asyncio
+async def test_experience_root_cause_gate_accepts_unlabeled_semantic_procedure_for_llm_review():
+    target, gate = _gradient_target(
+        '{"pass": true, "root_cause_quality": "sufficient", '
+        '"reason": "the procedure contains the required semantic checks", '
+        '"expected_behavior_change": "verify, repair, and recheck the result", '
+        '"repair_prompt": "", "risks": []}'
+    )
+    assert target.gradient is not None
+    target.gradient.after_file.content = re.sub(
+        r"(?ms)^## Procedure\n.*?(?=^## Anti-pattern)",
+        "## Procedure\n"
+        "- Before replying, calculate the total from the retrieved records.\n"
+        "- The reported total must equal the sum of those record prices.\n"
+        "- Recalculate the sum separately instead of trusting the draft answer.\n"
+        "- If the values differ, correct the calculation and repeat the same comparison.\n\n",
+        target.after_content,
+    )
+
+    decision = await gate.evaluate(target)
+
+    assert decision is None
+    assert len(gate.vlm.calls) == 1
+    assert "six-section injection contract" in gate.vlm.calls[0]["prompt"]
+    assert "independently" in gate.vlm.calls[0]["prompt"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("quality", "reason"),
+    [
+        ("missing_required_input", "required account field was not provided"),
+        ("external_dependency_failure", "external service timed out"),
+        ("tool_infrastructure_failure", "sandbox transport failed"),
+        ("evaluator_only_requirement", "requirement exists only in evaluator feedback"),
+    ],
+)
+async def test_experience_root_cause_gate_discards_unlearnable_failures_without_retry(
+    quality: str,
+    reason: str,
+):
+    target, gate = _gradient_target(
+        '{"pass": false, "root_cause_quality": "'
+        + quality
+        + '", "reason": "'
+        + reason
+        + '", "expected_behavior_change": "", '
+        '"repair_prompt": "should not be used", "risks": []}'
+    )
+
+    decision = await gate.evaluate(target)
+
+    assert decision is not None
+    assert decision.action == "reject"
+    assert decision.retriable is False
+    assert decision.repair_prompt == ""
+    assert len(gate.vlm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_experience_root_cause_gate_discards_legacy_external_failure_label():
+    target, gate = _gradient_target(
+        '{"pass": false, "root_cause_quality": "not_preventive", '
+        '"reason": "external service timed out before the agent received input", '
+        '"expected_behavior_change": "", "repair_prompt": "retry it", "risks": []}'
+    )
+
+    decision = await gate.evaluate(target)
+
+    assert decision is not None
+    assert decision.action == "reject"
+    assert decision.retriable is False
+    assert decision.repair_prompt == ""
 
 
 @pytest.mark.asyncio

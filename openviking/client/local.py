@@ -703,6 +703,7 @@ class LocalClient(BaseClient):
                 score_threshold=score_threshold,
                 filter=resolved_filter,
                 level=level,
+                retrieval_purpose="agent_recall",
             ),
         )
         return attach_telemetry_payload(
@@ -745,6 +746,7 @@ class LocalClient(BaseClient):
                 score_threshold=score_threshold,
                 filter=resolved_filter,
                 level=level,
+                retrieval_purpose="agent_recall",
             )
 
         execution = await run_with_telemetry(

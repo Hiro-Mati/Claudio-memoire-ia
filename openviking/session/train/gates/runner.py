@@ -11,6 +11,8 @@ from openviking.session.train.interfaces import SemanticGradient
 from openviking.telemetry import tracer
 from openviking_cli.utils import get_logger
 
+from .experience_source import ExperienceSourceEligibilityGate
+from .experience_structure import ExperienceStructureGate
 from .models import GateAction, GateDecision, GateMode, GateReport, GateTarget, PolicyGate
 from .plan_quality import ExperiencePlanQualityGate
 
@@ -116,9 +118,15 @@ class GateRunner:
 
 
 def default_policy_gate_runner() -> GateRunner:
-    """Semantic review applied to materially changed final experience plans."""
+    """Stable structure checks plus semantic review for Experience updates."""
 
-    return GateRunner(gates=[ExperiencePlanQualityGate(mode="enforce")])
+    return GateRunner(
+        gates=[
+            ExperienceSourceEligibilityGate(mode="enforce"),
+            ExperienceStructureGate(mode="enforce"),
+            ExperiencePlanQualityGate(mode="enforce"),
+        ]
+    )
 
 
 def mark_experience_gradients_post_validated(

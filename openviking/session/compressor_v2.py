@@ -16,9 +16,11 @@ from openviking.core.context import Context
 from openviking.message import Message
 from openviking.server.identity import RequestContext
 from openviking.session.memory import ExtractLoop, MemoryUpdater
-from openviking.session.memory.case_aggregation import case_generalization_post_validation
 from openviking.session.memory.constants import EXECUTION_MEMORY_TYPES
 from openviking.session.memory.dataclass import MemoryFile, ResolvedOperations, StoredLink
+from openviking.session.memory.experience_validation import (
+    build_memory_extraction_post_validation,
+)
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 from openviking.session.memory.memory_updater import (
     MemoryUpdateResult,
@@ -172,7 +174,10 @@ class SessionCompressorV2:
             ctx=ctx,
             context_provider=context_provider,
             isolation_handler=isolation_handler,
-            post_validation_hook=case_generalization_post_validation,
+            post_validation_hook=build_memory_extraction_post_validation(
+                context_provider=context_provider,
+                ctx=ctx,
+            ),
         )
 
     def _get_or_create_updater(self, registry, transaction_handle=None) -> MemoryUpdater:
