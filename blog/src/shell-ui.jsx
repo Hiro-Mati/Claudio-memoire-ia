@@ -9,7 +9,7 @@ import {
   buildPath, postPath, estimateReadingMinutes, getInitialLang, readPersistedPreferences,
   sharedThemeToBlogTheme, blogThemeToSharedTheme, writeCookiePreferences,
 } from './shell-core';
-import { ZoukInteractiveBlog } from './zouk-embed';
+import { VikingBotWidget } from './vikingbot-widget';
 import { trackPageView } from './track';
 
 /* ---------- topbar ---------- */
@@ -345,7 +345,7 @@ export function BlogShell({ router, lang, theme, onLang = () => {}, onToggleThem
         ? <IndexView lang={lang} t={t} theme={theme} navigate={router.navigate} S={S} formatDate={formatDate} />
         : <PostView slug={router.route.slug} lang={lang} theme={theme} navigate={router.navigate} S={S} formatDate={formatDate} t={t} />}
       <Footer S={S} />
-      <ZoukInteractiveBlog route={router.route} />
+      <VikingBotWidget lang={lang} />
     </div>
   );
 }

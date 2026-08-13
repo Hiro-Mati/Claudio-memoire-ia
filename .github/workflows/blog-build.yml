@@ -46,8 +46,13 @@ jobs:
         working-directory: blog
         env:
           VITE_COUNTER_URL: ${{ vars.VITE_COUNTER_URL }}
-          # Zouk embed backend overrides. Unset repo vars resolve to empty
-          # strings, so the client keeps its built-in defaults until cutover.
+          # Override for the shared widget bundle URL; unset resolves to the
+          # stable openviking.net alias baked into the loader.
+          VITE_VIKINGBOT_WIDGET_URL: ${{ vars.VITE_VIKINGBOT_WIDGET_URL }}
+          # Zouk embed backend overrides for the retired in-blog client. The
+          # widget does not read them, but they stay wired for one soak period
+          # so reverting this PR restores a working build without also having
+          # to restore repo variables.
           VITE_ZOUK_SERVER_URL: ${{ vars.VITE_ZOUK_SERVER_URL }}
           VITE_ZOUK_WORKSPACE_ID: ${{ vars.VITE_ZOUK_WORKSPACE_ID }}
           VITE_ZOUK_CHANNEL: ${{ vars.VITE_ZOUK_CHANNEL }}
