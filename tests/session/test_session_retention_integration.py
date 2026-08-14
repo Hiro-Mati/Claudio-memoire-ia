@@ -382,6 +382,35 @@ async def test_phase2_waits_for_all_earlier_pending_archives(
     assert scan_calls == 1
 
 
+async def test_phase2_marks_legacy_raw_only_archive_failed_for_replay(
+    client,
+    monkeypatch,
+):
+    session = client(session_id="legacy_raw_only_archive_recovery_test")
+    await session.ensure_exists()
+    first_uri = await _write_archive(
+        session,
+        1,
+        [_text_message("u1", "user", "legacy raw only")],
+    )
+    await _write_archive(
+        session,
+        2,
+        [_text_message("u2", "user", "current raw")],
+    )
+    monkeypatch.setattr(
+        "openviking.session.session._LEGACY_RAW_ONLY_ARCHIVE_MIN_AGE_SECONDS",
+        0.0,
+    )
+
+    assert await session._can_run_archive(2)
+    failed = json.loads(
+        await session._viking_fs.read_file(f"{first_uri}/.failed.json", ctx=session.ctx)
+    )
+
+    assert failed["stage"] == "legacy_raw_only_archive"
+
+
 async def test_missing_previous_archive_directory_does_not_block_phase2(
     client: AsyncOpenViking,
 ):

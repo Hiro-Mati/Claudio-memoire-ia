@@ -51,7 +51,7 @@ from openviking.session.tool_result_synopsis import (
 from openviking.telemetry import get_current_telemetry, tracer
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.model_retry import is_retryable_api_error, retry_async
-from openviking.utils.time_utils import get_current_timestamp
+from openviking.utils.time_utils import get_current_timestamp, parse_iso_datetime
 from openviking.utils.token_estimation import estimate_text_tokens, truncate_text_to_token_budget
 from openviking_cli.exceptions import (
     FailedPreconditionError,
@@ -88,6 +88,7 @@ _SESSION_PHASE1_LOCK_TIMEOUT_SECONDS = 30.0
 _MEMORY_STEP_NAMES = ("long_term", "execution")
 _CUMULATIVE_CHECKPOINT_VERSION = 2
 _ARCHIVE_PREDECESSOR_BARRIER_VERSION = 1
+_LEGACY_RAW_ONLY_ARCHIVE_MIN_AGE_SECONDS = 3600.0
 
 
 class _ArchiveMessagesCorruptError(ValueError):
@@ -3435,6 +3436,94 @@ class Session:
         except Exception:
             return {}
 
+    async def _mark_legacy_raw_only_archive_failed(self, archive_uri: str) -> bool:
+        """Make an old raw-only archive terminal so later Phase 2 can replay it.
+
+        Pre-Phase1-marker archives can be left with only messages.jsonl when the
+        old commit flow is interrupted between raw archive write and queue/Phase2
+        completion. There is no queue payload to reconstruct, so the least lossy
+        recovery is to mark the archive failed and let the next successful commit
+        roll its raw messages forward.
+        """
+        if (
+            await self._archive_file_exists(archive_uri, ".done")
+            or await self._archive_file_exists(archive_uri, ".failed.json")
+        ):
+            return False
+        if await self._read_phase1_meta(archive_uri):
+            return False
+
+        if not await self._legacy_raw_only_archive_is_old_enough(archive_uri):
+            return False
+
+        try:
+            messages = await self._read_archive_messages(archive_uri)
+        except _ArchiveMessagesCorruptError as exc:
+            await self._write_failed_marker(
+                archive_uri,
+                stage="legacy_raw_only_archive",
+                error=f"legacy raw-only archive has unreadable messages: {exc}",
+            )
+            logger.warning(
+                "Marked corrupt legacy raw-only archive as failed for Phase-2 skip: %s",
+                archive_uri,
+            )
+            return True
+        except Exception as exc:
+            if not _is_storage_not_found(exc):
+                logger.warning(
+                    "Cannot inspect legacy raw-only archive %s: %s",
+                    archive_uri,
+                    exc,
+                )
+            return False
+        if not messages:
+            return False
+
+        await self._write_failed_marker(
+            archive_uri,
+            stage="legacy_raw_only_archive",
+            error="legacy raw-only archive has no queue task or phase1 metadata",
+        )
+        logger.warning(
+            "Marked legacy raw-only archive as failed for Phase-2 replay: %s",
+            archive_uri,
+        )
+        return True
+
+    async def _legacy_raw_only_archive_is_old_enough(self, archive_uri: str) -> bool:
+        if _LEGACY_RAW_ONLY_ARCHIVE_MIN_AGE_SECONDS <= 0:
+            return True
+
+        try:
+            stat = await self._viking_fs.stat(f"{archive_uri}/messages.jsonl", ctx=self.ctx)
+        except Exception as exc:
+            logger.debug("Cannot stat legacy raw-only archive %s: %s", archive_uri, exc)
+            return False
+
+        raw_time = (stat.get("modTime") or stat.get("mtime")) if isinstance(stat, dict) else None
+        try:
+            if isinstance(raw_time, (int, float)):
+                modified_at = datetime.fromtimestamp(float(raw_time), tz=timezone.utc)
+            elif isinstance(raw_time, str) and raw_time:
+                modified_at = parse_iso_datetime(raw_time)
+                if modified_at.tzinfo is None:
+                    modified_at = modified_at.replace(tzinfo=timezone.utc)
+                else:
+                    modified_at = modified_at.astimezone(timezone.utc)
+            else:
+                return False
+        except Exception:
+            logger.debug(
+                "Cannot parse legacy raw-only archive mtime uri=%s raw=%r",
+                archive_uri,
+                raw_time,
+            )
+            return False
+
+        age_seconds = (datetime.now(timezone.utc) - modified_at).total_seconds()
+        return age_seconds >= _LEGACY_RAW_ONLY_ARCHIVE_MIN_AGE_SECONDS
+
     @staticmethod
     def _checkpoint_records_for_anchors(
         meta: Dict[str, Any],
@@ -3944,6 +4033,24 @@ class Session:
         start_index = int(start_match.group(1))
         end_index = int(end_match.group(1))
         return 1 <= start_index <= end_index == state.index
+    async def _can_run_archive(self, archive_index: int) -> bool:
+        """Resolve an orphaned direct predecessor before this Archive runs."""
+        if archive_index <= 1 or not self._viking_fs:
+            return True
+
+        predecessor_uri = (
+            f"{self._session_uri}/history/archive_{archive_index - 1:03d}"
+        )
+        if not await self._viking_fs.exists(predecessor_uri, ctx=self.ctx):
+            return True
+        if await self._archive_terminal_state(predecessor_uri) != "pending":
+            return True
+
+        phase1 = await self._read_phase1_meta(predecessor_uri)
+        if not phase1:
+            return await self._mark_legacy_raw_only_archive_failed(predecessor_uri)
+        if phase1.get("status") != "ready":
+            return not await self._ensure_phase1_ready(predecessor_uri)
 
     def _get_archive_terminal_event(
         self,
