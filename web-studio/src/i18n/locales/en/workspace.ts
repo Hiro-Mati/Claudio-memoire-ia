@@ -47,6 +47,9 @@ const workspace = {
       skills: {
         title: 'Skills',
       },
+      agentExperience: {
+        title: 'Agent Experience',
+      },
       tasks: {
         title: 'Task Center',
       },
@@ -201,6 +204,73 @@ const workspace = {
       description:
         'Configure the server URL and credentials to view monitoring data.',
       action: 'Open connection settings',
+    },
+  },
+  agentExperiencePage: {
+    title: 'Agent Experience',
+    description:
+      'Track experiences distilled from committed sessions, along with the trajectories and outcomes produced after they are applied.',
+    refresh: 'Refresh',
+    searchPlaceholder: 'Search experience name or URI',
+    searchClear: 'Clear',
+    searchNoResults: 'No matching experiences',
+    searchNoResultsDescription:
+      'Try a different keyword, or clear the search to see all experiences.',
+    loading: 'Loading experiences...',
+    loadFailed: 'Could not load experiences',
+    networkError:
+      'Could not connect to the OpenViking service. Check the server URL and connection status.',
+    connectionSettings: 'Open connection settings',
+    empty: 'No Agent experiences yet',
+    emptyDescription:
+      'Experiences are distilled automatically from committed sessions. Once a session is committed, reusable experiences will appear here.',
+    emptyAction: 'Go to Sessions',
+    directoryHint: 'memories / experiences',
+    updated: 'Updated {{time}}',
+    columnFile: 'Experience file',
+    columnUpdated: 'Updated',
+    columnActions: 'Actions',
+    viewAnalysis: 'Impact',
+    openDetail: 'View impact for {{name}}',
+    detail: {
+      back: 'Back',
+      copyUri: 'Copy URI',
+      copied: 'Copied',
+      copyFailed: 'Copy failed',
+      contentTitle: 'Experience content',
+      contentLoading: 'Loading experience content...',
+      contentLoadFailed: 'Could not load experience content',
+      analysisTitle: 'Application impact',
+      analysisDescription:
+        'Trajectories and task outcomes produced by commits that read this experience.',
+      rangeLabel: 'Time range',
+      rangeAll: 'All time',
+      range7d: 'Last 7 days',
+      range30d: 'Last 30 days',
+      rangeUtcHint: 'Filtered by UTC date',
+      outcomeTitle: 'Outcome distribution',
+      outcomeTotal: '{{count}} trajectories',
+      outcomeEmpty: 'No applied trajectories in this time range',
+      outcomeEmptyDescription:
+        'This experience has not been applied yet, or its trajectories carry no outcome tags. Switch to “All time” to see historical trajectories.',
+      trajectoriesTitle: 'Applied trajectories',
+      trajectoriesLoadFailed: 'Could not load trajectories',
+      trajectoryView: 'View trajectory {{name}}',
+      loadMore: 'Load more',
+      loadingMore: 'Loading...',
+      noMore: 'All {{count}} trajectories shown',
+      previewTitle: 'Trajectory content',
+      previewLoading: 'Loading trajectory content...',
+      previewLoadFailed: 'Could not load trajectory content',
+      totalApplied: 'Applied {{count}} times',
+      successRate: '{{rate}}% success',
+    },
+    outcomes: {
+      success: 'Success',
+      failure: 'Failure',
+      partial: 'Partial',
+      unknown: 'Unknown',
+      unfinished: 'Unfinished',
     },
   },
   skillsPage: {
