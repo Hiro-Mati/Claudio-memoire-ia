@@ -1,12 +1,18 @@
+// @vitest-environment jsdom
+
 import { describe, expect, it } from 'vitest'
 
 import {
+  buildCustomTimeRange,
   buildExperiencesUri,
   formatFileSize,
   formatTimestamp,
   getExperienceDisplayName,
+  isExperienceUpdatedSinceLastSeen,
+  markExperiencesSeen,
   normalizeExperienceFiles,
   normalizeOutcomeDistribution,
+  normalizeRelations,
   normalizeTrajectoryPage,
   resolveTimeRange,
 } from './experience'
@@ -196,6 +202,10 @@ describe('resolveTimeRange', () => {
     })
   })
 
+  it('returns no bounds for the custom preset', () => {
+    expect(resolveTimeRange('custom')).toEqual({ preset: 'custom' })
+  })
+
   it('computes inclusive UTC bounds for the 7d preset', () => {
     expect(resolveTimeRange('7d', new Date('2026-08-15T12:00:00Z'))).toEqual({
       preset: '7d',
@@ -218,6 +228,95 @@ describe('resolveTimeRange', () => {
       startDate: '2026-08-28',
       endDate: '2026-09-03',
     })
+  })
+})
+
+describe('normalizeRelations', () => {
+  it('keeps entries with a uri and optional reason', () => {
+    expect(
+      normalizeRelations([
+        {
+          uri: 'viking://user/u/memories/trajectories/t1.md',
+          reason: 'distilled',
+        },
+        { uri: 'viking://user/u/memories/trajectories/t2.md' },
+        { reason: 'missing uri' },
+        'junk',
+      ]),
+    ).toEqual([
+      {
+        uri: 'viking://user/u/memories/trajectories/t1.md',
+        reason: 'distilled',
+      },
+      { uri: 'viking://user/u/memories/trajectories/t2.md' },
+    ])
+  })
+
+  it('returns an empty list for non-array payloads', () => {
+    expect(normalizeRelations(undefined)).toEqual([])
+    expect(normalizeRelations({})).toEqual([])
+  })
+})
+
+describe('buildCustomTimeRange', () => {
+  it('builds a range from both bounds', () => {
+    expect(buildCustomTimeRange('2026-08-01', '2026-08-10')).toEqual({
+      range: { preset: 'all', startDate: '2026-08-01', endDate: '2026-08-10' },
+    })
+  })
+
+  it('supports an open-ended start bound only', () => {
+    expect(buildCustomTimeRange('2026-08-01', '')).toEqual({
+      range: { preset: 'all', startDate: '2026-08-01' },
+    })
+  })
+
+  it('supports an open-ended end bound only', () => {
+    expect(buildCustomTimeRange('', '2026-08-10')).toEqual({
+      range: { preset: 'all', endDate: '2026-08-10' },
+    })
+  })
+
+  it('rejects invalid formats', () => {
+    expect(buildCustomTimeRange('2026/08/01', '2026-08-10')).toEqual({
+      error: 'invalid',
+    })
+    expect(buildCustomTimeRange('2026-13-01', '')).toEqual({
+      error: 'invalid',
+    })
+    expect(buildCustomTimeRange('', '')).toEqual({ error: 'invalid' })
+  })
+
+  it('rejects reversed ranges', () => {
+    expect(buildCustomTimeRange('2026-08-10', '2026-08-01')).toEqual({
+      error: 'order',
+    })
+  })
+})
+
+describe('last-seen tracking', () => {
+  it('reports unseen experiences as updated until marked seen', () => {
+    expect(
+      isExperienceUpdatedSinceLastSeen(
+        'viking://user/u/memories/experiences/e.md',
+        '2026-08-05T02:00:00Z',
+      ),
+    ).toBe(true)
+
+    markExperiencesSeen([{ uri: 'viking://user/u/memories/experiences/e.md' }])
+
+    expect(
+      isExperienceUpdatedSinceLastSeen(
+        'viking://user/u/memories/experiences/e.md',
+        '2026-08-05T02:00:00Z',
+      ),
+    ).toBe(false)
+    expect(
+      isExperienceUpdatedSinceLastSeen(
+        'viking://user/u/memories/experiences/e.md',
+        undefined,
+      ),
+    ).toBe(false)
   })
 })
 

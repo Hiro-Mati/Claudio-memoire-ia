@@ -154,13 +154,14 @@ function toUtcDate(date: Date): string {
  * Resolve a quick time-range preset into UTC `YYYY-MM-DD` bounds.
  *
  * The Agent Evolution API filters trajectories by their UTC creation date, so
- * presets are computed in UTC as well. `all` disables filtering.
+ * presets are computed in UTC as well. `all` disables filtering; `custom` is
+ * built by {@link buildCustomTimeRange} and returns no bounds here.
  */
 export function resolveTimeRange(
   preset: TimeRangePreset,
   now: Date = new Date(),
 ): TimeRange {
-  if (preset === 'all') {
+  if (preset === 'all' || preset === 'custom') {
     return { preset }
   }
 
@@ -205,4 +206,112 @@ export function formatFileSize(size: number | undefined): string | undefined {
     unit = next
   }
   return `${value >= 10 ? Math.round(value) : Math.round(value * 10) / 10} ${unit}`
+}
+
+export type RelationLink = {
+  uri: string
+  reason?: string
+}
+
+/** Normalize `GET /api/v1/relations` result into linked resources. */
+export function normalizeRelations(value: unknown): RelationLink[] {
+  if (!Array.isArray(value)) return []
+
+  return value.flatMap((raw) => {
+    const entry = isRecord(raw) ? raw : null
+    const uri = entry ? readString(entry.uri) : undefined
+    if (!entry || !uri) return []
+
+    return [{ uri, reason: readString(entry.reason) } satisfies RelationLink]
+  })
+}
+
+/** Local-storage key tracking the last time each experience was seen. */
+const EXPERIENCE_LAST_SEEN_KEY = 'ov_agent_experience_last_seen'
+
+type LastSeenMap = Record<string, number>
+
+function readLastSeenMap(): LastSeenMap {
+  if (typeof window === 'undefined') return {}
+  try {
+    const raw = window.localStorage.getItem(EXPERIENCE_LAST_SEEN_KEY)
+    const parsed = raw ? (JSON.parse(raw) as unknown) : {}
+    return isRecord(parsed)
+      ? Object.fromEntries(
+          Object.entries(parsed).flatMap(([uri, value]) =>
+            typeof value === 'number' ? [[uri, value] as const] : [],
+          ),
+        )
+      : {}
+  } catch {
+    return {}
+  }
+}
+
+function writeLastSeenMap(map: LastSeenMap): void {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(EXPERIENCE_LAST_SEEN_KEY, JSON.stringify(map))
+  } catch {
+    // Ignore storage failures (private mode, quota).
+  }
+}
+
+/** Whether an experience was updated after the caller last saw it. */
+export function isExperienceUpdatedSinceLastSeen(
+  uri: string,
+  modTime: string | undefined,
+): boolean {
+  if (!modTime) return false
+  const updated = new Date(modTime).getTime()
+  if (Number.isNaN(updated)) return false
+  const map = readLastSeenMap()
+  if (!Object.prototype.hasOwnProperty.call(map, uri)) return true
+  return updated > map[uri]
+}
+
+/** Record "now" as the last-seen time for the given experiences. */
+export function markExperiencesSeen(entries: readonly { uri: string }[]): void {
+  if (entries.length === 0) return
+  const map = readLastSeenMap()
+  const now = Date.now()
+  for (const entry of entries) {
+    map[entry.uri] = now
+  }
+  writeLastSeenMap(map)
+}
+
+/** Parse a `YYYY-MM-DD` string; returns `undefined` when invalid. */
+export function parseUtcDate(value: string): Date | undefined {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value.trim())) return undefined
+  const date = new Date(`${value.trim()}T00:00:00Z`)
+  return Number.isNaN(date.getTime()) ? undefined : date
+}
+
+/**
+ * Build a custom time range from user-provided UTC dates.
+ *
+ * Returns an error key when the combination is invalid, so callers can
+ * surface inline validation instead of firing a bad request.
+ */
+export function buildCustomTimeRange(
+  startDate: string,
+  endDate: string,
+): { error?: 'invalid' | 'order'; range?: TimeRange } {
+  const start = parseUtcDate(startDate)
+  const end = parseUtcDate(endDate)
+  const rawStart = startDate.trim()
+  const rawEnd = endDate.trim()
+
+  if ((rawStart && !start) || (rawEnd && !end)) return { error: 'invalid' }
+  if (!rawStart && !rawEnd) return { error: 'invalid' }
+  if (start && end && start > end) return { error: 'order' }
+
+  return {
+    range: {
+      preset: 'all',
+      startDate: rawStart || undefined,
+      endDate: rawEnd || undefined,
+    },
+  }
 }

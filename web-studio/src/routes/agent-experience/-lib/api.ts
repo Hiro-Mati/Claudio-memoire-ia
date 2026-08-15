@@ -4,9 +4,12 @@ import {
   DEFAULT_TRAJECTORY_PAGE_SIZE,
   normalizeExperienceFiles,
   normalizeOutcomeDistribution,
+  normalizeRelations,
   normalizeTrajectoryPage,
 } from './experience'
+import type { RelationLink } from './experience'
 import type {
+  AgentEvolutionStatus,
   ExperienceFileItem,
   OutcomeDistribution,
   TimeRange,
@@ -138,4 +141,73 @@ export async function fetchOutcomeDistribution(options: {
     }),
   )
   return normalizeOutcomeDistribution(result, experienceUri)
+}
+
+/**
+ * Query the outgoing relations of a resource
+ * (`GET /api/v1/relations?uri=...`).
+ *
+ * For an experience this returns the trajectories that generated or evolved
+ * it (source lineage).
+ */
+export async function fetchRelations(
+  uri: string,
+  signal?: AbortSignal,
+): Promise<RelationLink[]> {
+  const result = await getOvResult<unknown>(
+    ovClient.client.get({
+      query: { uri },
+      signal,
+      url: '/api/v1/relations',
+    }),
+  )
+  return normalizeRelations(result)
+}
+
+/**
+ * Read the deployment/account Agent Evolution switch
+ * (`GET /api/v1/admin/agent-evolution`). Requires an admin or root API key.
+ */
+export async function fetchAgentEvolutionStatus(
+  signal?: AbortSignal,
+): Promise<AgentEvolutionStatus> {
+  const result = await getOvResult<unknown>(
+    ovClient.client.get({
+      signal,
+      url: '/api/v1/admin/agent-evolution',
+    }),
+  )
+  const record =
+    result && typeof result === 'object'
+      ? (result as Record<string, unknown>)
+      : {}
+  return {
+    enabled: record.enabled === true,
+    accountId:
+      typeof record.account_id === 'string' ? record.account_id : undefined,
+  }
+}
+
+/**
+ * Toggle the Agent Evolution switch
+ * (`PUT /api/v1/admin/agent-evolution`). Requires an admin or root API key.
+ */
+export async function setAgentEvolutionEnabled(
+  enabled: boolean,
+): Promise<AgentEvolutionStatus> {
+  const result = await getOvResult<unknown>(
+    ovClient.client.put({
+      body: { enabled },
+      url: '/api/v1/admin/agent-evolution',
+    }),
+  )
+  const record =
+    result && typeof result === 'object'
+      ? (result as Record<string, unknown>)
+      : {}
+  return {
+    enabled: record.enabled === true,
+    accountId:
+      typeof record.account_id === 'string' ? record.account_id : undefined,
+  }
 }

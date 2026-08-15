@@ -7,6 +7,7 @@ import {
   BrainCircuitIcon,
   ClipboardIcon,
   FileTextIcon,
+  GitBranchIcon,
   LoaderCircleIcon,
   RefreshCwIcon,
 } from 'lucide-react'
@@ -16,7 +17,6 @@ import remarkGfm from 'remark-gfm'
 import { toast } from 'sonner'
 
 import { Button } from '#/components/ui/button'
-import { ButtonGroup } from '#/components/ui/button-group'
 import {
   Card,
   CardContent,
@@ -24,12 +24,13 @@ import {
   CardHeader,
   CardTitle,
 } from '#/components/ui/card'
-import { Separator } from '#/components/ui/separator'
 import { useAppConnection } from '#/hooks/use-app-connection'
 import { copyTextToClipboard } from '#/lib/clipboard'
 import { isOvClientError } from '#/lib/ov-client'
 
 import { OutcomeDistribution } from './-components/outcome-distribution'
+import { SourceTracePanel } from './-components/source-trace-panel'
+import { TimeRangePicker } from './-components/time-range-picker'
 import { TrajectoryList } from './-components/trajectory-list'
 import { TrajectoryPreviewSheet } from './-components/trajectory-preview-sheet'
 import {
@@ -49,7 +50,9 @@ export const Route = createFileRoute('/agent-experience/$experienceUri')({
   component: ExperienceDetailRoute,
 })
 
-const TIME_RANGE_PRESETS: readonly TimeRangePreset[] = ['all', '7d', '30d']
+type DetailTab = 'impact' | 'source'
+
+const DETAIL_TABS: readonly DetailTab[] = ['impact', 'source']
 
 function getErrorMessage(error: unknown): string {
   if (isOvClientError(error) || error instanceof Error) {
@@ -66,14 +69,19 @@ function ExperienceDetailRoute() {
   // them again on match, so `params.experienceUri` is the raw `viking://` URI.
   const experienceUri = params.experienceUri
 
+  const [activeTab, setActiveTab] = React.useState<DetailTab>('impact')
   const [timeRangePreset, setTimeRangePreset] =
     React.useState<TimeRangePreset>('all')
-  const timeRange = React.useMemo<TimeRange>(
-    () => resolveTimeRange(timeRangePreset),
-    [timeRangePreset],
+  const [timeRange, setTimeRange] = React.useState<TimeRange>(() =>
+    resolveTimeRange('all'),
   )
   const [selectedTrajectory, setSelectedTrajectory] =
     React.useState<TrajectoryItem | null>(null)
+
+  const handleTimeRangeChange = (preset: TimeRangePreset, range: TimeRange) => {
+    setTimeRangePreset(preset)
+    setTimeRange(preset === 'custom' ? range : resolveTimeRange(preset))
+  }
 
   const contentQuery = useQuery({
     queryFn: ({ signal }) => fetchContent(experienceUri, signal),
@@ -82,6 +90,7 @@ function ExperienceDetailRoute() {
   })
 
   const outcomeQuery = useQuery({
+    enabled: activeTab === 'impact',
     queryFn: ({ signal }) =>
       fetchOutcomeDistribution({ experienceUri, signal, timeRange }),
     queryKey: [
@@ -101,6 +110,7 @@ function ExperienceDetailRoute() {
     readonly unknown[],
     number
   >({
+    enabled: activeTab === 'impact',
     initialPageParam: 0,
     getNextPageParam: (lastPage) =>
       lastPage.hasMore ? lastPage.offset + lastPage.items.length : undefined,
@@ -154,35 +164,33 @@ function ExperienceDetailRoute() {
             {t('detail.back')}
           </Button>
         </div>
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="flex min-w-0 items-center gap-2.5">
-            <div className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
-              <BrainCircuitIcon className="size-4.5" />
-            </div>
-            <div className="min-w-0">
-              <h1
-                className="truncate text-xl font-semibold tracking-tight"
-                title={experienceName}
+        <div className="flex min-w-0 items-center gap-2.5">
+          <div className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
+            <BrainCircuitIcon className="size-4.5" />
+          </div>
+          <div className="min-w-0">
+            <h1
+              className="truncate text-xl font-semibold tracking-tight"
+              title={experienceName}
+            >
+              {experienceName}
+            </h1>
+            <div className="flex items-center gap-1.5">
+              <code
+                className="min-w-0 truncate text-xs text-muted-foreground"
+                title={experienceUri}
               >
-                {experienceName}
-              </h1>
-              <div className="flex items-center gap-1.5">
-                <code
-                  className="min-w-0 truncate text-xs text-muted-foreground"
-                  title={experienceUri}
-                >
-                  {experienceUri}
-                </code>
-                <Button
-                  type="button"
-                  aria-label={t('detail.copyUri')}
-                  size="icon-xs"
-                  variant="ghost"
-                  onClick={handleCopyUri}
-                >
-                  <ClipboardIcon className="size-3.5" />
-                </Button>
-              </div>
+                {experienceUri}
+              </code>
+              <Button
+                type="button"
+                aria-label={t('detail.copyUri')}
+                size="icon-xs"
+                variant="ghost"
+                onClick={handleCopyUri}
+              >
+                <ClipboardIcon className="size-3.5" />
+              </Button>
             </div>
           </div>
         </div>
@@ -251,93 +259,109 @@ function ExperienceDetailRoute() {
           <CardHeader>
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="grid min-w-0 gap-1">
-                <div className="flex min-w-0 items-center gap-2">
-                  <BarChart3Icon className="size-4 shrink-0 text-muted-foreground" />
-                  <CardTitle className="truncate text-base">
-                    {t('detail.analysisTitle')}
-                  </CardTitle>
-                </div>
+                <CardTitle className="truncate text-base">
+                  {activeTab === 'impact'
+                    ? t('detail.analysisTitle')
+                    : t('detail.sourceTitle')}
+                </CardTitle>
                 <CardDescription>
-                  {t('detail.analysisDescription')}
+                  {activeTab === 'impact'
+                    ? t('detail.analysisDescription')
+                    : t('detail.sourceDescription')}
                 </CardDescription>
               </div>
-              <ButtonGroup>
-                {TIME_RANGE_PRESETS.map((preset) => (
-                  <Button
-                    key={preset}
-                    type="button"
-                    aria-pressed={timeRangePreset === preset}
-                    variant={timeRangePreset === preset ? 'secondary' : 'ghost'}
-                    size="xs"
-                    onClick={() => setTimeRangePreset(preset)}
-                  >
-                    {t(
-                      preset === 'all'
-                        ? 'detail.rangeAll'
-                        : preset === '7d'
-                          ? 'detail.range7d'
-                          : 'detail.range30d',
-                    )}
-                  </Button>
-                ))}
-              </ButtonGroup>
+              {activeTab === 'impact' ? (
+                <TimeRangePicker
+                  onChange={handleTimeRangeChange}
+                  preset={timeRangePreset}
+                  range={timeRange}
+                />
+              ) : null}
+            </div>
+            <div className="flex w-fit gap-1 rounded-[min(var(--radius-md),10px)] bg-muted p-0.5">
+              {DETAIL_TABS.map((tab) => (
+                <button
+                  key={tab}
+                  type="button"
+                  aria-pressed={activeTab === tab}
+                  className={
+                    activeTab === tab
+                      ? 'flex items-center gap-1.5 rounded-md bg-background px-2.5 py-1 text-xs font-medium shadow-xs'
+                      : 'flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground'
+                  }
+                  onClick={() => setActiveTab(tab)}
+                >
+                  {tab === 'impact' ? (
+                    <BarChart3Icon className="size-3" />
+                  ) : (
+                    <GitBranchIcon className="size-3" />
+                  )}
+                  {tab === 'impact'
+                    ? t('detail.tabImpact')
+                    : t('detail.tabSource')}
+                </button>
+              ))}
             </div>
           </CardHeader>
           <CardContent className="grid gap-5 px-5 pb-5">
-            <section className="grid gap-3">
-              <h3 className="text-sm font-medium">
-                {t('detail.outcomeTitle')}
-              </h3>
-              {outcomeQuery.isLoading ? (
-                <div className="flex min-h-16 items-center gap-2 text-sm text-muted-foreground">
-                  <LoaderCircleIcon className="size-4 animate-spin" />
-                  {t('detail.loadingMore')}
-                </div>
-              ) : outcomeQuery.isError ? (
-                <div className="grid min-h-16 place-items-center gap-2 text-center">
-                  <p className="text-sm text-muted-foreground">
-                    {getErrorMessage(outcomeQuery.error)}
-                  </p>
-                  <Button
-                    type="button"
-                    size="xs"
-                    variant="outline"
-                    onClick={() => void outcomeQuery.refetch()}
-                  >
-                    {t('refresh')}
-                  </Button>
-                </div>
-              ) : outcomeQuery.data ? (
-                <OutcomeDistribution
-                  distribution={outcomeQuery.data.distribution}
-                />
-              ) : null}
-            </section>
+            {activeTab === 'impact' ? (
+              <>
+                <section className="grid gap-3">
+                  <h3 className="text-sm font-medium">
+                    {t('detail.outcomeTitle')}
+                  </h3>
+                  {outcomeQuery.isLoading ? (
+                    <div className="flex min-h-16 items-center gap-2 text-sm text-muted-foreground">
+                      <LoaderCircleIcon className="size-4 animate-spin" />
+                      {t('detail.loadingMore')}
+                    </div>
+                  ) : outcomeQuery.isError ? (
+                    <div className="grid min-h-16 place-items-center gap-2 text-center">
+                      <p className="text-sm text-muted-foreground">
+                        {getErrorMessage(outcomeQuery.error)}
+                      </p>
+                      <Button
+                        type="button"
+                        size="xs"
+                        variant="outline"
+                        onClick={() => void outcomeQuery.refetch()}
+                      >
+                        {t('refresh')}
+                      </Button>
+                    </div>
+                  ) : outcomeQuery.data ? (
+                    <OutcomeDistribution
+                      distribution={outcomeQuery.data.distribution}
+                    />
+                  ) : null}
+                </section>
 
-            <Separator />
-
-            <section className="grid gap-3">
-              <div className="flex items-center justify-between gap-3">
-                <h3 className="text-sm font-medium">
-                  {t('detail.trajectoriesTitle')}
-                </h3>
-                <span className="text-xs text-muted-foreground">
-                  {t('detail.rangeUtcHint')}
-                </span>
-              </div>
-              <TrajectoryList
-                error={trajectoriesQuery.error}
-                hasMore={hasMoreTrajectories}
-                isLoading={trajectoriesQuery.isLoading}
-                isLoadingMore={trajectoriesQuery.isFetchingNextPage}
-                items={trajectories}
-                language={i18n.language}
-                onLoadMore={() => void trajectoriesQuery.fetchNextPage()}
-                onRetry={() => void trajectoriesQuery.refetch()}
-                onSelect={setSelectedTrajectory}
-                total={trajectoryTotal}
-              />
-            </section>
+                <section className="grid gap-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <h3 className="text-sm font-medium">
+                      {t('detail.trajectoriesTitle')}
+                    </h3>
+                    <span className="text-xs text-muted-foreground">
+                      {t('detail.rangeUtcHint')}
+                    </span>
+                  </div>
+                  <TrajectoryList
+                    error={trajectoriesQuery.error}
+                    hasMore={hasMoreTrajectories}
+                    isLoading={trajectoriesQuery.isLoading}
+                    isLoadingMore={trajectoriesQuery.isFetchingNextPage}
+                    items={trajectories}
+                    language={i18n.language}
+                    onLoadMore={() => void trajectoriesQuery.fetchNextPage()}
+                    onRetry={() => void trajectoriesQuery.refetch()}
+                    onSelect={setSelectedTrajectory}
+                    total={trajectoryTotal}
+                  />
+                </section>
+              </>
+            ) : (
+              <SourceTracePanel experienceUri={experienceUri} />
+            )}
           </CardContent>
         </Card>
       </div>
