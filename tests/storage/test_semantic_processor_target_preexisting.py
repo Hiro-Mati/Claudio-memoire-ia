@@ -5,6 +5,7 @@ import pytest
 
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
+from openviking.storage.queuefs.semantic_sync import sync_semantic_tree
 from openviking.storage.viking_fs import SyncDiff
 
 
@@ -67,7 +68,7 @@ class _FakeDagExecutor:
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
-        self.stale = False
+        self.root_directory_committed = False
         _FakeDagExecutor.calls.append(kwargs)
 
     async def run(self, root_uri):
@@ -94,15 +95,23 @@ async def test_target_source_syncs_before_semantic_dag(monkeypatch):
         "openviking.storage.queuefs.semantic_processor.SemanticLockScope.resolve",
         AsyncMock(return_value=SimpleNamespace(lock=None, close=AsyncMock())),
     )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.is_semantic_msg_stale",
+        lambda _msg: True,
+    )
 
     _FakeDagExecutor.calls = []
     _FakeDagExecutor.runs = []
     processor = SemanticProcessor()
     processor._enqueue_parent_refresh = AsyncMock()
-    processor._sync_topdown_recursive = AsyncMock(
+    sync = AsyncMock(
         return_value=SyncDiff(
             updated_files=["viking://resources/org/repo/a.md"],
         )
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.sync_semantic_tree",
+        sync,
     )
     msg = SemanticMsg(
         uri="viking://temp/import_root/repository",
@@ -133,15 +142,15 @@ async def test_sync_wrapper_delegates_to_sync_tree_and_cleans_temp(monkeypatch):
         "owned": False,
     }
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
+        "openviking.storage.queuefs.semantic_sync.get_viking_fs",
         lambda: fake_fs,
     )
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_processor.rewrite_image_uris",
+        "openviking.storage.queuefs.semantic_sync.rewrite_image_uris",
         AsyncMock(),
     )
 
-    diff = await SemanticProcessor()._sync_topdown_recursive(
+    diff = await sync_semantic_tree(
         "viking://temp/import",
         "viking://resources/root",
         lock=lease,
@@ -166,15 +175,15 @@ async def test_sync_wrapper_whole_tree_mv_for_new_target(monkeypatch):
     """When the target does not exist, sync_tree does a full mv and the wrapper does not delete (source is gone)."""
     fake_fs = _SyncWrapperVikingFS(target_exists=False)
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
+        "openviking.storage.queuefs.semantic_sync.get_viking_fs",
         lambda: fake_fs,
     )
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_processor.rewrite_image_uris",
+        "openviking.storage.queuefs.semantic_sync.rewrite_image_uris",
         AsyncMock(),
     )
 
-    diff = await SemanticProcessor()._sync_topdown_recursive(
+    diff = await sync_semantic_tree(
         "viking://temp/import",
         "viking://resources/root",
         lock=None,
@@ -189,12 +198,12 @@ async def test_sync_missing_source_never_touches_target(monkeypatch):
     fake_fs = AsyncMock()
     fake_fs.exists.return_value = False
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
+        "openviking.storage.queuefs.semantic_sync.get_viking_fs",
         lambda: fake_fs,
     )
 
     with pytest.raises(FileNotFoundError, match="refusing to sync"):
-        await SemanticProcessor()._sync_topdown_recursive(
+        await sync_semantic_tree(
             "viking://temp/missing",
             "viking://resources/root",
             lock=None,

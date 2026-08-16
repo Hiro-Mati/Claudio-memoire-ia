@@ -27,7 +27,7 @@ from openviking.server.identity import RequestContext
 from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.expr import And, Eq, PathScope
 from openviking.storage.internal_names import STORAGE_INTERNAL_ENTRY_NAMES
-from openviking.storage.queuefs.semantic_processor import SemanticProcessor
+from openviking.storage.queuefs.semantic_sync import sync_semantic_tree
 from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
 from openviking.storage.vikingdb_manager import VikingDBManager
 from openviking.telemetry import get_current_telemetry
@@ -537,7 +537,7 @@ class ResourceProcessor:
                 if not should_summarize and temp_uri and not source_committed:
                     viking_fs = get_viking_fs()
                     if vectors_only and target_preexisting and not root_is_file:
-                        diff = await SemanticProcessor()._sync_topdown_recursive(
+                        diff = await sync_semantic_tree(
                             temp_uri,
                             root_uri,
                             ctx=ctx,

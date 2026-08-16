@@ -13,7 +13,7 @@ from openviking.parse.parsers.constants import (
 )
 from openviking.parse.parsers.code.ast import SkeletonExtractionResult
 from openviking.parse.parsers.media.utils import get_media_type
-from openviking.storage.queuefs.semantic_processor import SemanticProcessor
+from openviking.storage.queuefs.semantic_service import SemanticService
 
 
 def _config(vlm_available: bool = True):
@@ -32,11 +32,11 @@ async def _generate(extraction=None, vlm_available=True):
     fs.read_file = AsyncMock(return_value="def run():\n    return 1\n")
     patches = [
         patch(
-            "openviking.storage.queuefs.semantic_processor.get_openviking_config",
+            "openviking.storage.queuefs.semantic_service.get_openviking_config",
             return_value=config,
         ),
         patch(
-            "openviking.storage.queuefs.semantic_processor.get_viking_fs",
+            "openviking.storage.queuefs.semantic_service.get_viking_fs",
             return_value=fs,
         ),
     ]
@@ -50,14 +50,14 @@ async def _generate(extraction=None, vlm_available=True):
 
     with patches[0], patches[1]:
         if extraction is None:
-            result = await SemanticProcessor()._generate_text_summary(
+            result = await SemanticService().generate_text_summary(
                 "viking://resources/sample.py",
                 "sample.py",
                 asyncio.Semaphore(1),
             )
         else:
             with patches[2]:
-                result = await SemanticProcessor()._generate_text_summary(
+                result = await SemanticService().generate_text_summary(
                     "viking://resources/sample.py",
                     "sample.py",
                     asyncio.Semaphore(1),
@@ -105,37 +105,37 @@ async def test_missing_skeleton_without_vlm_returns_empty_summary():
 
 
 def test_cuda_extensions_are_dispatched_as_code():
-    processor = SemanticProcessor()
-    assert processor._detect_file_type("kernel.cu") == FILE_TYPE_CODE
-    assert processor._detect_file_type("common.cuh") == FILE_TYPE_CODE
+    service = SemanticService()
+    assert service._detect_file_type("kernel.cu") == FILE_TYPE_CODE
+    assert service._detect_file_type("common.cuh") == FILE_TYPE_CODE
 
 
 def test_documentation_extensions_are_dispatched_before_code_skeleton_support():
-    processor = SemanticProcessor()
+    service = SemanticService()
     with patch(
         "openviking.parse.parsers.code.ast.providers.supports_code_skeleton",
         return_value=True,
     ):
-        assert processor._detect_file_type("README.md") == FILE_TYPE_DOCUMENTATION
+        assert service._detect_file_type("README.md") == FILE_TYPE_DOCUMENTATION
 
 
 def test_process_supported_extensions_are_dispatched_as_code():
-    processor = SemanticProcessor()
-    assert processor._detect_file_type("main.tf") == FILE_TYPE_CODE
+    service = SemanticService()
+    assert service._detect_file_type("main.tf") == FILE_TYPE_CODE
 
 
 def test_process_denied_non_code_formats_are_not_dispatched_as_code():
-    processor = SemanticProcessor()
-    assert processor._detect_file_type("request.http") == FILE_TYPE_OTHER
+    service = SemanticService()
+    assert service._detect_file_type("request.http") == FILE_TYPE_OTHER
 
 
 def test_legacy_code_extensions_remain_fallback_when_skeleton_is_unsupported():
-    processor = SemanticProcessor()
+    service = SemanticService()
     with patch(
         "openviking.parse.parsers.code.ast.providers.supports_code_skeleton",
         return_value=False,
     ):
-        assert processor._detect_file_type("sample.py") == FILE_TYPE_CODE
+        assert service._detect_file_type("sample.py") == FILE_TYPE_CODE
 
 
 def test_plain_ts_extension_is_not_dispatched_as_video():

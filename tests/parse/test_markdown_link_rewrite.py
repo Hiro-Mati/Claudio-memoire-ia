@@ -805,13 +805,13 @@ class TestRewriteImageUris:
         assert f"{dest}/report/.image_mappings.json" in fake.files
 
     async def test_sync_path_carries_nested_mappings_to_target(self):
-        # Re-ingest of an existing resource goes through SemanticProcessor's
+        # Re-ingest of an existing resource goes through the semantic sync path.
         # temp->target sync, which MOVES the visible files into the target and
         # skips hidden ones: afterwards the temp tree holds ONLY the
         # .image_mappings.json sidecars (the md files are gone). They must
         # still be carried over so the rewrite happens in the target tree.
-        import openviking.storage.queuefs.semantic_processor as sp_mod
-        from openviking.storage.queuefs.semantic_processor import SemanticProcessor
+        import openviking.storage.queuefs.semantic_sync as sync_mod
+        from openviking.storage.queuefs.semantic_sync import _rewrite_synced_image_uris
 
         root = "viking://temp/sync_src"
         target = "viking://resources/res"
@@ -826,16 +826,15 @@ class TestRewriteImageUris:
             f"{target}/index/logo.png": b"img",
         }
 
-        processor = SemanticProcessor.__new__(SemanticProcessor)
         with (
-            patch.object(sp_mod, "get_viking_fs", return_value=fake),
+            patch.object(sync_mod, "get_viking_fs", return_value=fake),
             patch.object(
                 __import__("openviking.parse.image_rewrite", fromlist=["x"]),
                 "get_viking_fs",
                 return_value=fake,
             ),
         ):
-            await processor._rewrite_target_image_uris(root, target)
+            await _rewrite_synced_image_uris(root, target)
 
         assert _decode(fake.files[f"{target}/index/index.md"]) == (f"![p]({target}/index/logo.png)")
 

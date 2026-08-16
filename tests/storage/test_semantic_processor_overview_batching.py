@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from openviking.storage.queuefs import semantic_processor as semantic_processor_module
-from openviking.storage.queuefs.semantic_processor import SemanticProcessor
+from openviking.storage.queuefs import semantic_service as semantic_service_module
+from openviking.storage.queuefs.semantic_service import SemanticService
 
 
 class RecordingVLM:
@@ -33,12 +33,12 @@ async def test_children_only_oversized_overview_is_batched(monkeypatch):
         output_language_override="en",
     )
     monkeypatch.setattr(
-        semantic_processor_module,
+        semantic_service_module,
         "get_openviking_config",
         lambda: config,
     )
     monkeypatch.setattr(
-        semantic_processor_module,
+        semantic_service_module,
         "render_prompt",
         lambda _name, values: (
             f"files={values['file_summaries']}|children={values['children_abstracts']}"
@@ -46,7 +46,7 @@ async def test_children_only_oversized_overview_is_batched(monkeypatch):
     )
     children = [{"name": f"child-{index}", "abstract": "x" * 20} for index in range(3)]
 
-    overview = await SemanticProcessor()._generate_overview(
+    overview = await SemanticService().generate_overview(
         "viking://resources/root",
         file_summaries=[],
         children_abstracts=children,

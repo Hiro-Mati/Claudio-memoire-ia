@@ -161,7 +161,7 @@ async def test_stale_memory_semantic_write_is_skipped(monkeypatch):
         await q.enqueue(first)
         await q.enqueue(latest)
 
-    wrote_first = await processor._write_memory_directory_semantics(
+    wrote_first = await processor._memory_semantic_task._write_directory_semantics(
         msg=first,
         viking_fs=viking_fs,
         dir_uri=first.uri,
@@ -169,7 +169,7 @@ async def test_stale_memory_semantic_write_is_skipped(monkeypatch):
         abstract="old abstract",
         ctx=None,
     )
-    wrote_latest = await processor._write_memory_directory_semantics(
+    wrote_latest = await processor._memory_semantic_task._write_directory_semantics(
         msg=latest,
         viking_fs=viking_fs,
         dir_uri=latest.uri,
@@ -212,19 +212,21 @@ async def test_memory_directory_summarizes_all_uncached_files(monkeypatch):
         return True
 
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
+        "openviking.storage.queuefs.memory_semantic.get_viking_fs",
         lambda: _FakeMemoryDirFS(),
     )
-    monkeypatch.setattr(processor, "_generate_single_file_summary", generate_file_summary)
-    monkeypatch.setattr(processor, "_generate_overview", generate_overview)
+    monkeypatch.setattr(processor._semantic_service, "generate_file_summary", generate_file_summary)
+    monkeypatch.setattr(processor._semantic_service, "generate_overview", generate_overview)
     monkeypatch.setattr(
-        processor,
-        "_normalize_overview_generation",
+        processor._semantic_service,
+        "normalize_overview",
         lambda overview: (overview, "abstract"),
     )
-    monkeypatch.setattr(processor, "_write_memory_directory_semantics", write_semantics)
+    monkeypatch.setattr(
+        processor._memory_semantic_task, "_write_directory_semantics", write_semantics
+    )
 
-    await processor._process_memory_directory(
+    await processor._memory_semantic_task.run(
         SemanticMsg(
             uri="viking://user/default/memories/preferences",
             context_type="memory",
@@ -265,21 +267,23 @@ async def test_memory_directory_vectorizes_changed_files_with_generated_summary(
         captured_directory_vectorize.append(kwargs)
 
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
+        "openviking.storage.queuefs.memory_semantic.get_viking_fs",
         lambda: _FakeMemoryDirFS(),
     )
-    monkeypatch.setattr(processor, "_generate_single_file_summary", generate_file_summary)
-    monkeypatch.setattr(processor, "_generate_overview", generate_overview)
+    monkeypatch.setattr(processor._semantic_service, "generate_file_summary", generate_file_summary)
+    monkeypatch.setattr(processor._semantic_service, "generate_overview", generate_overview)
     monkeypatch.setattr(
-        processor,
-        "_normalize_overview_generation",
+        processor._semantic_service,
+        "normalize_overview",
         lambda overview: (overview, "abstract"),
     )
-    monkeypatch.setattr(processor, "_write_memory_directory_semantics", write_semantics)
-    monkeypatch.setattr(processor, "_vectorize_single_file", vectorize_single_file)
-    monkeypatch.setattr(processor, "_vectorize_directory", vectorize_directory)
+    monkeypatch.setattr(
+        processor._memory_semantic_task, "_write_directory_semantics", write_semantics
+    )
+    monkeypatch.setattr(processor._semantic_service, "vectorize_file", vectorize_single_file)
+    monkeypatch.setattr(processor._semantic_service, "vectorize_directory", vectorize_directory)
 
-    await processor._process_memory_directory(
+    await processor._memory_semantic_task.run(
         SemanticMsg(
             uri=dir_uri,
             context_type="memory",

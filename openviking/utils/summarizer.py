@@ -189,6 +189,17 @@ class Summarizer:
                     is_code_repo=kwargs.get("is_code_repo", False),
                     target_preexisting=resolve_target_preexisting(idx, target_uri),
                     ingest_options=ingest_options,
+                    coalesce_key=(
+                        build_semantic_coalesce_key(
+                            context_type=context_type,
+                            uri=target_uri,
+                            account_id=ctx.account_id,
+                            user_id=ctx.user.user_id,
+                            peer_id=ctx.user.user_id,
+                        )
+                        if context_type in {"resource", "skill"}
+                        else ""
+                    ),
                 )
                 if msg.telemetry_id:
                     get_request_wait_tracker().register_semantic_root(msg.telemetry_id, msg.id)
