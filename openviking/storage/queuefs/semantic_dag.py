@@ -159,8 +159,7 @@ class SemanticDagExecutor:
         changes: Optional[Dict[str, List[str]]] = None,
         skip_vectorization: bool = False,
         ingest_options: IngestOptions | None = None,
-        coalesce_key: str = "",
-        coalesce_event_id: str = "",
+        event_id: str = "",
         directory_task: Optional[DirectorySemanticTask] = None,
     ):
         self._context_type = context_type
@@ -173,8 +172,7 @@ class SemanticDagExecutor:
         self._changes = changes or {}
         self._skip_vectorization = skip_vectorization
         self._ingest_options = IngestOptions.from_value(ingest_options)
-        self._coalesce_key = coalesce_key
-        self._coalesce_event_id = coalesce_event_id
+        self._event_id = event_id
         self._directory_task = directory_task or DirectorySemanticTask(semantic_service)
         self._task_context = get_task_context()
         self._telemetry = get_current_telemetry()
@@ -215,8 +213,8 @@ class SemanticDagExecutor:
         self._root_done = asyncio.Event()
         self._scheduler = get_semantic_node_scheduler(self._node_concurrency)
         self._directory_task.mark_dirty(
-            self._coalesce_key,
-            self._coalesce_event_id,
+            root_uri,
+            self._event_id,
         )
 
         try:
@@ -235,8 +233,8 @@ class SemanticDagExecutor:
             self._unregister_active()
             if not self._directory_request_submitted:
                 self._directory_task.discard_dirty(
-                    self._coalesce_key,
-                    self._coalesce_event_id,
+                    root_uri,
+                    self._event_id,
                 )
 
     def _schedule_work(self, work: DagWork) -> None:
@@ -646,8 +644,8 @@ class SemanticDagExecutor:
             self._directory_request_submitted = dir_uri == self._root_uri
             result = await self._directory_task.refresh(
                 DirectorySemanticRequest(
-                    event_id=self._coalesce_event_id,
-                    coalesce_key=(self._coalesce_key if dir_uri == self._root_uri else ""),
+                    event_id=self._event_id,
+                    track_inflight=dir_uri == self._root_uri,
                     uri=dir_uri,
                     context_type=self._context_type,
                     ctx=self._ctx,

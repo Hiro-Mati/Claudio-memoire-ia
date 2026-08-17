@@ -10,16 +10,6 @@ from uuid import uuid4
 
 from openviking.utils.ingest_options import IngestOptions
 
-def build_semantic_coalesce_key(
-    *,
-    context_type: str,
-    uri: str,
-    account_id: str = "default",
-    user_id: str = "default",
-    peer_id: str = "default",
-) -> str:
-    return "|".join([context_type, account_id, user_id, peer_id, uri.rstrip("/")])
-
 
 @dataclass
 class SemanticMsg:

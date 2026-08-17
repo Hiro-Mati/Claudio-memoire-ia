@@ -18,7 +18,7 @@ from openviking.storage.queuefs.memory_semantic import MemorySemanticTask
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.semantic_dag import DagStats, SemanticDagExecutor
 from openviking.storage.queuefs.semantic_lock import SemanticLockScope
-from openviking.storage.queuefs.semantic_msg import SemanticMsg, build_semantic_coalesce_key
+from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.queuefs.semantic_queue import is_semantic_msg_stale
 from openviking.storage.queuefs.semantic_service import SemanticService
 from openviking.storage.queuefs.semantic_sync import sync_semantic_tree
@@ -219,13 +219,6 @@ class SemanticProcessor(DequeueHandlerBase):
             role=msg.role,
             skip_vectorization=msg.skip_vectorization,
             changes={"modified": [uri]},
-            coalesce_key=build_semantic_coalesce_key(
-                context_type=msg.context_type,
-                uri=parent_uri,
-                account_id=msg.account_id,
-                user_id=msg.user_id,
-                peer_id=msg.peer_id,
-            ),
         )
         with detach_task_context():
             await semantic_queue.enqueue(parent_msg)
@@ -292,6 +285,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 root_attrs.user_id = msg.user_id
                 root_context_token = bind_root_observability_context(root_attrs)
                 dirty_owned = False
+                directory_uri = (msg.target_uri or msg.uri).rstrip("/")
                 try:
                     current_ctx = self._ctx_from_semantic_msg(msg)
                     logger.info(
@@ -310,7 +304,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     try:
                         if msg.context_type != "memory":
                             self._directory_semantic_task.mark_dirty(
-                                msg.coalesce_key,
+                                directory_uri,
                                 msg.id,
                             )
                             dirty_owned = True
@@ -378,8 +372,7 @@ class SemanticProcessor(DequeueHandlerBase):
                                 changes=changes,
                                 skip_vectorization=msg.skip_vectorization,
                                 ingest_options=msg.ingest_options,
-                                coalesce_key=msg.coalesce_key,
-                                coalesce_event_id=msg.id,
+                                event_id=msg.id,
                                 directory_task=self._directory_semantic_task,
                             )
                             dirty_owned = False
@@ -402,7 +395,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 finally:
                     if dirty_owned:
                         self._directory_semantic_task.discard_dirty(
-                            msg.coalesce_key,
+                            directory_uri,
                             msg.id,
                         )
                     reset_root_observability_context(root_context_token)

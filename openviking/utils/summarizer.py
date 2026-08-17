@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from openviking.core.namespace import context_type_for_uri
 from openviking.storage.queuefs import SemanticMsg, get_queue_manager
-from openviking.storage.queuefs.semantic_msg import build_semantic_coalesce_key
 from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
 from openviking.telemetry import get_current_telemetry
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
@@ -60,13 +59,6 @@ class Summarizer:
             skip_vectorization=skip_vectorization,
             telemetry_id=telemetry_id,
             changes={"modified": [file_uri]},
-            coalesce_key=build_semantic_coalesce_key(
-                context_type=context_type_for_uri(file_uri),
-                uri=parent_uri,
-                account_id=ctx.account_id,
-                user_id=ctx.user.user_id,
-                peer_id=ctx.user.user_id,
-            ),
             ingest_options=ingest_options,
         )
         if telemetry_id:
@@ -189,17 +181,6 @@ class Summarizer:
                     is_code_repo=kwargs.get("is_code_repo", False),
                     target_preexisting=resolve_target_preexisting(idx, target_uri),
                     ingest_options=ingest_options,
-                    coalesce_key=(
-                        build_semantic_coalesce_key(
-                            context_type=context_type,
-                            uri=target_uri,
-                            account_id=ctx.account_id,
-                            user_id=ctx.user.user_id,
-                            peer_id=ctx.user.user_id,
-                        )
-                        if context_type in {"resource", "skill"}
-                        else ""
-                    ),
                 )
                 if msg.telemetry_id:
                     get_request_wait_tracker().register_semantic_root(msg.telemetry_id, msg.id)

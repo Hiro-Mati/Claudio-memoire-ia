@@ -74,33 +74,6 @@ async def test_non_memory_context_not_deduped():
         assert named_enqueue.call_count == 2
 
 
-@pytest.mark.asyncio
-async def test_coalesced_semantic_messages_mark_old_version_stale():
-    mock_agfs = MagicMock()
-    with patch.object(NamedQueue, "enqueue", new_callable=AsyncMock) as named_enqueue:
-        named_enqueue.return_value = "queued-id"
-        q = SemanticQueue(mock_agfs, "/queue", "semantic")
-        coalesce_key = f"resource|acc|u|p|viking://resources/docs/{uuid4().hex}"
-        first = SemanticMsg(
-            uri="viking://resources/docs",
-            context_type="resource",
-            coalesce_key=coalesce_key,
-        )
-        second = SemanticMsg(
-            uri="viking://resources/docs",
-            context_type="resource",
-            coalesce_key=first.coalesce_key,
-        )
-
-        await q.enqueue(first)
-        await q.enqueue(second)
-
-        assert first.coalesce_version == 1
-        assert second.coalesce_version == 2
-        assert is_semantic_msg_stale(first)
-        assert not is_semantic_msg_stale(second)
-
-
 class _FakePathLock:
     """Mock for _async_agfs pathlock operations."""
 

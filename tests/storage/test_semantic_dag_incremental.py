@@ -116,12 +116,12 @@ async def test_direct_incremental_updates_coalesce_only_directory_generation(mon
 
     processor = _FakeProcessor()
     directory_task = _DirectoryTask(processor)
-    ctx = RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER)
-    coalesce_key = "resource|acc1|user1|user1|viking://resources/docs"
+    ctx_a = RequestContext(user=UserIdentifier("acc1", "user-a"), role=Role.USER)
+    ctx_b = RequestContext(user=UserIdentifier("acc1", "user-b"), role=Role.USER)
     options_a = IngestOptions.from_search_tags(["team=a"])
     options_b = IngestOptions.from_search_tags(["team=b"])
 
-    def make_executor(file_name, ingest_options):
+    def make_executor(file_name, ingest_options, ctx):
         return SemanticDagExecutor(
             semantic_service=processor,
             context_type="resource",
@@ -131,13 +131,12 @@ async def test_direct_incremental_updates_coalesce_only_directory_generation(mon
             target_uri=root_uri,
             changes={"modified": [f"{root_uri}/{file_name}"]},
             ingest_options=ingest_options,
-            coalesce_key=coalesce_key,
-            coalesce_event_id=f"event-{file_name}",
+            event_id=f"event-{file_name}",
             directory_task=directory_task,
         )
 
-    executor_a = make_executor("a.txt", options_a)
-    executor_b = make_executor("b.txt", options_b)
+    executor_a = make_executor("a.txt", options_a, ctx_a)
+    executor_b = make_executor("b.txt", options_b, ctx_b)
 
     task_a = asyncio.create_task(executor_a.run(root_uri))
     await processor.first_generation_started.wait()

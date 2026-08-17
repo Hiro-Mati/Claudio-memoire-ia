@@ -25,7 +25,7 @@ from openviking.utils.ingest_options import IngestOptions
 @dataclass(frozen=True)
 class DirectorySemanticRequest:
     event_id: str
-    coalesce_key: str
+    track_inflight: bool
     uri: str
     context_type: str
     ctx: RequestContext
@@ -73,11 +73,12 @@ class DirectorySemanticTask:
         self._states: dict[str, _DirectoryState] = {}
         self._submission_order = 0
 
-    def mark_dirty(self, coalesce_key: str, event_id: str) -> None:
+    def mark_dirty(self, directory_uri: str, event_id: str) -> None:
         """Register directory work before its file phase starts."""
-        if not coalesce_key or not event_id:
+        directory_uri = directory_uri.rstrip("/")
+        if not directory_uri or not event_id:
             return
-        state = self._states.setdefault(coalesce_key, _DirectoryState())
+        state = self._states.setdefault(directory_uri, _DirectoryState())
         if event_id in state.event_orders:
             return
         self._submission_order += 1
@@ -86,9 +87,10 @@ class DirectorySemanticTask:
         state.revision += 1
         state.ready.clear()
 
-    def discard_dirty(self, coalesce_key: str, event_id: str) -> None:
+    def discard_dirty(self, directory_uri: str, event_id: str) -> None:
         """Release a registration whose file phase failed before submission."""
-        state = self._states.get(coalesce_key)
+        directory_uri = directory_uri.rstrip("/")
+        state = self._states.get(directory_uri)
         if state is None or event_id not in state.pending_events:
             return
         state.pending_events.remove(event_id)
@@ -96,7 +98,7 @@ class DirectorySemanticTask:
         if not state.pending_events:
             state.ready.set()
         if not state.running and not state.waiters and not state.pending_events:
-            self._states.pop(coalesce_key, None)
+            self._states.pop(directory_uri, None)
 
     async def read_file_summaries(
         self,
@@ -111,7 +113,7 @@ class DirectorySemanticTask:
         return self._semantic_service.parse_overview(overview) if overview else {}
 
     async def refresh(self, request: DirectorySemanticRequest) -> DirectorySemanticResult:
-        if not request.coalesce_key or not request.event_id:
+        if not request.track_inflight or not request.event_id:
             return await self._run_bound(
                 request,
                 request.file_summary_updates,
@@ -119,8 +121,9 @@ class DirectorySemanticTask:
                 lambda: True,
             )
 
-        self.mark_dirty(request.coalesce_key, request.event_id)
-        state = self._states[request.coalesce_key]
+        directory_uri = request.uri.rstrip("/")
+        self.mark_dirty(directory_uri, request.event_id)
+        state = self._states[directory_uri]
         loop = asyncio.get_running_loop()
         waiter: asyncio.Future[DirectorySemanticResult] = loop.create_future()
         order = state.event_orders[request.event_id]
@@ -160,7 +163,7 @@ class DirectorySemanticTask:
                 if revision != state.revision or state.pending_events:
                     continue
 
-                self._states.pop(request.coalesce_key, None)
+                self._states.pop(directory_uri, None)
                 for event_id, pending in state.waiters:
                     if pending.done():
                         continue
@@ -173,13 +176,13 @@ class DirectorySemanticTask:
                     )
                 return waiter.result()
         except asyncio.CancelledError:
-            self._states.pop(request.coalesce_key, None)
+            self._states.pop(directory_uri, None)
             for _, pending in state.waiters:
                 if not pending.done():
                     pending.cancel()
             raise
         except Exception as error:
-            self._states.pop(request.coalesce_key, None)
+            self._states.pop(directory_uri, None)
             for _, pending in state.waiters:
                 if pending is waiter:
                     pending.cancel()

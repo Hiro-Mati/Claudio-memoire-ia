@@ -23,7 +23,6 @@ from openviking.session.memory.memory_updater import MemoryUpdater
 from openviking.session.memory.utils.content_visibility import visible_content
 from openviking.storage.content_write import ContentWriteCoordinator
 from openviking.storage.queuefs import SemanticMsg, get_queue_manager
-from openviking.storage.queuefs.semantic_msg import build_semantic_coalesce_key
 from openviking.storage.viking_fs import VikingFS
 from openviking.telemetry import get_current_telemetry
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
@@ -379,13 +378,6 @@ class FSService:
             role=str(ctx.role),
             skip_vectorization=False,
             telemetry_id=telemetry_id,
-            coalesce_key=build_semantic_coalesce_key(
-                context_type=context_type,
-                uri=root_uri,
-                account_id=ctx.account_id,
-                user_id=ctx.user.user_id,
-                peer_id=ctx.user.user_id,
-            ),
             changes={"deleted": [deleted_uri]},
         )
         if telemetry_id:
