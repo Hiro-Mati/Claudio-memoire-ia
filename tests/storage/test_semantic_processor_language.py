@@ -374,7 +374,7 @@ class TestGenerateTextSummaryOutputLanguage:
         self, temp_multilang_files, file_key, file_name, expected_lang
     ):
         """端到端测试：文件 -> 语言检测 -> 生成对应语言摘要"""
-        from openviking.storage.queuefs.semantic_service import SemanticService
+        from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 
         content = Path(temp_multilang_files[file_key]).read_text()
         mock_vlm = LanguageAwareMockVLM()
@@ -387,16 +387,18 @@ class TestGenerateTextSummaryOutputLanguage:
                 {"LC_ALL": self._LANGUAGE_LOCALE[expected_lang]},
             ),
             patch(
-                "openviking.storage.queuefs.semantic_service.get_viking_fs",
+                "openviking.storage.queuefs.semantic_processor.get_viking_fs",
                 return_value=mock_viking_fs,
             ),
             patch(
-                "openviking.storage.queuefs.semantic_service.get_openviking_config",
+                "openviking.storage.queuefs.semantic_processor.get_openviking_config",
                 return_value=mock_config,
             ),
         ):
-            service = SemanticService()
-            result = await service.generate_text_summary(
+            processor = SemanticProcessor()
+            processor._current_ctx = MagicMock()
+
+            result = await processor._generate_text_summary(
                 file_path=temp_multilang_files[file_key],
                 file_name=file_name,
                 llm_sem=asyncio.Semaphore(1),
@@ -422,7 +424,7 @@ class TestGenerateTextSummaryOutputLanguage:
     )
     async def test_e2e_russian_arabic_output_language(self, content, file_name, expected_lang):
         """端到端测试：俄文和阿拉伯文内容"""
-        from openviking.storage.queuefs.semantic_service import SemanticService
+        from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 
         mock_vlm = LanguageAwareMockVLM()
         mock_viking_fs = self._create_mock_viking_fs(content)
@@ -434,16 +436,18 @@ class TestGenerateTextSummaryOutputLanguage:
                 {"LC_ALL": self._LANGUAGE_LOCALE[expected_lang]},
             ),
             patch(
-                "openviking.storage.queuefs.semantic_service.get_viking_fs",
+                "openviking.storage.queuefs.semantic_processor.get_viking_fs",
                 return_value=mock_viking_fs,
             ),
             patch(
-                "openviking.storage.queuefs.semantic_service.get_openviking_config",
+                "openviking.storage.queuefs.semantic_processor.get_openviking_config",
                 return_value=mock_config,
             ),
         ):
-            service = SemanticService()
-            result = await service.generate_text_summary(
+            processor = SemanticProcessor()
+            processor._current_ctx = MagicMock()
+
+            result = await processor._generate_text_summary(
                 file_path=f"/tmp/{file_name}",
                 file_name=file_name,
                 llm_sem=asyncio.Semaphore(1),

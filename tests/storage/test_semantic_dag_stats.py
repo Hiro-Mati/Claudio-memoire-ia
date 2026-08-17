@@ -57,13 +57,13 @@ class _FakeProcessor:
         self.vectorized_contexts = {}
         self.verify_streaming = verify_streaming
 
-    async def generate_file_summary(self, file_path, llm_sem=None, ctx=None):
+    async def _generate_single_file_summary(self, file_path, llm_sem=None, ctx=None):
         result = {"name": file_path.split("/")[-1], "summary": "summary"}
         if self.verify_streaming:
             result["content"] = "x" * 100_000
         return result
 
-    async def generate_overview(self, dir_uri, file_summaries, children_abstracts):
+    async def _generate_overview(self, dir_uri, file_summaries, children_abstracts):
         if self.verify_streaming:
             assert all("content" not in item for item in file_summaries)
             assert all(
@@ -71,10 +71,10 @@ class _FakeProcessor:
             )
         return "overview"
 
-    def normalize_overview(self, overview):
+    def _normalize_overview_generation(self, overview):
         return overview, "abstract"
 
-    async def vectorize_directory(
+    async def _vectorize_directory(
         self,
         uri,
         context_type,
@@ -85,7 +85,7 @@ class _FakeProcessor:
     ):
         self.vectorized_dirs.append(uri)
 
-    async def vectorize_file(
+    async def _vectorize_single_file(
         self,
         parent_uri,
         context_type,
@@ -104,8 +104,8 @@ class _FakeProcessor:
             get_current_telemetry().telemetry_id,
         )
 
-    async def vectorize_directory_simple(self, uri, context_type, abstract, overview, ctx=None):
-        await self.vectorize_directory(uri, context_type, abstract, overview, ctx=ctx)
+    async def _vectorize_directory_simple(self, uri, context_type, abstract, overview, ctx=None):
+        await self._vectorize_directory(uri, context_type, abstract, overview, ctx=ctx)
 
 
 class _TrackingProcessor(_FakeProcessor):
@@ -114,7 +114,7 @@ class _TrackingProcessor(_FakeProcessor):
         self.active_summaries = 0
         self.max_active_summaries = 0
 
-    async def generate_file_summary(self, file_path, llm_sem=None, ctx=None):
+    async def _generate_single_file_summary(self, file_path, llm_sem=None, ctx=None):
         self.active_summaries += 1
         self.max_active_summaries = max(self.max_active_summaries, self.active_summaries)
         try:
@@ -162,7 +162,7 @@ async def test_semantic_dag_stats_collects_nodes(monkeypatch):
     processor = _FakeProcessor(verify_streaming=True)
     ctx = RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER)
     executor = SemanticDagExecutor(
-        semantic_service=processor,
+        processor=processor,
         context_type="resource",
         max_concurrent_llm=2,
         ctx=ctx,
@@ -198,7 +198,7 @@ async def test_semantic_dag_bounds_active_node_work(monkeypatch):
     processor = _TrackingProcessor()
     ctx = RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER)
     executor = SemanticDagExecutor(
-        semantic_service=processor,
+        processor=processor,
         context_type="resource",
         max_concurrent_llm=3,
         ctx=ctx,
@@ -241,7 +241,7 @@ async def test_semantic_dag_shares_node_scheduler_across_roots(monkeypatch):
         bind_telemetry(telemetry_a),
     ):
         executor_a = SemanticDagExecutor(
-            semantic_service=processor,
+            processor=processor,
             context_type="resource",
             max_concurrent_llm=1,
             ctx=ctx,
@@ -251,7 +251,7 @@ async def test_semantic_dag_shares_node_scheduler_across_roots(monkeypatch):
         bind_telemetry(telemetry_b),
     ):
         executor_b = SemanticDagExecutor(
-            semantic_service=processor,
+            processor=processor,
             context_type="resource",
             max_concurrent_llm=1,
             ctx=ctx,
@@ -336,7 +336,7 @@ async def test_semantic_dag_skip_vectorization_does_not_schedule_tasks(monkeypat
     processor = _FakeProcessor()
     ctx = RequestContext(user=UserIdentifier("acc1", "user1"), role=Role.USER)
     executor = SemanticDagExecutor(
-        semantic_service=processor,
+        processor=processor,
         context_type="resource",
         max_concurrent_llm=2,
         ctx=ctx,

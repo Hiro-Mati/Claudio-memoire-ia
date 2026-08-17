@@ -43,11 +43,11 @@ async def test_memory_semantic_directory_does_not_release_borrowed_lock(monkeypa
     borrowed_lease = {"id": "borrowed-lock", "owned": False}
 
     monkeypatch.setattr(
-        "openviking.storage.queuefs.memory_semantic.get_viking_fs",
+        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
         lambda: _FakeVikingFS(pathlock),
     )
 
-    await processor._memory_semantic_task.run(
+    await processor._process_memory_directory(
         SemanticMsg(
             uri="viking://memory/demo",
             context_type="memory",

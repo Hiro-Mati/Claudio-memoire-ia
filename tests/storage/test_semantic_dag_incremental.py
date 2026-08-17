@@ -7,8 +7,7 @@ import re
 import pytest
 
 from openviking.server.identity import RequestContext, Role
-from openviking.storage.queuefs.directory_semantic import DirectorySemanticTask
-from openviking.storage.queuefs.semantic_dag import SemanticDagExecutor
+from openviking.storage.queuefs.semantic_dag import DirectorySemanticTask, SemanticDagExecutor
 from openviking.utils.ingest_options import IngestOptions
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -51,10 +50,10 @@ class _FakeProcessor:
         self.second_file_started = asyncio.Event()
         self.release_second_file = asyncio.Event()
 
-    def parse_overview(self, overview_content):
+    def _parse_overview_md(self, overview_content):
         return dict(re.findall(r"^-\s*([^:]+):\s*(.*)$", overview_content, re.MULTILINE))
 
-    async def generate_file_summary(self, file_path, llm_sem=None, ctx=None):
+    async def _generate_single_file_summary(self, file_path, llm_sem=None, ctx=None):
         del llm_sem, ctx
         name = file_path.rsplit("/", 1)[-1]
         if name == "b.txt":
@@ -62,7 +61,7 @@ class _FakeProcessor:
             await self.release_second_file.wait()
         return {"name": name, "summary": f"summary-{name}"}
 
-    async def generate_overview(self, dir_uri, file_summaries, children_abstracts):
+    async def _generate_overview(self, dir_uri, file_summaries, children_abstracts):
         del dir_uri, children_abstracts
         overview = "FILES:\n" + "\n".join(
             f"- {item['name']}: {item['summary']}" for item in file_summaries
@@ -74,13 +73,22 @@ class _FakeProcessor:
             self.first_generation_returned.set()
         return overview
 
-    def normalize_overview(self, overview):
+    def _normalize_overview_generation(self, overview):
         return overview, "abstract"
 
-    async def vectorize_file(self, file_path, ingest_options=None, **kwargs):
+    async def _vectorize_single_file(
+        self,
+        parent_uri,
+        context_type,
+        file_path,
+        summary_dict,
+        ctx=None,
+        use_summary=False,
+        ingest_options=None,
+    ):
         self.file_vector_options[file_path] = ingest_options
 
-    async def vectorize_directory(self, uri, ingest_options=None, **kwargs):
+    async def _vectorize_directory(self, uri, ingest_options=None, **kwargs):
         self.directory_vector_options.append(ingest_options)
 
 
@@ -105,8 +113,8 @@ async def test_direct_incremental_updates_coalesce_only_directory_generation(mon
     monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fake_fs)
 
     class _DirectoryTask(DirectorySemanticTask):
-        def __init__(self, semantic_service):
-            super().__init__(semantic_service)
+        def __init__(self, processor):
+            super().__init__(processor)
             self.second_submitted = asyncio.Event()
 
         async def refresh(self, request):
@@ -123,7 +131,7 @@ async def test_direct_incremental_updates_coalesce_only_directory_generation(mon
 
     def make_executor(file_name, ingest_options, ctx):
         return SemanticDagExecutor(
-            semantic_service=processor,
+            processor=processor,
             context_type="resource",
             max_concurrent_llm=2,
             ctx=ctx,

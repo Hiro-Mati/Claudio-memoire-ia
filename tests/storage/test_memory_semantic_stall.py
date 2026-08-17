@@ -3,7 +3,7 @@
 
 """Tests for memory semantic queue stall fix (issue #864).
 
-Ensures that memory semantic task error paths propagate exceptions
+Ensures that _process_memory_directory() error paths propagate exceptions
 so that on_dequeue() always calls report_success() or report_error().
 """
 
@@ -79,7 +79,7 @@ async def test_memory_empty_dir_still_reports_success():
 
     with (
         patch(
-            "openviking.storage.queuefs.memory_semantic.get_viking_fs",
+            "openviking.storage.queuefs.semantic_processor.get_viking_fs",
             return_value=fake_fs,
         ),
         patch(
@@ -126,7 +126,7 @@ async def test_memory_ls_error_reports_error():
 
     with (
         patch(
-            "openviking.storage.queuefs.memory_semantic.get_viking_fs",
+            "openviking.storage.queuefs.semantic_processor.get_viking_fs",
             return_value=fake_fs,
         ),
         patch(
@@ -180,7 +180,7 @@ async def test_memory_ls_transient_error_requeues():
 
     with (
         patch(
-            "openviking.storage.queuefs.memory_semantic.get_viking_fs",
+            "openviking.storage.queuefs.semantic_processor.get_viking_fs",
             return_value=fake_fs,
         ),
         patch(
@@ -239,7 +239,7 @@ async def test_memory_write_error_reports_error():
 
     with (
         patch(
-            "openviking.storage.queuefs.memory_semantic.get_viking_fs",
+            "openviking.storage.queuefs.semantic_processor.get_viking_fs",
             return_value=fake_fs,
         ),
         patch(
@@ -247,7 +247,7 @@ async def test_memory_write_error_reports_error():
             return_value=None,
         ),
         patch(
-            "openviking.storage.queuefs.semantic_service.get_openviking_config",
+            "openviking.storage.queuefs.semantic_processor.get_openviking_config",
             return_value=SimpleNamespace(
                 semantic=SimpleNamespace(
                     overview_max_chars=100_000,
@@ -256,13 +256,13 @@ async def test_memory_write_error_reports_error():
             ),
         ),
         patch.object(
-            processor._semantic_service,
-            "generate_file_summary",
+            processor,
+            "_generate_single_file_summary",
             new=AsyncMock(return_value={"name": "file1.md", "summary": "test summary"}),
         ),
         patch.object(
-            processor._semantic_service,
-            "generate_overview",
+            processor,
+            "_generate_overview",
             new=AsyncMock(return_value="# Overview\ntest overview"),
         ),
     ):

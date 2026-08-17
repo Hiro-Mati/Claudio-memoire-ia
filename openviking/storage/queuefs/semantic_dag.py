@@ -3,19 +3,17 @@
 """Semantic DAG executor with event-driven lazy dispatch."""
 
 import asyncio
+import re
 import threading
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Set
 from weakref import WeakKeyDictionary
 
+from openviking.parse.parsers.media import get_media_type
 from openviking.server.identity import RequestContext
 from openviking.service.task_work_index import bind_task_context, get_task_context
-from openviking.storage.queuefs.directory_semantic import (
-    DirectorySemanticRequest,
-    DirectorySemanticTask,
-)
-from openviking.storage.queuefs.file_semantic import FileSemanticTask
+from openviking.storage.queuefs.semantic_sidecar import write_semantic_sidecars
 from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
 from openviking.telemetry import bind_telemetry, get_current_telemetry
 from openviking.utils.ingest_options import IngestOptions
@@ -39,7 +37,6 @@ class DirNode:
     file_paths: List[str]
     file_index: Dict[str, int]
     child_index: Dict[str, int]
-    existing_file_summaries: Dict[str, str]
     file_summaries: List[Optional[Dict[str, str]]]
     children_abstracts: List[Optional[Dict[str, str]]]
     pending: int
@@ -54,6 +51,251 @@ class DagStats:
     pending_nodes: int = 0
     in_progress_nodes: int = 0
     done_nodes: int = 0
+
+
+@dataclass(frozen=True)
+class DirectorySemanticRequest:
+    event_id: str
+    track_inflight: bool
+    uri: str
+    context_type: str
+    ctx: RequestContext
+    file_paths: tuple[str, ...]
+    file_summaries: Dict[str, Dict[str, str]]
+    file_summary_updates: Dict[str, Dict[str, str]]
+    children_dirs: tuple[str, ...]
+    children_abstracts: List[Dict[str, str]]
+    preferred_overview: Optional[str]
+    changed: bool
+    skip_vectorization: bool
+    ingest_options: IngestOptions
+    llm_sem: asyncio.Semaphore
+    viking_fs: Any
+    lock: Optional[Dict[str, Any]] = None
+    task_context: Any = field(default_factory=get_task_context)
+    telemetry: Any = field(default_factory=get_current_telemetry)
+
+
+@dataclass(frozen=True)
+class DirectorySemanticResult:
+    abstract: str
+    changed: bool
+    committed: bool
+
+
+@dataclass
+class _DirectoryState:
+    latest_request: Optional[DirectorySemanticRequest] = None
+    latest_order: int = -1
+    revision: int = 0
+    event_orders: Dict[str, int] = field(default_factory=dict)
+    pending_events: set[str] = field(default_factory=set)
+    changed: bool = False
+    summary_updates: Dict[str, tuple[int, Dict[str, str]]] = field(default_factory=dict)
+    waiters: list[tuple[str, asyncio.Future[DirectorySemanticResult]]] = field(default_factory=list)
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    running: bool = False
+
+
+class DirectorySemanticTask:
+    """Merge only in-flight directory L0/L1 work; file work remains per message."""
+
+    def __init__(self, processor: "SemanticProcessor") -> None:
+        self._processor = processor
+        self._states: dict[str, _DirectoryState] = {}
+        self._submission_order = 0
+
+    def mark_dirty(self, directory_uri: str, event_id: str) -> None:
+        directory_uri = directory_uri.rstrip("/")
+        if not directory_uri or not event_id:
+            return
+        state = self._states.setdefault(directory_uri, _DirectoryState())
+        if event_id in state.event_orders:
+            return
+        self._submission_order += 1
+        state.event_orders[event_id] = self._submission_order
+        state.pending_events.add(event_id)
+        state.revision += 1
+        state.ready.clear()
+
+    def discard_dirty(self, directory_uri: str, event_id: str) -> None:
+        directory_uri = directory_uri.rstrip("/")
+        state = self._states.get(directory_uri)
+        if state is None or event_id not in state.pending_events:
+            return
+        state.pending_events.remove(event_id)
+        state.event_orders.pop(event_id, None)
+        if not state.pending_events:
+            state.ready.set()
+        if not state.running and not state.waiters and not state.pending_events:
+            self._states.pop(directory_uri, None)
+
+    async def refresh(self, request: DirectorySemanticRequest) -> DirectorySemanticResult:
+        if not request.track_inflight or not request.event_id:
+            return await self._run_bound(
+                request,
+                request.file_summary_updates,
+                request.changed,
+                lambda: True,
+            )
+
+        directory_uri = request.uri.rstrip("/")
+        self.mark_dirty(directory_uri, request.event_id)
+        state = self._states[directory_uri]
+        waiter: asyncio.Future[DirectorySemanticResult] = asyncio.get_running_loop().create_future()
+        order = state.event_orders[request.event_id]
+        state.pending_events.discard(request.event_id)
+        state.waiters.append((request.event_id, waiter))
+        state.changed = state.changed or request.changed
+        for path, summary in request.file_summary_updates.items():
+            current = state.summary_updates.get(path)
+            if current is None or order >= current[0]:
+                state.summary_updates[path] = (order, dict(summary))
+        if order >= state.latest_order:
+            state.latest_request = request
+            state.latest_order = order
+        if not state.pending_events:
+            state.ready.set()
+
+        if state.running:
+            return await asyncio.shield(waiter)
+        state.running = True
+
+        try:
+            while True:
+                await state.ready.wait()
+                await asyncio.sleep(0)
+                if state.pending_events:
+                    continue
+                revision = state.revision
+                latest = state.latest_request
+                assert latest is not None
+                updates = {
+                    path: dict(ordered_summary[1])
+                    for path, ordered_summary in state.summary_updates.items()
+                }
+                result = await self._run_bound(
+                    latest,
+                    updates,
+                    state.changed,
+                    lambda expected=revision: expected == state.revision,
+                )
+                if revision != state.revision or state.pending_events:
+                    continue
+
+                self._states.pop(directory_uri, None)
+                for event_id, pending in state.waiters:
+                    if not pending.done():
+                        pending.set_result(
+                            DirectorySemanticResult(
+                                abstract=result.abstract,
+                                changed=result.changed,
+                                committed=result.committed and event_id == latest.event_id,
+                            )
+                        )
+                return waiter.result()
+        except asyncio.CancelledError:
+            self._states.pop(directory_uri, None)
+            for _, pending in state.waiters:
+                if not pending.done():
+                    pending.cancel()
+            raise
+        except Exception as error:
+            self._states.pop(directory_uri, None)
+            for _, pending in state.waiters:
+                if pending is waiter:
+                    pending.cancel()
+                elif not pending.done():
+                    pending.set_exception(error)
+            raise
+
+    async def _run_bound(
+        self,
+        request: DirectorySemanticRequest,
+        summary_updates: Dict[str, Dict[str, str]],
+        changed: bool,
+        is_current: Any,
+    ) -> DirectorySemanticResult:
+        task_context = (
+            bind_task_context(
+                request.task_context.task_id,
+                request.task_context.account_id,
+                request.task_context.user_id,
+            )
+            if request.task_context is not None
+            else nullcontext()
+        )
+        with bind_telemetry(request.telemetry), task_context:
+            return await self._generate_and_commit(
+                request,
+                summary_updates,
+                changed,
+                is_current,
+            )
+
+    async def _generate_and_commit(
+        self,
+        request: DirectorySemanticRequest,
+        summary_updates: Dict[str, Dict[str, str]],
+        changed: bool,
+        is_current: Any,
+    ) -> DirectorySemanticResult:
+        if not changed and not summary_updates:
+            try:
+                abstract = await request.viking_fs.read_file(
+                    f"{request.uri}/.abstract.md", ctx=request.ctx
+                )
+                overview = await request.viking_fs.read_file(
+                    f"{request.uri}/.overview.md", ctx=request.ctx
+                )
+                if overview is not None and abstract is not None:
+                    return DirectorySemanticResult(
+                        abstract=abstract,
+                        changed=False,
+                        committed=False,
+                    )
+            except Exception:
+                pass
+
+        file_summaries = [
+            summary_updates.get(path)
+            or request.file_summaries.get(path)
+            or {"name": path.rsplit("/", 1)[-1], "summary": ""}
+            for path in request.file_paths
+        ]
+        overview = request.preferred_overview
+        if overview is None:
+            async with request.llm_sem:
+                overview = await self._processor._generate_overview(
+                    request.uri,
+                    file_summaries,
+                    request.children_abstracts,
+                )
+        overview, abstract = self._processor._normalize_overview_generation(overview)
+
+        wrote = await write_semantic_sidecars(
+            viking_fs=request.viking_fs,
+            dir_uri=request.uri,
+            overview=overview,
+            abstract=abstract,
+            ctx=request.ctx,
+            is_stale=lambda: not is_current(),
+            lock=request.lock,
+            log_prefix="[DirectorySemanticTask]",
+        )
+        if not wrote or not is_current():
+            return DirectorySemanticResult(abstract=abstract, changed=True, committed=False)
+
+        if not request.skip_vectorization:
+            await self._processor._vectorize_directory(
+                request.uri,
+                context_type=request.context_type,
+                abstract=abstract,
+                overview=overview,
+                ctx=request.ctx,
+                ingest_options=request.ingest_options,
+            )
+        return DirectorySemanticResult(abstract=abstract, changed=True, committed=True)
 
 
 @dataclass(frozen=True)
@@ -147,7 +389,7 @@ class SemanticDagExecutor:
 
     def __init__(
         self,
-        semantic_service: "SemanticService",
+        processor: "SemanticProcessor",
         context_type: str,
         max_concurrent_llm: int,
         ctx: RequestContext,
@@ -163,6 +405,7 @@ class SemanticDagExecutor:
         event_id: str = "",
         directory_task: Optional[DirectorySemanticTask] = None,
     ):
+        self._processor = processor
         self._context_type = context_type
         self._ctx = ctx
         self._incremental_update = incremental_update
@@ -177,25 +420,14 @@ class SemanticDagExecutor:
             self._ingest_options if tag_directories else IngestOptions()
         )
         self._event_id = event_id
-        self._directory_task = directory_task or DirectorySemanticTask(semantic_service)
+        self._directory_task = directory_task or DirectorySemanticTask(processor)
         self._task_context = get_task_context()
         self._telemetry = get_current_telemetry()
-        self._root_directory_committed = False
-        self._directory_request_submitted = False
         self._changed_paths = {
             path for key in ("added", "modified", "deleted") for path in self._changes.get(key, [])
         }
         self._node_concurrency = max(1, max_concurrent_llm)
         self._llm_sem = asyncio.Semaphore(max_concurrent_llm)
-        self._file_task = FileSemanticTask(
-            semantic_service,
-            context_type=context_type,
-            ctx=ctx,
-            llm_sem=self._llm_sem,
-            ingest_options=self._ingest_options,
-            skip_vectorization=skip_vectorization,
-            is_code_repo=is_code_repo,
-        )
         self._viking_fs = get_viking_fs()
         self._nodes: Dict[str, DirNode] = {}
         self._parent: Dict[str, Optional[str]] = {}
@@ -210,16 +442,17 @@ class SemanticDagExecutor:
         self._stats = DagStats()
         self._file_change_status: Dict[str, bool] = {}
         self._dir_change_status: Dict[str, bool] = {}
+        self._overview_cache: Dict[str, Dict[str, str]] = {}
+        self._overview_cache_lock = asyncio.Lock()
+        self._root_directory_committed = False
+        self._directory_request_submitted = False
 
     async def run(self, root_uri: str) -> None:
         """Run DAG execution starting from root_uri."""
         self._root_uri = root_uri
         self._root_done = asyncio.Event()
         self._scheduler = get_semantic_node_scheduler(self._node_concurrency)
-        self._directory_task.mark_dirty(
-            root_uri,
-            self._event_id,
-        )
+        self._directory_task.mark_dirty(root_uri, self._event_id)
 
         try:
             self._register_active()
@@ -236,10 +469,7 @@ class SemanticDagExecutor:
             await self._active_work_idle.wait()
             self._unregister_active()
             if not self._directory_request_submitted:
-                self._directory_task.discard_dirty(
-                    root_uri,
-                    self._event_id,
-                )
+                self._directory_task.discard_dirty(root_uri, self._event_id)
 
     def _schedule_work(self, work: DagWork) -> None:
         if self._closed:
@@ -375,15 +605,6 @@ class SemanticDagExecutor:
                 pending = len(children_dirs) + len(file_paths)
             else:
                 pending = len(file_paths)
-            existing_file_summaries = (
-                await self._directory_task.read_file_summaries(
-                    self._viking_fs,
-                    dir_uri,
-                    self._ctx,
-                )
-                if self._incremental_update
-                else {}
-            )
 
             node = DirNode(
                 uri=dir_uri,
@@ -391,7 +612,6 @@ class SemanticDagExecutor:
                 file_paths=file_paths,
                 file_index=file_index,
                 child_index=child_index,
-                existing_file_summaries=existing_file_summaries,
                 file_summaries=[None] * len(file_paths),
                 children_abstracts=[None] * len(children_dirs),
                 pending=pending,
@@ -492,6 +712,62 @@ class SemanticDagExecutor:
         except Exception:
             return True
 
+    async def _read_existing_summary(self, file_path: str) -> Optional[Dict[str, str]]:
+        """Read existing summary from parent directory's .overview.md.
+
+        Args:
+            file_path: Current file path
+
+        Returns:
+            Summary dict with 'name' and 'summary' keys, or None if not found
+        """
+        target_path = self._get_target_file_path(file_path)
+        if not target_path:
+            return None
+
+        try:
+            parent_uri = "/".join(target_path.rsplit("/", 1)[:-1])
+            if not parent_uri:
+                return None
+
+            if parent_uri not in self._overview_cache:
+                try:
+                    from openviking.metrics.datasources.cache import CacheEventDataSource
+
+                    CacheEventDataSource.record_miss("L1")
+                except Exception:
+                    pass
+                async with self._overview_cache_lock:
+                    if parent_uri not in self._overview_cache:
+                        overview_path = f"{parent_uri}/.overview.md"
+                        overview_content = await self._viking_fs.read_file(
+                            overview_path, ctx=self._ctx
+                        )
+                        if overview_content:
+                            self._overview_cache[parent_uri] = self._processor._parse_overview_md(
+                                overview_content
+                            )
+                        else:
+                            self._overview_cache[parent_uri] = {}
+            else:
+                try:
+                    from openviking.metrics.datasources.cache import CacheEventDataSource
+
+                    CacheEventDataSource.record_hit("L1")
+                except Exception:
+                    pass
+
+            existing_summaries = self._overview_cache.get(parent_uri, {})
+            file_name = file_path.split("/")[-1]
+
+            if file_name in existing_summaries:
+                return {"name": file_name, "summary": existing_summaries[file_name]}
+
+        except Exception as e:
+            logger.debug(f"Failed to read existing summary from overview.md for {file_path}: {e}")
+
+        return None
+
     async def _check_dir_children_changed(
         self, dir_uri: str, current_files: List[str], current_dirs: List[str]
     ) -> bool:
@@ -532,34 +808,65 @@ class SemanticDagExecutor:
             return True
 
     async def _file_summary_task(self, parent_uri: str, file_path: str) -> None:
-        node = self._nodes.get(parent_uri)
-        file_name = file_path.rsplit("/", 1)[-1]
+        """Generate file summary and notify parent completion."""
+
+        file_name = file_path.split("/")[-1]
+        need_vectorize = True
         try:
-            content_changed = (
-                await self._check_file_content_changed(file_path)
-                if self._incremental_update
-                else True
-            )
-            existing = None
-            if not content_changed and node is not None:
-                summary = node.existing_file_summaries.get(file_name)
-                if summary is not None:
-                    existing = {"name": file_name, "summary": summary}
-            result = await self._file_task.run(
-                parent_uri=parent_uri,
-                file_path=file_path,
-                content_changed=content_changed,
-                existing_summary=existing,
-            )
-            self._file_change_status[file_path] = result.directory_changed
-            summary_dict = result.summary
+            summary_dict = None
+            if self._incremental_update:
+                content_changed = await self._check_file_content_changed(file_path)
+                self._file_change_status[file_path] = content_changed
+
+                if not content_changed:
+                    summary_dict = await self._read_existing_summary(file_path)
+                    if summary_dict is not None:
+                        need_vectorize = False
+                    else:
+                        self._file_change_status[file_path] = True
+            else:
+                self._file_change_status[file_path] = True
+            if summary_dict is None:
+                summary_dict = await self._processor._generate_single_file_summary(
+                    file_path, llm_sem=self._llm_sem, ctx=self._ctx
+                )
+        except Exception as e:
+            logger.warning(f"Failed to generate summary for {file_path}: {e}")
+            summary_dict = {"name": file_name, "summary": ""}
         finally:
             self._stats.done_nodes += 1
             self._stats.in_progress_nodes = max(0, self._stats.in_progress_nodes - 1)
 
         if self._closed:
             return
-        await self._on_file_done(parent_uri, file_path, summary_dict)
+        if need_vectorize and not self._skip_vectorization:
+            use_summary = self._is_code_repo and bool(summary_dict.get("summary"))
+            try:
+                await self._processor._vectorize_single_file(
+                    parent_uri=parent_uri,
+                    context_type=self._context_type,
+                    file_path=file_path,
+                    summary_dict=summary_dict,
+                    ctx=self._ctx,
+                    use_summary=use_summary,
+                    ingest_options=self._ingest_options,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to schedule vectorization for %s: %s",
+                    file_path,
+                    e,
+                    exc_info=True,
+                )
+                raise
+        await self._on_file_done(
+            parent_uri,
+            file_path,
+            {
+                "name": str(summary_dict.get("name") or file_name),
+                "summary": str(summary_dict.get("summary") or ""),
+            },
+        )
 
     async def _on_file_done(
         self, parent_uri: str, file_path: str, summary_dict: Dict[str, str]
@@ -597,19 +904,48 @@ class SemanticDagExecutor:
         node.overview_scheduled = True
         self._schedule_work(DagWork(kind="overview", dir_uri=dir_uri))
 
-    def _changed_file_summaries(self, node: DirNode) -> Dict[str, Dict[str, str]]:
-        updates: Dict[str, Dict[str, str]] = {}
+    def _finalize_file_summaries(self, node: DirNode) -> List[Dict[str, str]]:
+        summaries: List[Dict[str, str]] = []
         for idx, file_path in enumerate(node.file_paths):
-            if not self._file_change_status.get(file_path, True):
-                continue
-            summary = node.file_summaries[idx]
-            if summary is not None:
-                updates[file_path] = dict(summary)
-        return updates
+            item = node.file_summaries[idx]
+            if item is None:
+                summaries.append({"name": file_path.split("/")[-1], "summary": ""})
+            else:
+                summaries.append(item)
+        return summaries
 
-    @property
-    def root_directory_committed(self) -> bool:
-        return self._root_directory_committed
+    def _select_direct_media_overview(
+        self,
+        node: DirNode,
+        file_summaries: List[Dict[str, str]],
+    ) -> Optional[str]:
+        if len(node.file_paths) != 1 or node.children_dirs or len(file_summaries) != 1:
+            return None
+
+        file_path = node.file_paths[0]
+        filename = file_path.rsplit("/", 1)[-1]
+        if get_media_type(file_path, None) not in {"audio", "video"}:
+            return None
+
+        summary = str(file_summaries[0].get("summary") or "").strip()
+        if not summary.startswith("# "):
+            return None
+
+        lines = summary.splitlines()
+        brief_start = next((idx for idx in range(1, len(lines)) if lines[idx].strip()), None)
+        if brief_start is None or lines[brief_start].lstrip().startswith("#"):
+            return None
+
+        brief_end = brief_start
+        while brief_end < len(lines) and lines[brief_end].strip():
+            if lines[brief_end].lstrip().startswith("#"):
+                return None
+            brief_end += 1
+
+        filename_heading = re.compile(rf"^###\s+{re.escape(filename)}\s*$", re.MULTILINE)
+        if not any(filename_heading.fullmatch(line) for line in lines[brief_end:]):
+            return None
+        return summary
 
     async def _finalize_children_abstracts(self, node: DirNode) -> List[Dict[str, str]]:
         results: List[Dict[str, str]] = []
@@ -625,6 +961,20 @@ class SemanticDagExecutor:
                 results.append(item)
         return results
 
+    def _changed_file_summaries(self, node: DirNode) -> Dict[str, Dict[str, str]]:
+        updates: Dict[str, Dict[str, str]] = {}
+        for idx, file_path in enumerate(node.file_paths):
+            if not self._file_change_status.get(file_path, True):
+                continue
+            summary = node.file_summaries[idx]
+            if summary is not None:
+                updates[file_path] = dict(summary)
+        return updates
+
+    @property
+    def root_directory_committed(self) -> bool:
+        return self._root_directory_committed
+
     async def _overview_task(self, dir_uri: str) -> None:
         node = self._nodes.get(dir_uri)
         if not node:
@@ -639,11 +989,8 @@ class SemanticDagExecutor:
                     node.children_dirs,
                 )
             async with node.lock:
-                file_summaries = {
-                    path: node.file_summaries[idx]
-                    or {"name": path.rsplit("/", 1)[-1], "summary": ""}
-                    for idx, path in enumerate(node.file_paths)
-                }
+                finalized = self._finalize_file_summaries(node)
+                file_summaries = {path: finalized[idx] for idx, path in enumerate(node.file_paths)}
                 children_abstracts = await self._finalize_children_abstracts(node)
             self._directory_request_submitted = dir_uri == self._root_uri
             result = await self._directory_task.refresh(
@@ -658,6 +1005,7 @@ class SemanticDagExecutor:
                     file_summary_updates=file_summary_updates,
                     children_dirs=tuple(node.children_dirs),
                     children_abstracts=children_abstracts,
+                    preferred_overview=self._select_direct_media_overview(node, finalized),
                     changed=changed,
                     skip_vectorization=self._skip_vectorization,
                     ingest_options=self._directory_ingest_options,
@@ -694,4 +1042,4 @@ class SemanticDagExecutor:
 
 
 if False:  # pragma: no cover - for type checkers only
-    from openviking.storage.queuefs.semantic_service import SemanticService
+    from openviking.storage.queuefs.semantic_processor import SemanticProcessor

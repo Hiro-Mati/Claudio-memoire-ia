@@ -15,11 +15,9 @@ exactly 1000 directories under ``resources/wixqa``.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
-
 import pytest
 
-from openviking.storage.queuefs.semantic_sync import sync_semantic_tree
+from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 from openviking.storage.viking_fs import LS_ALL_NODES
 
 
@@ -96,15 +94,15 @@ async def test_sync_materializes_all_children_above_default_node_limit(monkeypat
     n_children = 1500  # > the default node_limit of 1000
     fake = _TruncatingVikingFS(n_children)
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_sync.get_viking_fs",
+        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
         lambda: fake,
     )
     monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_sync.rewrite_image_uris",
-        AsyncMock(),
+        "openviking.storage.queuefs.semantic_processor.rewrite_image_uris",
+        lambda *a, **kw: None,
     )
 
-    diff = await sync_semantic_tree(
+    diff = await SemanticProcessor()._sync_topdown_recursive(
         _TruncatingVikingFS.TEMP,
         _TruncatingVikingFS.TARGET,
         lock=None,
@@ -150,7 +148,7 @@ async def test_semantic_dag_list_dir_enumerates_all_children(monkeypatch):
     )
 
     executor = SemanticDagExecutor(
-        semantic_service=None,
+        processor=None,
         context_type="resource",
         max_concurrent_llm=1,
         ctx=None,

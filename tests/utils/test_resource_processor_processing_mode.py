@@ -309,7 +309,11 @@ async def test_vectors_only_syncs_preexisting_target_instead_of_merging(monkeypa
     )
     sync = AsyncMock()
     monkeypatch.setattr("openviking.utils.resource_processor.get_viking_fs", lambda: viking_fs)
-    monkeypatch.setattr("openviking.utils.resource_processor.sync_semantic_tree", sync)
+    monkeypatch.setattr("openviking.utils.resource_processor.SemanticProcessor", Mock())
+    monkeypatch.setattr(
+        "openviking.utils.resource_processor.SemanticProcessor.return_value._sync_topdown_recursive",
+        sync,
+    )
     monkeypatch.setattr("openviking.utils.resource_processor.rewrite_image_uris", AsyncMock())
     monkeypatch.setattr("openviking.utils.resource_processor.vectorize_file", AsyncMock())
     processor = ResourceProcessor(_FakeVikingDB())
@@ -383,8 +387,9 @@ async def test_vectors_only_deletes_sync_removed_detail_vectors(monkeypatch, ctx
         deleted_dirs=["viking://resources/demo/old-dir"],
     )
     monkeypatch.setattr("openviking.utils.resource_processor.get_viking_fs", lambda: viking_fs)
+    monkeypatch.setattr("openviking.utils.resource_processor.SemanticProcessor", Mock())
     monkeypatch.setattr(
-        "openviking.utils.resource_processor.sync_semantic_tree",
+        "openviking.utils.resource_processor.SemanticProcessor.return_value._sync_topdown_recursive",
         AsyncMock(return_value=diff),
     )
     monkeypatch.setattr("openviking.utils.resource_processor.rewrite_image_uris", AsyncMock())

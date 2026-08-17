@@ -116,11 +116,10 @@ async def test_manual_memory_batching_100_files(monkeypatch):
     # 使用 patch.multiple 来模拟多个 get_xxx 方法
     with (
         patch(
-            "openviking.storage.queuefs.semantic_service.get_openviking_config",
+            "openviking.storage.queuefs.semantic_processor.get_openviking_config",
             return_value=mock_config,
         ),
-        patch("openviking.storage.queuefs.memory_semantic.get_viking_fs", return_value=mock_fs),
-        patch("openviking.storage.queuefs.semantic_service.get_viking_fs", return_value=mock_fs),
+        patch("openviking.storage.queuefs.semantic_processor.get_viking_fs", return_value=mock_fs),
     ):
         # 4. 初始化 Processor 并设置并发
         processor = SemanticProcessor(max_concurrent_llm=10)
@@ -129,7 +128,7 @@ async def test_manual_memory_batching_100_files(monkeypatch):
         active_concurrency = 0
         max_observed_concurrency = 0
         generate_summary_calls = []
-        generate_file_summary = processor._semantic_service.generate_file_summary
+        _generate_single_file_summary = processor._generate_single_file_summary
 
         async def mock_generate_summary(*args, **kwargs):
             nonlocal active_concurrency, max_observed_concurrency, generate_summary_calls
@@ -140,14 +139,12 @@ async def test_manual_memory_batching_100_files(monkeypatch):
                 max_observed_concurrency = max(max_observed_concurrency, active_concurrency)
                 # 模拟 I/O 耗时，给事件循环调度其他协程的机会
                 await asyncio.sleep(0.01)
-                return await generate_file_summary(*args, **kwargs)
+                return await _generate_single_file_summary(*args, **kwargs)
             finally:
                 active_concurrency -= 1
 
         # 将增强后的 mock 应用到 processor
-        monkeypatch.setattr(
-            processor._semantic_service, "generate_file_summary", mock_generate_summary
-        )
+        monkeypatch.setattr(processor, "_generate_single_file_summary", mock_generate_summary)
 
         # 5. 构造消息
         msg = SemanticMsg(
@@ -159,7 +156,7 @@ async def test_manual_memory_batching_100_files(monkeypatch):
 
         # 6. 执行测试
         print(f"\n[Manual Test] 正在处理 {file_count} 个西北大环线旅行记忆文件（分批模式）...")
-        await processor._memory_semantic_task.run(msg)
+        await processor._process_memory_directory(msg)
 
     # 7. 验证结果
     print(f"[Manual Test] 处理完成。LLM 总调用次数: {mock_vlm.call_count}")
