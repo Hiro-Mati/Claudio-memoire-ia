@@ -60,6 +60,7 @@ class Summarizer:
             telemetry_id=telemetry_id,
             changes={"modified": [file_uri]},
             ingest_options=ingest_options,
+            tag_directories=False,
         )
         if telemetry_id:
             get_request_wait_tracker().register_semantic_root(telemetry_id, msg.id)

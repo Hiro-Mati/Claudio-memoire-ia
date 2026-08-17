@@ -131,6 +131,7 @@ async def test_direct_incremental_updates_coalesce_only_directory_generation(mon
             target_uri=root_uri,
             changes={"modified": [f"{root_uri}/{file_name}"]},
             ingest_options=ingest_options,
+            tag_directories=False,
             event_id=f"event-{file_name}",
             directory_task=directory_task,
         )
@@ -161,7 +162,7 @@ async def test_direct_incremental_updates_coalesce_only_directory_generation(mon
         ),
         (f"{root_uri}/.abstract.md", "abstract"),
     ]
-    assert processor.directory_vector_options == [options_b]
+    assert processor.directory_vector_options == [IngestOptions()]
     assert not executor_a.root_directory_committed
     assert executor_b.root_directory_committed
 

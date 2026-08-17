@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from openviking.server.identity import RequestContext, Role
+from openviking.utils.ingest_options import IngestOptions
 from openviking.utils.summarizer import Summarizer
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -211,6 +212,7 @@ async def test_flat_file_refresh_enqueues_incremental_parent_summary():
             file_uri="viking://resources/神雕.md",
             ctx=ctx,
             skip_vectorization=False,
+            ingest_options=IngestOptions.from_search_tags(["team=search"]),
         )
 
     assert result == {"status": "success", "enqueued_count": 1}
@@ -220,6 +222,8 @@ async def test_flat_file_refresh_enqueues_incremental_parent_summary():
     assert msg.recursive is False
     assert msg.changes == {"modified": ["viking://resources/神雕.md"]}
     assert msg.skip_vectorization is False
+    assert msg.ingest_options == IngestOptions.from_search_tags(["team=search"])
+    assert msg.tag_directories is False
     assert msg.telemetry_id == "tid"
     assert wait_tracker.registered == [("tid", msg.id)]
 

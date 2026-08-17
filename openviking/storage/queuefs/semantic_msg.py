@@ -45,6 +45,8 @@ class SemanticMsg:
     is_code_repo: bool = False
     target_preexisting: Optional[bool] = None
     ingest_options: IngestOptions = field(default_factory=IngestOptions)
+    # Flat-file imports tag the file they create, not its pre-existing parent directory.
+    tag_directories: bool = True
     coalesce_key: str = ""
     coalesce_version: int = 0
     changes: Optional[Dict[str, List[str]]] = (
@@ -67,6 +69,7 @@ class SemanticMsg:
         is_code_repo: bool = False,
         target_preexisting: Optional[bool] = None,
         ingest_options: IngestOptions | Dict[str, Any] | None = None,
+        tag_directories: bool = True,
         coalesce_key: str = "",
         coalesce_version: int = 0,
         changes: Optional[Dict[str, List[str]]] = None,
@@ -86,6 +89,7 @@ class SemanticMsg:
         self.is_code_repo = is_code_repo
         self.target_preexisting = target_preexisting
         self.ingest_options = IngestOptions.from_value(ingest_options)
+        self.tag_directories = tag_directories
         self.coalesce_key = coalesce_key
         self.coalesce_version = coalesce_version
         self.changes = changes
@@ -138,6 +142,7 @@ class SemanticMsg:
                     "search_tag_mode": data.get("search_tag_mode", "replace"),
                 }
             ),
+            tag_directories=data.get("tag_directories", True),
             coalesce_key=data.get("coalesce_key", ""),
             coalesce_version=data.get("coalesce_version", 0),
             changes=data.get("changes"),

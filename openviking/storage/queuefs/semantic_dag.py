@@ -159,6 +159,7 @@ class SemanticDagExecutor:
         changes: Optional[Dict[str, List[str]]] = None,
         skip_vectorization: bool = False,
         ingest_options: IngestOptions | None = None,
+        tag_directories: bool = True,
         event_id: str = "",
         directory_task: Optional[DirectorySemanticTask] = None,
     ):
@@ -172,6 +173,9 @@ class SemanticDagExecutor:
         self._changes = changes or {}
         self._skip_vectorization = skip_vectorization
         self._ingest_options = IngestOptions.from_value(ingest_options)
+        self._directory_ingest_options = (
+            self._ingest_options if tag_directories else IngestOptions()
+        )
         self._event_id = event_id
         self._directory_task = directory_task or DirectorySemanticTask(semantic_service)
         self._task_context = get_task_context()
@@ -656,7 +660,7 @@ class SemanticDagExecutor:
                     children_abstracts=children_abstracts,
                     changed=changed,
                     skip_vectorization=self._skip_vectorization,
-                    ingest_options=self._ingest_options,
+                    ingest_options=self._directory_ingest_options,
                     llm_sem=self._llm_sem,
                     viking_fs=self._viking_fs,
                     lock=self._lock,

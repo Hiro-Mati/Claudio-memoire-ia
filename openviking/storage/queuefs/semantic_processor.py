@@ -372,6 +372,7 @@ class SemanticProcessor(DequeueHandlerBase):
                                 changes=changes,
                                 skip_vectorization=msg.skip_vectorization,
                                 ingest_options=msg.ingest_options,
+                                tag_directories=msg.tag_directories,
                                 event_id=msg.id,
                                 directory_task=self._directory_semantic_task,
                             )
