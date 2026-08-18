@@ -71,6 +71,7 @@ class BatchTrainEvalConfig:
     direct_experience_uri: str | None = None
     server_url: str | None = None
     api_key: str | None = None
+    server_headers: dict[str, str] = field(default_factory=dict)
     account_id: str = "default"
     user_id: str = "default"
     commit_keep_recent_count: int = 0
@@ -684,6 +685,9 @@ def _build_http_client(config: BatchTrainEvalConfig) -> AsyncHTTPClient:
     # identity and account/user assertion headers must not be sent.
     account = config.account_id if auth_mode == AuthMode.TRUSTED else None
     user = config.user_id if auth_mode == AuthMode.TRUSTED else None
+    client_kwargs: dict[str, Any] = {}
+    if config.server_headers:
+        client_kwargs["extra_headers"] = dict(config.server_headers)
     return AsyncHTTPClient(
         url=server_url,
         api_key=api_key,
@@ -691,6 +695,7 @@ def _build_http_client(config: BatchTrainEvalConfig) -> AsyncHTTPClient:
         user=user,
         profile_enabled=False,
         timeout=max(60.0, (config.commit_timeout_seconds or 600.0) + 30.0),
+        **client_kwargs,
     )
 
 

@@ -20,6 +20,7 @@ _SECRET_OPTIONS = (
     "access-token",
     "auth-token",
     "password",
+    "server-header",
     "secret",
     "token",
 )

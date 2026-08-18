@@ -6,12 +6,42 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+
+_HEADER_NAME_PATTERN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+
+def _parse_server_header(value: str) -> tuple[str, str]:
+    """Parse one repeatable OpenViking server header CLI argument."""
+
+    raw = str(value or "").strip()
+    colon_index = raw.find(":")
+    equals_index = raw.find("=")
+    if colon_index > 0 and (equals_index < 0 or colon_index < equals_index):
+        name, header_value = raw.split(":", 1)
+    elif equals_index > 0:
+        name, header_value = raw.split("=", 1)
+    else:
+        raise argparse.ArgumentTypeError(
+            "server header must use NAME=VALUE or NAME:VALUE"
+        )
+
+    name = name.strip()
+    header_value = header_value.strip()
+    if not _HEADER_NAME_PATTERN.fullmatch(name):
+        raise argparse.ArgumentTypeError(f"invalid server header name: {name!r}")
+    if not header_value:
+        raise argparse.ArgumentTypeError(f"server header {name!r} has an empty value")
+    if "\r" in header_value or "\n" in header_value:
+        raise argparse.ArgumentTypeError("server header value must not contain newlines")
+    return name, header_value
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,6 +84,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--api-key", default=None, help="OpenViking API key. Defaults to ov.conf/ovcli.conf"
+    )
+    parser.add_argument(
+        "--server-header",
+        action="append",
+        type=_parse_server_header,
+        default=[],
+        metavar="NAME=VALUE",
+        help=(
+            "Extra header sent with every OpenViking server request. Repeat for multiple "
+            "headers; accepts NAME=VALUE or NAME:VALUE."
+        ),
     )
     parser.add_argument(
         "--account-id", default="default", help="OpenViking trusted account id. Default: default"
@@ -276,6 +317,7 @@ async def main_async() -> int:
             config_path=str(Path(args.config).expanduser()) if args.config else None,
             server_url=args.server_url,
             api_key=args.api_key,
+            server_headers=dict(args.server_header),
             account_id=args.account_id,
             user_id=args.user_id,
             output_path=args.output,

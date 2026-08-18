@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
+import pytest
+
+from openviking.session.train import batch_runner
 from openviking.session.train.batch_runner import BatchTrainEvalConfig
-from openviking.session.train.run_batch_train_eval import parse_args
+from openviking.session.train.run_batch_train_eval import _parse_server_header, parse_args
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -54,6 +58,90 @@ def test_train_concurrency_explicit_overrides_are_preserved(monkeypatch) -> None
     assert args.commit_concurrency == 90
     assert config.concurrency == 80
     assert config.commit_concurrency == 90
+
+
+def test_server_headers_are_repeatable(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_batch_train_eval",
+            "--dataset",
+            "tau2",
+            "--domain",
+            "airline",
+            "--server-header",
+            "X-Tenant-ID=tenant-a",
+            "--server-header",
+            "Authorization: Bearer token==",
+        ],
+    )
+
+    args = parse_args()
+
+    assert dict(args.server_header) == {
+        "X-Tenant-ID": "tenant-a",
+        "Authorization": "Bearer token==",
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "missing-separator",
+        "Bad Header=value",
+        "X-Empty=",
+        "X-Newline=value\nnext",
+    ),
+)
+def test_server_header_rejects_invalid_values(value: str) -> None:
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_server_header(value)
+
+
+def test_build_http_client_passes_server_headers(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(batch_runner, "AsyncHTTPClient", FakeClient)
+    config = BatchTrainEvalConfig(
+        dataset="tau2",
+        domain="airline",
+        server_url="http://127.0.0.1:1933",
+        api_key="test-key",
+        server_headers={
+            "X-Tenant-ID": "tenant-a",
+            "Authorization": "Bearer token",
+        },
+    )
+
+    client = batch_runner._build_http_client(config)
+
+    assert isinstance(client, FakeClient)
+    assert captured["extra_headers"] == config.server_headers
+
+
+def test_build_http_client_preserves_config_headers_by_default(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(batch_runner, "AsyncHTTPClient", FakeClient)
+    config = BatchTrainEvalConfig(
+        dataset="tau2",
+        domain="airline",
+        server_url="http://127.0.0.1:1933",
+        api_key="test-key",
+    )
+
+    batch_runner._build_http_client(config)
+
+    assert "extra_headers" not in captured
 
 
 def test_tau2_launchers_use_concurrency_150() -> None:

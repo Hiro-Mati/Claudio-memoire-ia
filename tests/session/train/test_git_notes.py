@@ -49,7 +49,8 @@ def test_git_notes_reporter_appends_redacted_stage_summaries(tmp_path: Path):
         run_id="run-123",
         launch_command=(
             "bash benchmark/tau2/train/restart_vikingbot_train_eval.sh "
-            "--auto-commit --api-key top-secret --token=also-secret --epochs 2"
+            "--auto-commit --api-key top-secret --token=also-secret "
+            "--server-header 'Authorization: Bearer header-secret' --epochs 2"
         ),
         output_path="result/tau2/train/run_123/report.json",
         events_path="result/tau2/train/run_123/events.jsonl",
@@ -101,6 +102,8 @@ def test_git_notes_reporter_appends_redacted_stage_summaries(tmp_path: Path):
     assert "--token='***'" in note
     assert "top-secret" not in note
     assert "also-secret" not in note
+    assert "header-secret" not in note
+    assert "--server-header '***'" in note
     assert "### baseline_test" in note
     assert "passed: 5/16" in note
     assert "accuracy: 31.25%" in note
