@@ -167,6 +167,9 @@ class MemoryOperationSource(BaseModel):
     task_id: Optional[str] = None
     trace_id: Optional[str] = None
     extracted_at: Optional[str] = None
+    context_memory_refs: List[str] = Field(default_factory=list)
+    context_event_refs: List[str] = Field(default_factory=list)
+    resource_refs: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 # ============================================================================

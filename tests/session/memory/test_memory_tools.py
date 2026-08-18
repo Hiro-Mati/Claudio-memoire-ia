@@ -231,6 +231,34 @@ class TestMemoryTools:
         assert viking_fs.received_target_uri == tool_ctx.default_search_uris
         assert viking_fs.received_limit == 12
 
+    @pytest.mark.asyncio
+    async def test_search_tool_returns_resource_uris(self):
+        class MockSearchResult:
+            def to_dict(self):
+                return {
+                    "memories": [],
+                    "resources": [
+                        {"uri": "viking://resources/project-a/sop.md", "score": 0.8},
+                        {"uri": "viking://resources/project-a/.overview.md", "score": 0.7},
+                    ],
+                    "skills": [],
+                }
+
+        class MockVikingFS:
+            async def search(self, query, target_uri="", limit=10, ctx=None, **kwargs):
+                return MockSearchResult()
+
+        tool_ctx = ToolContext(
+            viking_fs=MockVikingFS(),
+            request_ctx=RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER),
+            default_search_uris=["viking://resources/"],
+            read_file_contents={},
+        )
+
+        result = await MemorySearchTool().execute(tool_ctx, query="gray release", limit=5)
+
+        assert result == [{"uri": "viking://resources/project-a/sop.md", "score": 0.8}]
+
     def test_ls_tool_properties(self):
         """Test MemoryLsTool properties."""
         tool = MemoryLsTool()

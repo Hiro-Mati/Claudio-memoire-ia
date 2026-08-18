@@ -5,8 +5,10 @@ Test that provider instruction correctly instructs LLM.
 """
 
 from openviking.message import ImagePart, Message, TextPart, ToolPart
+from openviking.server.identity import RequestContext, Role
 from openviking.session.memory.session_extract_context_provider import SessionExtractContextProvider
 from openviking.session.memory.vision_message_normalizer import IMAGE_DESCRIPTION_PROMPT
+from openviking_cli.session.user_id import UserIdentifier
 
 
 class TestProviderInstruction:
@@ -49,6 +51,15 @@ class TestProviderInstruction:
         assert "Peer Memory" in instruction
         assert "profile/preferences/entities/events" in instruction
         assert "cases/patterns/tools/skills" in instruction
+
+    def test_instruction_explains_recall_grounding(self):
+        provider = SessionExtractContextProvider(messages=[])
+
+        instruction = provider.instruction()
+
+        assert "Evidence and Recall Grounding" in instruction
+        assert "New memory facts MUST be grounded in the Conversation History" in instruction
+        assert "Resource context is not a factual source for group-chat memory" in instruction
 
     def test_instruction_omits_resource_uri_handling_without_resource_uri(self):
         provider = SessionExtractContextProvider(
@@ -340,6 +351,79 @@ class TestSessionConversationToolFiltering:
         assert len(messages) == 1
         assert any(isinstance(part, ImagePart) for part in messages[0].parts)
         assert provider.messages is not messages
+
+
+    async def test_prefetch_appends_selective_recall_context(self):
+        class FakeSearchResult:
+            def __init__(self, uris):
+                self._uris = uris
+
+            def to_dict(self):
+                return {
+                    "memories": [
+                        {"uri": uri, "score": 0.9}
+                        for uri in self._uris
+                    ],
+                }
+
+        class FakeVikingFS:
+            def __init__(self):
+                self.search_calls = []
+
+            async def search(self, query, target_uri="", limit=10, ctx=None):
+                self.search_calls.append(
+                    {"query": query, "target_uri": target_uri, "limit": limit, "ctx": ctx}
+                )
+                if target_uri == ["viking://resources/"]:
+                    return FakeSearchResult(["viking://resources/project-a/sop.md"])
+                return FakeSearchResult([])
+
+            async def read_file(self, uri, ctx=None):
+                return (
+                    "# Project A SOP\n"
+                    "Release uses gray plan B.\n\n"
+                    "<!-- MEMORY_FIELDS\n"
+                    '{"memory_type": "resource"}\n'
+                    "-->"
+                )
+
+        request_ctx = RequestContext(
+            user=UserIdentifier(account_id="default", user_id="default"),
+            role=Role.USER,
+        )
+        provider = SessionExtractContextProvider(
+            messages=[
+                Message(
+                    id="m1",
+                    role="user",
+                    parts=[TextPart("项目 A 继续按灰度方案 B 走。")],
+                )
+            ],
+            ctx=request_ctx,
+            viking_fs=FakeVikingFS(),
+            extraction_context_policy={
+                "memory_recall": {"enabled": False},
+                "event_recall": {"enabled": False},
+                "resource_recall": {
+                    "enabled": True,
+                    "scopes": ["viking://resources/"],
+                    "max_entries": 1,
+                    "max_tokens": 200,
+                },
+            },
+        )
+
+        prefetch_messages = await provider.prefetch()
+
+        assert any("recall_resource" in message["content"] for message in prefetch_messages)
+        assert provider.recall_refs()["resource"] == [
+            {
+                "resource_uri": "viking://resources/project-a/sop.md",
+                "source": "extraction_context_recall",
+            }
+        ]
+        assert provider._viking_fs.search_calls[-1]["target_uri"] == ["viking://resources/"]
+
 
 def test_session_provider_empty_messages_still_uses_environment_fallback(monkeypatch):
     monkeypatch.setenv("TZ", "Asia/Shanghai")

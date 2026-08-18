@@ -59,6 +59,49 @@ async def test_session_config_updates_event_tags_and_auto_commit_policy(
     assert disabled.json()["result"]["auto_commit_policy"] is None
 
 
+async def test_session_config_updates_extraction_context_policy(client: httpx.AsyncClient):
+    created = await client.post(
+        "/api/v1/sessions",
+        json={
+            "memory_extraction_config": {
+                "extraction_context_policy": {
+                    "memory_recall": {"enabled": True, "max_entries": 3},
+                    "resource_recall": {
+                        "enabled": True,
+                        "scopes": ["viking://resources/project-a/"],
+                        "max_entries": 2,
+                    },
+                }
+            }
+        },
+    )
+    assert created.status_code == 200
+    session_id = created.json()["result"]["session_id"]
+    policy = created.json()["result"]["memory_extraction_config"]["extraction_context_policy"]
+    assert policy["memory_recall"]["max_entries"] == 3
+    assert policy["resource_recall"]["enabled"] is True
+    assert policy["resource_recall"]["scopes"] == ["viking://resources/project-a/"]
+
+    updated = await client.patch(
+        f"/api/v1/sessions/{session_id}/config",
+        json={
+            "memory_extraction_config": {
+                "extraction_context_policy": {
+                    "resource_recall": {"max_tokens": 1234}
+                }
+            }
+        },
+    )
+    assert updated.status_code == 200
+    updated_policy = updated.json()["result"]["memory_extraction_config"][
+        "extraction_context_policy"
+    ]
+    assert updated_policy["resource_recall"]["enabled"] is True
+    assert updated_policy["resource_recall"]["max_entries"] == 2
+    assert updated_policy["resource_recall"]["max_tokens"] == 1234
+    assert updated_policy["resource_recall"]["scopes"] == ["viking://resources/project-a/"]
+
+
 async def test_session_event_tags_discard_invalid_values(client: httpx.AsyncClient):
     response = await client.post(
         "/api/v1/sessions",

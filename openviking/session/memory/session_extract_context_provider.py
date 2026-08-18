@@ -11,8 +11,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from openviking.message.part import TextPart, ToolPart
 from openviking.server.identity import RequestContext, ToolContext
+from openviking.session.extraction_context_policy import ExtractionContextPolicy, RecallPolicy
 from openviking.session.memory.core import ExtractContextProvider
 from openviking.session.memory.dataclass import MemoryFile
+from openviking.session.memory.constants import EVENT_MEMORY_TYPE
 from openviking.session.memory.memory_isolation_handler import (
     MemoryIsolationHandler,
     RoleScope,
@@ -45,6 +47,7 @@ _PREFETCH_SEARCH_QUERY_MAX_CHARS = 5000
 _PREFETCH_SEARCH_TEXT_PART_MAX_CHARS = 1000
 _PREFETCH_SEARCH_ASSISTANT_TEXT_PART_MAX_CHARS = 500
 _PREFETCH_SEARCH_TOOL_FIELD_MAX_CHARS = 500
+_RECALL_SNIPPET_MAX_CHARS = 1200
 _RESOURCE_REASON_LANGUAGE_RE = re.compile(
     r"(?im)^\s*(?:User reason|用户说明|用户原因|用户理由)[:：]\s*(.+?)\s*$"
 )
@@ -64,6 +67,7 @@ class SessionExtractContextProvider(ExtractContextProvider):
         ctx: RequestContext = None,
         viking_fs: VikingFS = None,
         transaction_handle=None,
+        extraction_context_policy: Optional[Dict[str, Any]] = None,
     ):
         self.messages = list(messages) if isinstance(messages, list) else messages
         self.latest_archive_overview = latest_archive_overview
@@ -81,12 +85,19 @@ class SessionExtractContextProvider(ExtractContextProvider):
         self._viking_fs = viking_fs
         self._transaction_handle = transaction_handle
         self._link_enabled = config.memory.link_enabled if config.memory else False
+        self._extraction_context_policy = ExtractionContextPolicy.from_dict(
+            extraction_context_policy
+        )
+        self._recall_refs: Dict[str, List[Any]] = {"memory": [], "event": [], "resource": []}
         self._vision_messages_prepared = False
         self._vision_vlm = None
 
     @property
     def read_file_contents(self) -> Dict[str, MemoryFile]:
         return self._read_file_contents
+
+    def recall_refs(self) -> Dict[str, List[Any]]:
+        return {key: list(value) for key, value in self._recall_refs.items()}
 
     def get_conversation_text(self) -> str:
         """Get the full conversation text for match_text validation."""
@@ -234,6 +245,15 @@ For events with ranges, the system derives self/peer targets from the message ra
 Message role is authoritative: user-role content is the source for profile/preferences/entities/events,
 and assistant-role content is the source for cases/patterns/tools/skills. Do not infer ownership
 from neighboring messages.
+
+## Evidence and Recall Grounding
+- New memory facts MUST be grounded in the Conversation History message ranges from this extraction.
+- Recalled memory, event/archive, and resource context is optional background for disambiguation,
+  timeline continuity, and private terminology only.
+- Do NOT create a new memory when the only supporting fact comes from recalled context and the
+  Conversation History contains no new active evidence.
+- Resource context is not a factual source for group-chat memory; keep resource URIs as references
+  only when the active conversation actually mentions or uses that resource-backed context.
 """
 
         return goal
@@ -437,8 +457,13 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
             )
             if isinstance(result, list):
                 return [m.get("uri", "") for m in result if m.get("uri")]
-            elif isinstance(result, dict) and "memories" in result:
-                return [m.get("uri", "") for m in result.get("memories", []) if m.get("uri")]
+            elif isinstance(result, dict):
+                uris: List[str] = []
+                for key in ("memories", "resources", "skills"):
+                    values = result.get(key)
+                    if isinstance(values, list):
+                        uris.extend(m.get("uri", "") for m in values if m.get("uri"))
+                return uris
             return []
         except Exception as e:
             tracer.error(f"Failed to search: {e}")
@@ -461,6 +486,183 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
             )
             return call_id + 1
         return call_id
+
+    @staticmethod
+    def _fit_token_budget(text: str, max_tokens: int) -> str:
+        if max_tokens <= 0:
+            return ""
+        from openviking.utils.token_estimation import truncate_text_to_token_budget
+
+        return truncate_text_to_token_budget(str(text or ""), max_tokens)
+
+    @staticmethod
+    def _dedupe_uris(uris: List[str]) -> List[str]:
+        return [uri for uri in dict.fromkeys(str(item or "") for item in uris) if uri]
+
+    def _record_recall_ref(self, category: str, uri: str) -> None:
+        if not uri:
+            return
+        refs = self._recall_refs.setdefault(category, [])
+        if category == "resource":
+            resource_ref = {
+                "resource_uri": uri,
+                "source": "extraction_context_recall",
+            }
+            if resource_ref not in refs:
+                refs.append(resource_ref)
+            return
+        if uri not in refs:
+            refs.append(uri)
+
+    def _render_memory_search_dirs(self, *, include_events: bool) -> List[str]:
+        dirs: List[str] = []
+        rolescope: RoleScope = (
+            self._isolation_handler.get_read_scope()
+            if self._isolation_handler
+            else RoleScope(
+                user_ids=[self._ctx.user.user_id] if self._ctx and self._ctx.user else [],
+                peer_ids=[],
+            )
+        )
+        for schema in self._get_registry().list_all(include_disabled=False):
+            if not schema.directory:
+                continue
+            if (getattr(schema, "memory_type", "") == EVENT_MEMORY_TYPE) != include_events:
+                continue
+            if self._isolation_handler and not self._isolation_handler.allows_schema(schema):
+                continue
+            if self._isolation_handler:
+                dirs.extend(self._isolation_handler.render_schema_directories(schema))
+                continue
+            for user_id in rolescope.user_ids:
+                dirs.append(render_template(schema.directory, {"user_space": user_id}))
+                for peer_id in rolescope.peer_ids:
+                    dirs.append(
+                        render_template(
+                            schema.directory,
+                            {"user_space": peer_user_space(user_id, peer_id)},
+                        )
+                    )
+        return self._dedupe_uris(dirs)
+
+    async def _read_recall_snippet(self, uri: str, *, max_chars: int = _RECALL_SNIPPET_MAX_CHARS) -> Dict[str, Any]:
+        result = await self.read_file(uri)
+        if not isinstance(result, dict) or result.get("error"):
+            return {}
+        snippet = str(result.get("content") or "")
+        if len(snippet) > max_chars:
+            snippet = snippet[: max_chars - 3].rstrip() + "..."
+        return {
+            key: value
+            for key, value in {
+                "uri": uri,
+                "memory_type": result.get("memory_type"),
+                "title": result.get("title") or result.get("name") or result.get("topic"),
+                "content": snippet,
+            }.items()
+            if value
+        }
+
+    async def _build_recall_section(
+        self,
+        *,
+        category: str,
+        title: str,
+        policy: RecallPolicy,
+        search_dirs: List[str],
+        query: str,
+        call_id_seq: int,
+        pre_fetch_messages: List[Dict[str, Any]],
+    ) -> int:
+        if not policy.active() or not search_dirs or not query.strip():
+            return call_id_seq
+        query_budget = max(1, policy.max_queries)
+        candidate_uris: List[str] = []
+        # First query is the compact conversation query. Additional query slots
+        # are reserved for future planner-produced queries without changing the API.
+        for _query in [query][:query_budget]:
+            candidate_uris.extend(
+                await self.search_files(
+                    query=_query,
+                    search_uris=search_dirs,
+                    limit=policy.max_entries,
+                )
+            )
+        uris = self._dedupe_uris(candidate_uris)[: policy.max_entries]
+        snippets: List[Dict[str, Any]] = []
+        remaining_tokens = policy.max_tokens
+        for uri in uris:
+            snippet = await self._read_recall_snippet(uri)
+            if not snippet:
+                continue
+            rendered = self._fit_token_budget(
+                str(snippet.get("content") or ""),
+                remaining_tokens,
+            )
+            if not rendered:
+                break
+            snippet["content"] = rendered
+            remaining_tokens -= max(1, len(rendered) // 4)
+            snippets.append(snippet)
+            self._record_recall_ref(category, uri)
+            if remaining_tokens <= 0:
+                break
+        if snippets:
+            add_tool_call_pair_to_messages(
+                messages=pre_fetch_messages,
+                call_id=call_id_seq,
+                tool_name=f"recall_{category}",
+                params={
+                    "query": "[Keywords]",
+                    "scope": search_dirs,
+                    "note": (
+                        "Recall context only; new facts must be grounded in "
+                        "Conversation History message ranges."
+                    ),
+                },
+                result={"title": title, "items": snippets},
+            )
+            call_id_seq += 1
+        return call_id_seq
+
+    async def _append_selective_recall_context(
+        self,
+        *,
+        pre_fetch_messages: List[Dict[str, Any]],
+        call_id_seq: int,
+    ) -> int:
+        policy = self._extraction_context_policy
+        query = self._build_prefetch_search_query()
+        if not query:
+            return call_id_seq
+        call_id_seq = await self._build_recall_section(
+            category="memory",
+            title="Recalled Historical Memories",
+            policy=policy.memory_recall,
+            search_dirs=self._render_memory_search_dirs(include_events=False),
+            query=query,
+            call_id_seq=call_id_seq,
+            pre_fetch_messages=pre_fetch_messages,
+        )
+        call_id_seq = await self._build_recall_section(
+            category="event",
+            title="Recalled Historical Events",
+            policy=policy.event_recall,
+            search_dirs=self._render_memory_search_dirs(include_events=True),
+            query=query,
+            call_id_seq=call_id_seq,
+            pre_fetch_messages=pre_fetch_messages,
+        )
+        call_id_seq = await self._build_recall_section(
+            category="resource",
+            title="Recalled Resources",
+            policy=policy.resource_recall,
+            search_dirs=list(policy.resource_recall.scopes),
+            query=query,
+            call_id_seq=call_id_seq,
+            pre_fetch_messages=pre_fetch_messages,
+        )
+        return call_id_seq
 
     async def prefetch(self) -> List[Dict]:
         """
@@ -492,7 +694,14 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
         ls_dirs = set()  # directories to ls (for multi-file schemas)
         read_files = set()  # files to read directly (for single-file schemas)
 
-        rolescope: RoleScope = self._isolation_handler.get_read_scope()
+        rolescope: RoleScope = (
+            self._isolation_handler.get_read_scope()
+            if self._isolation_handler
+            else RoleScope(
+                user_ids=[self._ctx.user.user_id] if self._ctx and self._ctx.user else [],
+                peer_ids=[],
+            )
+        )
 
         for schema in schemas:
             if not schema.directory:
@@ -577,6 +786,11 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
                     call_id=call_id_seq,
                     file_uri=file_uri,
                 )
+
+        call_id_seq = await self._append_selective_recall_context(
+            pre_fetch_messages=pre_fetch_messages,
+            call_id_seq=call_id_seq,
+        )
 
         return pre_fetch_messages
 

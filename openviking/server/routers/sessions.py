@@ -116,10 +116,34 @@ class EventExtractionConfigRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class RecallPolicyRequest(BaseModel):
+    """Selective recall controls for extraction context."""
+
+    enabled: Optional[bool] = None
+    mode: Optional[Literal["off", "selective"]] = None
+    max_queries: Optional[int] = None
+    max_entries: Optional[int] = None
+    max_tokens: Optional[int] = None
+    scopes: Optional[List[str]] = None
+
+    model_config = {"extra": "forbid"}
+
+
+class ExtractionContextPolicyRequest(BaseModel):
+    """Commit-time recall policy used while extracting long-term memories."""
+
+    memory_recall: Optional[RecallPolicyRequest] = None
+    event_recall: Optional[RecallPolicyRequest] = None
+    resource_recall: Optional[RecallPolicyRequest] = None
+
+    model_config = {"extra": "forbid"}
+
+
 class MemoryExtractionConfigRequest(BaseModel):
     """Per-memory-type extraction configuration."""
 
     events: Optional[EventExtractionConfigRequest] = None
+    extraction_context_policy: Optional[ExtractionContextPolicyRequest] = None
 
     model_config = {"extra": "forbid"}
 
@@ -197,6 +221,15 @@ def _event_tags_from_extraction_config(
     if events is None:
         return None
     return events.tags
+
+
+def _extraction_context_policy_from_config(
+    config: Optional[MemoryExtractionConfigRequest],
+) -> Optional[Dict[str, Any]]:
+    """Extract explicit extraction context policy updates from config."""
+    if config is None or config.extraction_context_policy is None:
+        return None
+    return config.extraction_context_policy.model_dump(exclude_none=True)
 
 
 def _commit_event_tags(
@@ -291,6 +324,9 @@ async def create_session(
         auto_commit_policy_payload = request.auto_commit_policy.model_dump(exclude_none=True)
 
     event_tags = _event_tags_from_extraction_config(request.memory_extraction_config)
+    extraction_context_policy = _extraction_context_policy_from_config(
+        request.memory_extraction_config
+    )
 
     async def _create() -> dict[str, Any]:
         await service.initialize_user_directories(_ctx)
@@ -301,6 +337,7 @@ async def create_session(
             auto_commit_policy=auto_commit_policy_payload,
             update_auto_commit_policy=update_auto_commit_policy,
             event_tags=event_tags,
+            extraction_context_policy=extraction_context_policy,
         )
         return {
             "session_id": session.session_id,
@@ -387,6 +424,9 @@ async def update_session_config(
     event_tags = _event_tags_from_extraction_config(
         request.memory_extraction_config
     )
+    extraction_context_policy = _extraction_context_policy_from_config(
+        request.memory_extraction_config
+    )
     update_auto_commit_policy = "auto_commit_policy" in request.model_fields_set
     auto_commit_policy = (
         request.auto_commit_policy.model_dump(exclude_none=True)
@@ -399,6 +439,7 @@ async def update_session_config(
             session_id,
             _ctx,
             event_tags=event_tags,
+            extraction_context_policy=extraction_context_policy,
             auto_commit_policy=auto_commit_policy,
             update_auto_commit_policy=update_auto_commit_policy,
         )

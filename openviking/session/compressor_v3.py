@@ -22,6 +22,7 @@ from uuid import uuid4
 from openviking.core.context import Context
 from openviking.message import Message
 from openviking.server.identity import RequestContext
+from openviking.session.extraction_context_policy import ExtractionContextPolicy
 from openviking.session.memory import ExtractLoop, MemoryUpdater, StreamingMemoryUpdaterConfig
 from openviking.session.memory.constants import (
     AGENT_EVOLUTION_MEMORY_TYPES,
@@ -363,6 +364,7 @@ class SessionCompressorV3:
         allow_self_memory: bool = True,
         allowed_peer_ids: Optional[set[str]] = None,
         event_search_tags: Optional[List[str]] = None,
+        extraction_context_policy: Optional[dict[str, Any]] = None,
     ):
         if not agent_evolution_enabled:
             effective_types = (
@@ -402,6 +404,7 @@ class SessionCompressorV3:
                 allow_self_memory=allow_self_memory,
                 allowed_peer_ids=allowed_peer_ids,
                 event_search_tags=event_search_tags,
+                extraction_context_policy=extraction_context_policy,
             )
             agent_memory_types = _allowed_agent_memory_types(allowed_memory_types)
             cases_allowed = (
@@ -603,6 +606,7 @@ class SessionCompressorV3:
         allow_self_memory: bool = True,
         allowed_peer_ids: Optional[set[str]] = None,
         event_search_tags: Optional[List[str]] = None,
+        extraction_context_policy: Optional[dict[str, Any]] = None,
     ) -> "_V3ExtractionResult":
         del user
         if not messages:
@@ -633,6 +637,9 @@ class SessionCompressorV3:
             ctx=ctx,
             viking_fs=viking_fs,
             transaction_handle=None,
+            extraction_context_policy=ExtractionContextPolicy.from_dict(
+                extraction_context_policy
+            ).to_dict(),
         )
         await context_provider.prepare_extraction_messages()
         extract_context = context_provider.get_extract_context()
@@ -665,6 +672,7 @@ class SessionCompressorV3:
 
         extraction_id = uuid4().hex
         extracted_at = datetime.now(timezone.utc).isoformat()
+        recall_refs = context_provider.recall_refs()
 
         updater = await get_streaming_memory_updater(
             key=make_streaming_memory_updater_key(request_context=ctx),
@@ -689,6 +697,9 @@ class SessionCompressorV3:
                     "archive_uri": archive_uri,
                     "trace_id": tracer.get_trace_id(),
                     "extracted_at": extracted_at,
+                    "context_memory_refs": recall_refs.get("memory", []),
+                    "context_event_refs": recall_refs.get("event", []),
+                    "resource_refs": recall_refs.get("resource", []),
                 },
             )
         )

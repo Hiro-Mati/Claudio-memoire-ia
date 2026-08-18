@@ -5,6 +5,13 @@ description: |
   Each preference should be about a specific topic (not generic).
   Topics can be: code style, communication style, tools, workflow, food, commute, etc.
   Store different topics as separate memory files, do NOT mix unrelated preferences.
+  Preserve scenario, task, project, environment, audience, and constraint qualifiers.
+  Do not infer global preferences from scene-specific evidence.
+  If the same object has different preferences in different contexts, keep separate scoped
+  preference bullets instead of overwriting one with the other.
+  Only supersede an existing preference when the active conversation explicitly changes the
+  preference for the same context, e.g. "from now on", "change it to", "default to", or
+  equivalent wording.
 directory: "viking://user/{{ user_space }}/memories/preferences"
 filename_template: "{{ user }}/{{ topic }}.md"
 enabled: true
@@ -45,6 +52,9 @@ fields:
     description: |
       Preference content in Markdown format describing "what the user prefers/is accustomed to".
       Write one concise bullet per distinct, reusable preference; omit duplicates, events, dates, plans, and supporting evidence.
+      Preserve context qualifiers in each bullet when the preference is scene-specific.
+      If context is ambiguous, write a narrow evidence-bound preference instead of upgrading it to a global preference.
+      Do not erase an existing opposite preference unless the new evidence explicitly changes the same scoped preference.
       Example:
       - Prefers concise written updates with decisions and next actions.
       - Chooses lightweight tools when they cover the workflow.

@@ -1309,6 +1309,10 @@ def attach_source_to_request_operations(request: MemoryUpdateRequest) -> None:
         source_trace_id = getattr(op.source, "trace_id", None)
         if source_trace_id:
             op.memory_fields.setdefault("last_update_trace_id", source_trace_id)
+        for field_name in ("context_memory_refs", "context_event_refs", "resource_refs"):
+            source_value = getattr(op.source, field_name, None)
+            if source_value:
+                op.memory_fields.setdefault(field_name, list(source_value))
 
 
 def memory_operation_source_from_request(
@@ -1325,6 +1329,9 @@ def memory_operation_source_from_request(
         task_id=_optional_str(metadata.get("task_id")),
         trace_id=_optional_str(metadata.get("trace_id")),
         extracted_at=_optional_str(metadata.get("extracted_at")),
+        context_memory_refs=_list_of_strings(metadata.get("context_memory_refs")),
+        context_event_refs=_list_of_strings(metadata.get("context_event_refs")),
+        resource_refs=_list_of_dicts(metadata.get("resource_refs")),
     )
 
 
@@ -1365,6 +1372,18 @@ def _optional_str(value: Any) -> str | None:
         return None
     text = str(value)
     return text if text else None
+
+
+def _list_of_strings(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item or "").strip()]
+
+
+def _list_of_dicts(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
 
 
 def seed_patch_merge_read_contents(

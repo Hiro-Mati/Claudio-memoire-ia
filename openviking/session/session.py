@@ -22,6 +22,7 @@ from openviking.pyagfs.exceptions import AGFSClientError, AGFSHTTPError, AGFSNot
 from openviking.server.config import ToolOutputExternalizationConfig
 from openviking.server.identity import RequestContext, Role
 from openviking.session.auto_commit_policy import AutoCommitPolicy
+from openviking.session.extraction_context_policy import ExtractionContextPolicy
 from openviking.session.memory.constants import AGENT_EVOLUTION_MEMORY_TYPES
 from openviking.session.memory_policy import MemoryPolicy
 from openviking.session.retention import (
@@ -169,6 +170,22 @@ def _resolve_event_search_tags(
 
     chosen = commit_tags if commit_tags is not None else session_default_tags
     return normalize_search_tags(chosen)
+
+
+def _merge_extraction_context_policy(
+    existing: Optional[Dict[str, Any]],
+    updates: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Deep-merge extraction context policy sections and normalize defaults."""
+    merged: Dict[str, Any] = dict(existing or {})
+    for key, value in dict(updates or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            section = dict(merged[key])
+            section.update(value)
+            merged[key] = section
+        else:
+            merged[key] = value
+    return ExtractionContextPolicy.from_dict(merged).to_dict()
 
 
 def _message_peer_ids(messages: List[Message]) -> set[str]:
@@ -482,6 +499,9 @@ class SessionMeta:
     # session. Maps to config.memory_extraction_config.events.tags in the API.
     # None means no session default; a commit may still override per-call.
     event_search_tags: Optional[List[str]] = None
+    # Default recall controls applied when building commit-time extraction
+    # context. None uses ExtractionContextPolicy.default().
+    extraction_context_policy: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = {
@@ -514,6 +534,8 @@ class SessionMeta:
             data["total_message_count"] = self.total_message_count
         if self.event_search_tags is not None:
             data["event_search_tags"] = list(self.event_search_tags)
+        if self.extraction_context_policy is not None:
+            data["extraction_context_policy"] = dict(self.extraction_context_policy)
         return data
 
     @classmethod
@@ -565,6 +587,7 @@ class SessionMeta:
             oldest_message_at=data.get("oldest_message_at", ""),
             last_auto_commit_at=data.get("last_auto_commit_at", ""),
             event_search_tags=data.get("event_search_tags"),
+            extraction_context_policy=data.get("extraction_context_policy"),
         )
 
 
@@ -698,6 +721,10 @@ class Session:
             self._meta.auto_commit_policy = AutoCommitPolicy.from_dict(
                 self._meta.auto_commit_policy
             ).to_dict()
+        if self._meta.extraction_context_policy is not None:
+            self._meta.extraction_context_policy = ExtractionContextPolicy.from_dict(
+                self._meta.extraction_context_policy
+            ).to_dict()
         # WM v2: always rebuild pending_tokens from current messages so the
         # counter stays consistent across restarts and is also backfilled for
         # legacy sessions whose .meta.json predates these fields. O(n) once,
@@ -807,6 +834,7 @@ class Session:
         self,
         *,
         event_search_tags: Optional[List[str]] = None,
+        extraction_context_policy: Optional[Dict[str, Any]] = None,
         auto_commit_policy: Optional[Dict[str, Any]] = None,
         update_auto_commit_policy: bool = False,
     ) -> None:
@@ -830,6 +858,11 @@ class Session:
                     raise
             if event_search_tags is not None:
                 self._meta.event_search_tags = list(event_search_tags)
+            if extraction_context_policy is not None:
+                self._meta.extraction_context_policy = _merge_extraction_context_policy(
+                    self._meta.extraction_context_policy,
+                    extraction_context_policy,
+                )
             if update_auto_commit_policy:
                 if auto_commit_policy is None:
                     self._meta.auto_commit_policy = None
@@ -1934,6 +1967,9 @@ class Session:
             effective_event_tags = _resolve_event_search_tags(
                 event_tags, self._meta.event_search_tags
             )
+            effective_extraction_context_policy = ExtractionContextPolicy.from_dict(
+                self._meta.extraction_context_policy
+            ).to_dict()
 
             # keep_recent_count controls how many live messages survive this
             # commit. stored_keep_recent_count is what we persist for future
@@ -2070,6 +2106,7 @@ class Session:
                 archive_uri=archive_uri,
                 user=self.ctx.user.to_dict(),
                 memory_policy=effective_memory_policy,
+                extraction_context_policy=effective_extraction_context_policy,
                 usage_uris=list(dict.fromkeys(u.uri for u in usage_snapshot if u.uri)),
                 record_auto_commit_success=record_auto_commit_success,
                 event_search_tags=list(effective_event_tags),
@@ -2336,6 +2373,7 @@ class Session:
             first_message_id=archive_messages[0].id,
             last_message_id=archive_messages[-1].id,
             memory_policy=msg.memory_policy,
+            extraction_context_policy=msg.extraction_context_policy,
             agent_evolution_enabled=agent_evolution_enabled,
             agent_memory_skip_reason=agent_memory_skip_reason,
             user_config_error=user_config_error,
@@ -2376,6 +2414,7 @@ class Session:
         first_message_id: str,
         last_message_id: str,
         memory_policy: Optional[Dict[str, Any]],
+        extraction_context_policy: Optional[Dict[str, Any]] = None,
         agent_evolution_enabled: bool = True,
         agent_memory_skip_reason: Optional[str] = None,
         user_config_error: Optional[str] = None,
@@ -2423,6 +2462,9 @@ class Session:
                 with bind_telemetry(telemetry):
                     ov_config = get_openviking_config()
                     effective_policy = MemoryPolicy.from_dict(memory_policy)
+                    resolved_extraction_context_policy = ExtractionContextPolicy.from_dict(
+                        extraction_context_policy
+                    ).to_dict()
                     working_memory_enabled = effective_policy.working_memory_enabled
                     checkpoint_requests = (
                         await self._collect_checkpoint_requests_for_phase2(
@@ -2606,6 +2648,9 @@ class Session:
                                     allow_self_memory=self_memory_enabled,
                                     allowed_peer_ids=allowed_peer_ids,
                                     event_search_tags=event_search_tags,
+                                    extraction_context_policy=(
+                                        resolved_extraction_context_policy
+                                    ),
                                 )
 
                             extraction_tasks.append(

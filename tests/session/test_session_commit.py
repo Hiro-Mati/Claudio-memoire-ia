@@ -403,6 +403,37 @@ class TestCommit:
         # Current message list should be cleared after commit
         assert len(session_with_messages.messages) == 0
 
+    async def test_commit_queue_message_includes_extraction_context_policy(
+        self,
+        session_with_messages: Session,
+    ):
+        await session_with_messages.update_config(
+            extraction_context_policy={
+                "resource_recall": {
+                    "enabled": True,
+                    "scopes": ["viking://resources/project-a/"],
+                    "max_entries": 2,
+                }
+            }
+        )
+        session_with_messages._session_compressor.extract_long_term_memories = AsyncMock(
+            return_value=[]
+        )
+
+        result = await session_with_messages.commit_async()
+        archive_meta = json.loads(
+            await session_with_messages._viking_fs.read_file(
+                f"{result['archive_uri']}/.meta.json",
+                ctx=session_with_messages.ctx,
+            )
+        )
+
+        queue_message = archive_meta["phase1"]["queue_message"]
+        policy = queue_message["extraction_context_policy"]
+        assert policy["resource_recall"]["enabled"] is True
+        assert policy["resource_recall"]["max_entries"] == 2
+        assert policy["resource_recall"]["scopes"] == ["viking://resources/project-a/"]
+
     async def test_commit_empty_session(self, session: Session):
         """Test committing empty session"""
         # Empty session commit should not raise error

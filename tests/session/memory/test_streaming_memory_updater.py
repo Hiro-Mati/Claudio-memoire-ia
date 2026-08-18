@@ -1081,13 +1081,29 @@ async def test_streaming_memory_updater_persists_source_extraction_id_trace_id_a
             ),
             messages=[Message(id="m1", role="user", parts=[TextPart("note source")])],
             ctx=_ctx(),
-            metadata={"source_extraction_id": "extract_1", "trace_id": "trace_1"},
+            metadata={
+                "source_extraction_id": "extract_1",
+                "trace_id": "trace_1",
+                "context_memory_refs": ["viking://user/u/memories/profile.md"],
+                "context_event_refs": ["viking://user/u/memories/events/2026/08/18/demo.md"],
+                "resource_refs": [
+                    {
+                        "resource_uri": "viking://resources/project-a/sop.md",
+                        "source": "extraction_context_recall",
+                    }
+                ],
+            },
         )
     )
 
     assert result.apply_result.written_uris == [op.uris[0]]
     assert '"source_extraction_id": "extract_1"' in fs.files[op.uris[0]]
     assert '"last_update_trace_id": "trace_1"' in fs.files[op.uris[0]]
+    assert '"context_memory_refs": [' in fs.files[op.uris[0]]
+    assert "viking://user/u/memories/profile.md" in fs.files[op.uris[0]]
+    assert '"context_event_refs": [' in fs.files[op.uris[0]]
+    assert "viking://user/u/memories/events/2026/08/18/demo.md" in fs.files[op.uris[0]]
+    assert '"resource_uri": "viking://resources/project-a/sop.md"' in fs.files[op.uris[0]]
 
     from openviking.server.identity import ToolContext
     from openviking.session.memory.tools import MemoryReadTool

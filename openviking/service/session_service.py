@@ -31,6 +31,7 @@ from openviking.service.session_auto_commit import (
 from openviking.service.task_tracker import get_task_tracker
 from openviking.session import Session
 from openviking.session.auto_commit_policy import AutoCommitPolicy
+from openviking.session.extraction_context_policy import ExtractionContextPolicy
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.memory_policy import MemoryPolicy
 from openviking.storage.viking_fs import VikingFS
@@ -213,6 +214,7 @@ class SessionService:
         auto_commit_policy: Optional[Dict[str, Any]] = None,
         update_auto_commit_policy: bool = False,
         event_tags: Optional[List[str]] = None,
+        extraction_context_policy: Optional[Dict[str, Any]] = None,
     ) -> Session:
         """Create a session and persist its root path.
 
@@ -258,6 +260,10 @@ class SessionService:
                     event_tags,
                     discard_invalid=True,
                 )
+            if extraction_context_policy is not None:
+                session.meta.extraction_context_policy = ExtractionContextPolicy.from_dict(
+                    extraction_context_policy
+                ).to_dict()
             await session.ensure_exists()
             self._record_lifecycle_metric("create", "ok")
             return session
@@ -491,6 +497,9 @@ class SessionService:
         """Return the caller-facing memory extraction config."""
         return {
             "events": {"tags": list(session.meta.event_search_tags or [])},
+            "extraction_context_policy": ExtractionContextPolicy.from_dict(
+                session.meta.extraction_context_policy
+            ).to_dict(),
         }
 
     async def update_config(
@@ -499,6 +508,7 @@ class SessionService:
         ctx: RequestContext,
         *,
         event_tags: Optional[List[str]] = None,
+        extraction_context_policy: Optional[Dict[str, Any]] = None,
         auto_commit_policy: Optional[Dict[str, Any]] = None,
         update_auto_commit_policy: bool = False,
     ) -> Session:
@@ -516,9 +526,14 @@ class SessionService:
             if event_tags is not None
             else None
         )
-        if normalized_event_tags is not None or update_auto_commit_policy:
+        if (
+            normalized_event_tags is not None
+            or extraction_context_policy is not None
+            or update_auto_commit_policy
+        ):
             await session.update_config(
                 event_search_tags=normalized_event_tags,
+                extraction_context_policy=extraction_context_policy,
                 auto_commit_policy=auto_commit_policy,
                 update_auto_commit_policy=update_auto_commit_policy,
             )
