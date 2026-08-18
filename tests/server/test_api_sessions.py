@@ -649,6 +649,7 @@ async def test_create_session_uses_default_policy_when_server_default_enabled(
         "idle_timeout_seconds": 86400,
         "keep_recent_count": 2,
         "min_commit_interval_seconds": 0,
+        "max_active_age_seconds": 0,
     }
 
 
@@ -698,6 +699,7 @@ async def test_auto_created_session_uses_default_policy_when_server_default_enab
         "idle_timeout_seconds": 86400,
         "keep_recent_count": 2,
         "min_commit_interval_seconds": 0,
+        "max_active_age_seconds": 0,
     }
 
 
@@ -719,6 +721,7 @@ async def test_create_session_applies_config_and_fills_defaults(client: httpx.As
         "idle_timeout_seconds": 86400,
         "keep_recent_count": 10,
         "min_commit_interval_seconds": 0,
+        "max_active_age_seconds": 0,
     }
 
     session_resp = await client.get(f"/api/v1/sessions/{result['session_id']}")

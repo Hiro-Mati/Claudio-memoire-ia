@@ -21,11 +21,13 @@ DEFAULT_MESSAGE_COUNT_THRESHOLD = 50
 DEFAULT_IDLE_TIMEOUT_SECONDS = 86400  # 1 day
 DEFAULT_KEEP_RECENT_COUNT = 2
 DEFAULT_MIN_COMMIT_INTERVAL_SECONDS = 0
+DEFAULT_MAX_ACTIVE_AGE_SECONDS = 0
 
 # PRD upper bounds.
 MAX_PENDING_TOKEN_THRESHOLD = 50000
 MAX_MESSAGE_COUNT_THRESHOLD = 500
 MAX_IDLE_TIMEOUT_SECONDS = 604800  # 7 days
+MAX_ACTIVE_AGE_SECONDS = 604800  # 7 days
 
 _POLICY_KEYS = {
     "pending_token_threshold",
@@ -33,6 +35,7 @@ _POLICY_KEYS = {
     "idle_timeout_seconds",
     "keep_recent_count",
     "min_commit_interval_seconds",
+    "max_active_age_seconds",
 }
 
 
@@ -57,6 +60,7 @@ class AutoCommitPolicy:
     idle_timeout_seconds: int = DEFAULT_IDLE_TIMEOUT_SECONDS
     keep_recent_count: int = DEFAULT_KEEP_RECENT_COUNT
     min_commit_interval_seconds: int = DEFAULT_MIN_COMMIT_INTERVAL_SECONDS
+    max_active_age_seconds: int = DEFAULT_MAX_ACTIVE_AGE_SECONDS
 
     @classmethod
     def default(cls) -> "AutoCommitPolicy":
@@ -110,6 +114,12 @@ class AutoCommitPolicy:
                 minimum=0,
                 maximum=MAX_IDLE_TIMEOUT_SECONDS,
             ),
+            max_active_age_seconds=_coerce_int(
+                data.get("max_active_age_seconds", default.max_active_age_seconds),
+                field="max_active_age_seconds",
+                minimum=0,
+                maximum=MAX_ACTIVE_AGE_SECONDS,
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -119,4 +129,5 @@ class AutoCommitPolicy:
             "idle_timeout_seconds": self.idle_timeout_seconds,
             "keep_recent_count": self.keep_recent_count,
             "min_commit_interval_seconds": self.min_commit_interval_seconds,
+            "max_active_age_seconds": self.max_active_age_seconds,
         }

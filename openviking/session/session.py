@@ -472,6 +472,9 @@ class SessionMeta:
     # Timestamp of the most recent add_message, used by the idle scan to decide
     # whether an idle-timeout commit is due.
     last_message_at: str = ""
+    # Timestamp of the oldest live message in messages.jsonl. Active-retention
+    # auto-commit uses it to bound busy sessions that never become idle.
+    oldest_message_at: str = ""
     # Timestamp of the most recent successful auto-commit, surfaced via session
     # GET and used to throttle auto-commit frequency.
     last_auto_commit_at: str = ""
@@ -504,6 +507,7 @@ class SessionMeta:
                 dict(self.auto_commit_policy) if self.auto_commit_policy is not None else None
             ),
             "last_message_at": self.last_message_at,
+            "oldest_message_at": self.oldest_message_at,
             "last_auto_commit_at": self.last_auto_commit_at,
         }
         if self.total_message_count is not None:
@@ -558,6 +562,7 @@ class SessionMeta:
             memory_policy=data.get("memory_policy"),
             auto_commit_policy=data.get("auto_commit_policy"),
             last_message_at=data.get("last_message_at", ""),
+            oldest_message_at=data.get("oldest_message_at", ""),
             last_auto_commit_at=data.get("last_auto_commit_at", ""),
             event_search_tags=data.get("event_search_tags"),
         )
@@ -698,8 +703,20 @@ class Session:
         # legacy sessions whose .meta.json predates these fields. O(n) once,
         # subsequent add_message() maintains it in O(1).
         self._rebuild_pending_tokens()
+        self._refresh_live_message_window_timestamps()
 
         self._loaded = True
+
+    def _refresh_live_message_window_timestamps(self) -> None:
+        """Backfill active-window timestamps from the authoritative live list."""
+        if not self._messages:
+            self._meta.oldest_message_at = ""
+            return
+        oldest = str(getattr(self._messages[0], "created_at", "") or "")
+        self._meta.oldest_message_at = oldest
+        if not self._meta.last_message_at:
+            newest = str(getattr(self._messages[-1], "created_at", "") or "")
+            self._meta.last_message_at = newest
 
     def _rebuild_pending_tokens(self) -> None:
         """Recompute ``pending_tokens`` from the current message list.
@@ -1261,6 +1278,7 @@ class Session:
                 # append. Message correctness remains rooted in messages.jsonl.
                 self._meta = in_memory_meta
 
+            self._refresh_live_message_window_timestamps()
             self._apply_appended_messages_to_state(messages)
             batch_content = "".join(message.to_jsonl() + "\n" for message in messages)
             if live_messages_missing:
@@ -1310,6 +1328,10 @@ class Session:
             # idle-timeout auto-commit is due. Written under the same append
             # path lock as the counters above.
             self._meta.last_message_at = get_current_timestamp()
+            if not self._meta.oldest_message_at and self._messages:
+                self._meta.oldest_message_at = str(
+                    getattr(self._messages[0], "created_at", "") or ""
+                )
 
     def _build_messages(
         self,
@@ -1748,6 +1770,7 @@ class Session:
             )
             self._meta.last_commit_at = get_current_timestamp()
             self._rebuild_pending_tokens()
+            self._refresh_live_message_window_timestamps()
             await self._save_meta(lease_ref=lease)
             await self._write_phase1_ready_marker(archive_uri, lease_ref=lease)
             logger.warning("Recovered interrupted Session Phase 1: %s", archive_uri)
@@ -1958,6 +1981,7 @@ class Session:
 
             if not self._messages:
                 self._meta.pending_tokens = 0
+                self._refresh_live_message_window_timestamps()
                 self._remember_retention_policy(
                     keep_recent_count=stored_keep_recent_count,
                     retention_mode=retention_mode,
@@ -2008,6 +2032,7 @@ class Session:
                 await self._write_to_agfs_async(messages=self._messages, lease_ref=lease)
                 self._meta.pending_tokens = 0
                 self._meta.message_count = total
+                self._refresh_live_message_window_timestamps()
                 self._remember_retention_policy(
                     keep_recent_count=stored_keep_recent_count,
                     retention_mode=retention_mode,
@@ -2111,6 +2136,7 @@ class Session:
                 await self._write_to_agfs_async(messages=self._messages, lease_ref=lease)
                 self._meta.message_count = len(self._messages)
                 self._meta.pending_tokens = 0
+                self._refresh_live_message_window_timestamps()
                 self._remember_retention_policy(
                     keep_recent_count=stored_keep_recent_count,
                     retention_mode=retention_mode,

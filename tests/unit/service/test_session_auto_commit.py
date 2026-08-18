@@ -17,6 +17,7 @@ import openviking.service.session_service as session_service_module
 from openviking.server.identity import RequestContext
 from openviking.service.session_auto_commit import (
     SessionAutoCommitScheduler,
+    compute_active_age_due,
     compute_next_check_at,
 )
 from openviking.service.session_service import SessionService
@@ -159,6 +160,7 @@ class _FakeSessionMeta:
         message_count: int = 0,
         keep_recent_count: int = 0,
         last_message_at: str = "",
+        oldest_message_at: str = "",
         last_auto_commit_at: str = "",
     ) -> None:
         self.auto_commit_policy = auto_commit_policy
@@ -166,6 +168,7 @@ class _FakeSessionMeta:
         self.message_count = message_count
         self.keep_recent_count = keep_recent_count
         self.last_message_at = last_message_at
+        self.oldest_message_at = oldest_message_at
         self.last_auto_commit_at = last_auto_commit_at
 
     def to_dict(self) -> dict:
@@ -175,6 +178,7 @@ class _FakeSessionMeta:
             "message_count": self.message_count,
             "keep_recent_count": self.keep_recent_count,
             "last_message_at": self.last_message_at,
+            "oldest_message_at": self.oldest_message_at,
             "last_auto_commit_at": self.last_auto_commit_at,
         }
 
@@ -239,12 +243,16 @@ def _meta(
     message_count: int = 1,
     keep_recent_count: int = 0,
     last_message_at: str | None = None,
+    oldest_message_at: str | None = None,
+    max_active_age_seconds: int | None = None,
 ) -> dict:
     if last_message_at is None:
         last_message_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
     policy: dict = {"keep_recent_count": keep_recent_count}
     if idle_timeout_seconds is not None:
         policy["idle_timeout_seconds"] = idle_timeout_seconds
+    if max_active_age_seconds is not None:
+        policy["max_active_age_seconds"] = max_active_age_seconds
     return {
         "auto_commit_policy": policy,
         "created_by_account_id": account_id,
@@ -253,6 +261,7 @@ def _meta(
         "message_count": message_count,
         "keep_recent_count": keep_recent_count,
         "last_message_at": last_message_at,
+        "oldest_message_at": oldest_message_at or "",
     }
 
 
@@ -266,6 +275,16 @@ def test_compute_next_check_at_parses_utc_z_timestamps_on_python310(monkeypatch)
     assert (
         compute_next_check_at("2026-06-20T10:00:00.000Z", 60)
         == "2026-06-20T10:01:00+00:00"
+    )
+
+
+def test_compute_active_age_due_uses_oldest_live_message_timestamp():
+    oldest_message_at = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+
+    assert compute_active_age_due(
+        oldest_message_at,
+        60,
+        datetime.now(timezone.utc),
     )
 
 
@@ -305,6 +324,30 @@ async def test_run_auto_commit_skips_when_policy_is_disabled(monkeypatch):
     await service.run_auto_commit("session_a", _auto_commit_ctx(), reason="message_write")
 
     assert session.commit_calls == []
+    assert session.save_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_run_auto_commit_uses_active_age_threshold_for_busy_sessions(monkeypatch):
+    session = _FakeAutoCommitSession(
+        _FakeSessionMeta(
+            auto_commit_policy={
+                "pending_token_threshold": 100_000,
+                "message_count_threshold": 500,
+                "max_active_age_seconds": 60,
+                "keep_recent_count": 3,
+                "min_commit_interval_seconds": 0,
+            },
+            pending_tokens=10,
+            message_count=5,
+            oldest_message_at=(datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
+        )
+    )
+    service = _session_service_for_auto_commit_test(monkeypatch, session)
+
+    await service.run_auto_commit("session_a", _auto_commit_ctx(), reason="message_write")
+
+    assert session.commit_calls == [(3, True, True)]
     assert session.save_calls == 0
 
 
@@ -556,6 +599,37 @@ async def test_scheduler_schedules_idle_sessions_still_within_keep_recent_window
 
     assert service.calls == [
         ("session_within_keep", "idle_timeout", "user_b"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_schedules_active_age_sessions_as_message_write():
+    service = _FakeSessionService(
+        [_session_entry("session_active_age_due")],
+        {
+            "/local/acct_a/user/user_b/sessions/session_active_age_due/.meta.json": _meta(
+                idle_timeout_seconds=3600,
+                pending_tokens=1,
+                message_count=3,
+                keep_recent_count=1,
+                last_message_at=datetime.now(timezone.utc).isoformat(),
+                oldest_message_at=(
+                    datetime.now(timezone.utc) - timedelta(minutes=5)
+                ).isoformat(),
+                max_active_age_seconds=60,
+            ),
+        },
+    )
+    scheduler = SessionAutoCommitScheduler(
+        service,
+        SimpleNamespace(idle_enabled=True, check_interval_seconds=60.0),
+        check_interval=60.0,
+    )
+
+    await scheduler._scan_once()
+
+    assert service.calls == [
+        ("session_active_age_due", "message_write", "user_b"),
     ]
 
 

@@ -16,9 +16,11 @@ from openviking.server.agent_evolution_config import AgentEvolutionConfigProvide
 from openviking.server.config import AgentEvolutionConfig, ToolOutputExternalizationConfig
 from openviking.server.identity import RequestContext
 from openviking.service.session_auto_commit import (
+    compute_active_age_due,
     compute_next_check_at,
     get_idle_timeout_seconds,
     get_keep_recent_count,
+    get_max_active_age_seconds,
     get_message_count_threshold,
     get_min_commit_interval_seconds,
     get_token_threshold,
@@ -665,5 +667,12 @@ class SessionService:
             return True
         message_threshold = get_message_count_threshold(policy)
         if message_threshold is not None and message_count > message_threshold:
+            return True
+        max_active_age = get_max_active_age_seconds(policy)
+        if max_active_age is not None and compute_active_age_due(
+            session.meta.oldest_message_at,
+            max_active_age,
+            datetime.now(),
+        ):
             return True
         return False

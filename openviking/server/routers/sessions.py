@@ -86,6 +86,7 @@ class AutoCommitPolicyRequest(BaseModel):
     idle_timeout_seconds: Optional[int] = None
     keep_recent_count: Optional[int] = None
     min_commit_interval_seconds: Optional[int] = None
+    max_active_age_seconds: Optional[int] = None
 
     model_config = {"extra": "forbid"}
 

@@ -8,9 +8,11 @@ import pytest
 from openviking.session.auto_commit_policy import (
     DEFAULT_IDLE_TIMEOUT_SECONDS,
     DEFAULT_KEEP_RECENT_COUNT,
+    DEFAULT_MAX_ACTIVE_AGE_SECONDS,
     DEFAULT_MESSAGE_COUNT_THRESHOLD,
     DEFAULT_MIN_COMMIT_INTERVAL_SECONDS,
     DEFAULT_PENDING_TOKEN_THRESHOLD,
+    MAX_ACTIVE_AGE_SECONDS,
     MAX_IDLE_TIMEOUT_SECONDS,
     MAX_MESSAGE_COUNT_THRESHOLD,
     MAX_PENDING_TOKEN_THRESHOLD,
@@ -27,6 +29,7 @@ def test_default_matches_prd_recommended_values():
     assert policy.idle_timeout_seconds == DEFAULT_IDLE_TIMEOUT_SECONDS == 86400
     assert policy.keep_recent_count == DEFAULT_KEEP_RECENT_COUNT == 2
     assert policy.min_commit_interval_seconds == DEFAULT_MIN_COMMIT_INTERVAL_SECONDS == 0
+    assert policy.max_active_age_seconds == DEFAULT_MAX_ACTIVE_AGE_SECONDS == 0
 
 
 def test_from_dict_none_returns_defaults():
@@ -41,6 +44,7 @@ def test_from_dict_fills_missing_fields_with_defaults():
     assert policy.idle_timeout_seconds == DEFAULT_IDLE_TIMEOUT_SECONDS
     assert policy.keep_recent_count == DEFAULT_KEEP_RECENT_COUNT
     assert policy.min_commit_interval_seconds == DEFAULT_MIN_COMMIT_INTERVAL_SECONDS
+    assert policy.max_active_age_seconds == DEFAULT_MAX_ACTIVE_AGE_SECONDS
 
 
 def test_from_dict_clamps_to_upper_bounds():
@@ -51,6 +55,7 @@ def test_from_dict_clamps_to_upper_bounds():
             "idle_timeout_seconds": 999_999_999,
             "keep_recent_count": 10_000,
             "min_commit_interval_seconds": 999_999_999,
+            "max_active_age_seconds": 999_999_999,
         }
     )
 
@@ -59,6 +64,7 @@ def test_from_dict_clamps_to_upper_bounds():
     assert policy.idle_timeout_seconds == MAX_IDLE_TIMEOUT_SECONDS
     assert policy.keep_recent_count == MAX_MESSAGE_COUNT_THRESHOLD
     assert policy.min_commit_interval_seconds == MAX_IDLE_TIMEOUT_SECONDS
+    assert policy.max_active_age_seconds == MAX_ACTIVE_AGE_SECONDS
 
 
 def test_from_dict_clamps_negatives_to_zero():
@@ -69,6 +75,7 @@ def test_from_dict_clamps_negatives_to_zero():
             "idle_timeout_seconds": -100,
             "keep_recent_count": -3,
             "min_commit_interval_seconds": -9,
+            "max_active_age_seconds": -7,
         }
     )
 
@@ -78,6 +85,7 @@ def test_from_dict_clamps_negatives_to_zero():
         "idle_timeout_seconds": 0,
         "keep_recent_count": 0,
         "min_commit_interval_seconds": 0,
+        "max_active_age_seconds": 0,
     }
 
 
@@ -112,6 +120,7 @@ def test_to_dict_round_trips():
         "idle_timeout_seconds": 600,
         "keep_recent_count": 10,
         "min_commit_interval_seconds": 30,
+        "max_active_age_seconds": 300,
     }
 
     assert AutoCommitPolicy.from_dict(payload).to_dict() == payload

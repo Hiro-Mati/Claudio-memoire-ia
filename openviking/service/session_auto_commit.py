@@ -125,7 +125,7 @@ class SessionAutoCommitScheduler:
         for item in results:
             if item is None:
                 continue
-            session_id, account_id, user_id = item
+            session_id, account_id, user_id, reason = item
             due += 1
             ctx = RequestContext(
                 user=UserIdentifier(account_id=account_id, user_id=user_id),
@@ -134,7 +134,7 @@ class SessionAutoCommitScheduler:
             did_schedule = await self._session_service.maybe_schedule_auto_commit(
                 session_id,
                 ctx,
-                reason_hint="idle_timeout",
+                reason_hint=reason,
             )
             if did_schedule:
                 scheduled += 1
@@ -145,7 +145,7 @@ class SessionAutoCommitScheduler:
         agfs: AsyncAGFSClient,
         meta_path: str,
         now: datetime,
-    ) -> Optional[tuple[str, str, str]]:
+    ) -> Optional[tuple[str, str, str, str]]:
         try:
             content = await agfs.read(meta_path)
             raw = content.decode("utf-8") if isinstance(content, bytes) else str(content)
@@ -179,7 +179,8 @@ class SessionAutoCommitScheduler:
             return None
 
         try:
-            if not _is_idle_candidate(meta, now):
+            reason = _auto_commit_candidate_reason(meta, now)
+            if reason is None:
                 return None
         except (TypeError, ValueError) as exc:
             logger.warning(
@@ -194,7 +195,7 @@ class SessionAutoCommitScheduler:
         user_id = _user_id_from_meta_path(meta_path)
         if not session_id or not account_id or not user_id:
             return None
-        return session_id, account_id, user_id
+        return session_id, account_id, user_id, reason
 
     async def _iter_session_meta_path_batches(
         self, agfs: AsyncAGFSClient
@@ -300,6 +301,13 @@ def get_min_commit_interval_seconds(policy: Optional[Dict[str, Any]]) -> int:
     return max(0, resolve_policy(policy).min_commit_interval_seconds)
 
 
+def get_max_active_age_seconds(policy: Optional[Dict[str, Any]]) -> Optional[int]:
+    if policy is None:
+        return None
+    seconds = resolve_policy(policy).max_active_age_seconds
+    return seconds if seconds > 0 else None
+
+
 def get_keep_recent_count(policy: Optional[Dict[str, Any]]) -> int:
     if policy is None:
         return 0
@@ -334,6 +342,19 @@ def is_next_check_due(next_check_at: str, now: datetime) -> Optional[bool]:
     return next_dt <= compare_now
 
 
+def compute_active_age_due(
+    oldest_message_at: str,
+    max_active_age_seconds: int,
+    now: datetime,
+) -> bool:
+    if not oldest_message_at:
+        return False
+    next_check_at = compute_next_check_at(oldest_message_at, max_active_age_seconds)
+    if not next_check_at:
+        return False
+    return is_next_check_due(next_check_at, now) is True
+
+
 def has_uncommitted_content(meta: Dict[str, Any]) -> bool:
     keep_recent_count = _coerce_non_negative_int(meta.get("keep_recent_count", 0))
     return bool(
@@ -361,6 +382,15 @@ def _is_idle_policy_due(meta: Dict[str, Any], now: datetime) -> bool:
     return is_next_check_due(next_check_at, now) is True
 
 
+def _is_active_age_policy_due(meta: Dict[str, Any], now: datetime) -> bool:
+    max_active_age = get_max_active_age_seconds(meta.get("auto_commit_policy"))
+    if max_active_age is None:
+        return False
+    if not has_uncommitted_content(meta):
+        return False
+    return compute_active_age_due(meta.get("oldest_message_at", ""), max_active_age, now)
+
+
 def _coerce_non_negative_int(value: Any) -> int:
     parsed = int(value or 0)
     return max(0, parsed)
@@ -368,6 +398,14 @@ def _coerce_non_negative_int(value: Any) -> int:
 
 def _is_idle_candidate(meta: Dict[str, Any], now: datetime) -> bool:
     return _is_idle_policy_due(meta, now)
+
+
+def _auto_commit_candidate_reason(meta: Dict[str, Any], now: datetime) -> Optional[str]:
+    if _is_idle_policy_due(meta, now):
+        return "idle_timeout"
+    if _is_active_age_policy_due(meta, now):
+        return "message_write"
+    return None
 
 
 def _session_id_from_meta_path(meta_path: str) -> str:
