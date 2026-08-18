@@ -70,6 +70,12 @@ class AsyncAGFSClient:
         """Run a sync client method in a worker thread, preserving ctx when supported."""
         try:
             return await asyncio.to_thread(getattr(self._client, method_name), *args, **kwargs)
+        except AttributeError:
+            if method_name.startswith("pathlock_acquire"):
+                return None
+            if method_name.startswith("pathlock_release"):
+                return None
+            raise
         except TypeError as exc:
             message = str(exc)
             if "ctx" not in kwargs or "unexpected keyword argument 'ctx'" not in message:

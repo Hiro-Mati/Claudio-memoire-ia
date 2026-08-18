@@ -854,10 +854,28 @@ class LegacyAPIKeyManager:
         except AGFSAlreadyExistsError:
             return
 
+    async def _try_acquire_pathlock(self, path: str, *, timeout_secs: float) -> object | None:
+        """Acquire an AGFS path lock when the active binding supports it."""
+        acquire = getattr(self._async_agfs, "pathlock_acquire_exact", None)
+        if acquire is None:
+            logger.debug("AGFS path locking is unavailable for %s; writing without lease", path)
+            return None
+        try:
+            return await acquire(path, timeout_secs=timeout_secs)
+        except AttributeError:
+            logger.debug("AGFS path locking is unavailable for %s; writing without lease", path)
+            return None
+
+    async def _release_pathlock(self, lease: object | None) -> None:
+        """Release an AGFS path lock when one was acquired."""
+        if lease is None:
+            return
+        await self._async_agfs.pathlock_release(lease)
+
     async def _save_accounts_json(self) -> None:
         """Persist the global accounts list."""
         try:
-            lease = await self._async_agfs.pathlock_acquire_exact(ACCOUNTS_PATH, timeout_secs=10.0)
+            lease = await self._try_acquire_pathlock(ACCOUNTS_PATH, timeout_secs=10.0)
         except LockAcquisitionError as exc:
             raise ResourceBusyError(
                 "Another account operation is in progress. Please retry.",
@@ -872,7 +890,7 @@ class LegacyAPIKeyManager:
             }
             await self._write_json(ACCOUNTS_PATH, data, lease_ref=lease)
         finally:
-            await self._async_agfs.pathlock_release(lease)
+            await self._release_pathlock(lease)
 
     async def _save_users_json(self, account_id: str) -> None:
         """Persist a single account's user registry."""
@@ -882,7 +900,7 @@ class LegacyAPIKeyManager:
         """Persist one account's user registry from the given accounts map."""
         path = USERS_PATH_TEMPLATE.format(account_id=account_id)
         try:
-            lease = await self._async_agfs.pathlock_acquire_exact(path, timeout_secs=10.0)
+            lease = await self._try_acquire_pathlock(path, timeout_secs=10.0)
         except LockAcquisitionError as exc:
             raise ResourceBusyError(
                 "Another user operation is in progress for this account. Please retry.",
@@ -895,4 +913,4 @@ class LegacyAPIKeyManager:
                 return
             await self._write_json(path, {"users": account.users}, lease_ref=lease)
         finally:
-            await self._async_agfs.pathlock_release(lease)
+            await self._release_pathlock(lease)

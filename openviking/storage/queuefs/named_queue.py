@@ -9,7 +9,11 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from openviking.pyagfs import AGFSSyncClientProtocol, AsyncAGFSClient
-from openviking.pyagfs.exceptions import AGFSAlreadyExistsError, AGFSNotFoundError
+from openviking.pyagfs.exceptions import (
+    AGFSAlreadyExistsError,
+    AGFSInvalidOperationError,
+    AGFSNotFoundError,
+)
 from openviking.service.task_work_index import (
     TaskWorkIndex,
     TaskWorkRejected,
@@ -419,7 +423,7 @@ class NamedQueue:
         await self._ensure_initialized()
         try:
             content = await self._async_agfs.read(f"{self.path}/messages")
-        except (AGFSNotFoundError, FileNotFoundError):
+        except (AGFSInvalidOperationError, AGFSNotFoundError, FileNotFoundError):
             return []
         if not content:
             return []

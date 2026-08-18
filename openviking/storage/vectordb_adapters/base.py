@@ -186,6 +186,33 @@ class CollectionAdapter(ABC):
         self._collection.create_index(index_name, index_meta)
         return True
 
+    def ensure_index(
+        self,
+        schema: Dict[str, Any],
+        *,
+        distance: str,
+        sparse_weight: float,
+        index_name: str,
+    ) -> bool:
+        """Create the configured index when an existing collection has lost it."""
+        collection = self.get_collection()
+        if collection.has_index(index_name):
+            return False
+
+        scalar_index_fields = self._sanitize_scalar_index_fields(
+            scalar_index_fields=schema.get("ScalarIndex", []),
+            fields_meta=schema.get("Fields", []),
+        )
+        index_meta = self._build_default_index_meta(
+            index_name=index_name,
+            distance=distance,
+            use_sparse=sparse_weight > 0.0,
+            sparse_weight=sparse_weight,
+            scalar_index_fields=scalar_index_fields,
+        )
+        collection.create_index(index_name, index_meta)
+        return True
+
     def drop_collection(self) -> bool:
         if not self.collection_exists():
             return False

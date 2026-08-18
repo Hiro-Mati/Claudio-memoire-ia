@@ -176,6 +176,41 @@ async def test_init_context_collection_writes_embedding_metadata(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_init_context_collection_repairs_missing_index(monkeypatch):
+    ensured = []
+    config = _DummyConfig(_DummyEmbedder())
+    embedding_meta = _build_embedding_metadata(config)
+
+    class _FakeStorage:
+        async def create_collection(self, name, schema):
+            del name, schema
+            return False
+
+        async def ensure_index(self, schema):
+            ensured.append(schema)
+            return True
+
+        async def get_collection_meta(self):
+            return {
+                "Description": (
+                    "Unified context collection\n\n[openviking.embedding]\n"
+                    f"{json.dumps(embedding_meta, sort_keys=True)}"
+                )
+            }
+
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: config,
+    )
+
+    created = await init_context_collection(_FakeStorage())
+
+    assert created is False
+    assert len(ensured) == 1
+    assert ensured[0]["CollectionName"] == "context"
+
+
+@pytest.mark.asyncio
 async def test_init_context_collection_backfills_metadata_for_empty_legacy_collection(monkeypatch):
     updates = []
 

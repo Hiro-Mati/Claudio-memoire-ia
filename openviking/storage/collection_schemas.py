@@ -298,6 +298,9 @@ async def init_context_collection(storage) -> bool:
     if created:
         return True
 
+    if hasattr(storage, "ensure_index"):
+        await storage.ensure_index(schema)
+
     existing_meta = None
     if hasattr(storage, "get_collection_meta"):
         existing_meta = await storage.get_collection_meta()

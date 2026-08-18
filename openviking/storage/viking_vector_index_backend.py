@@ -290,6 +290,23 @@ class _SingleAccountBackend:
             logger.error("Error creating collection %s: %s", name, e)
             return False
 
+    async def ensure_index(self, schema: Dict[str, Any]) -> bool:
+        """Repair a missing configured index without recreating the collection."""
+        created = await self._async_adapter.call(
+            "ensure_index",
+            schema=dict(schema),
+            distance=self._distance_metric,
+            sparse_weight=self._sparse_weight,
+            index_name=self._index_name,
+        )
+        if created:
+            logger.warning(
+                "Recreated missing index %s for collection %s",
+                self._index_name,
+                self._collection_name,
+            )
+        return bool(created)
+
     async def drop_collection(self) -> bool:
         try:
             dropped = await self._async_adapter.call("drop_collection")
@@ -842,6 +859,9 @@ class VikingVectorIndexBackend:
 
     async def create_collection(self, name: str, schema: Dict[str, Any]) -> bool:
         return await self._get_default_backend().create_collection(name, schema)
+
+    async def ensure_index(self, schema: Dict[str, Any]) -> bool:
+        return await self._get_default_backend().ensure_index(schema)
 
     async def drop_collection(self) -> bool:
         return await self._get_default_backend().drop_collection()

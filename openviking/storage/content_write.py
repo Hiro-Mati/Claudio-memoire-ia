@@ -88,6 +88,24 @@ class ContentWriteCoordinator:
         self._viking_fs = viking_fs
         self._vikingdb = vikingdb
 
+    async def _try_acquire_pathlock(self, path: str) -> object | None:
+        """Acquire an AGFS path lock when the active binding supports it."""
+        acquire = getattr(self._viking_fs._async_agfs, "pathlock_acquire_exact", None)
+        if acquire is None:
+            logger.debug("AGFS path locking is unavailable for %s; writing without lease", path)
+            return None
+        try:
+            return await acquire(path)
+        except AttributeError:
+            logger.debug("AGFS path locking is unavailable for %s; writing without lease", path)
+            return None
+
+    async def _release_pathlock(self, lease: object | None) -> None:
+        """Release an AGFS path lock when one was acquired."""
+        if lease is None:
+            return
+        await self._viking_fs._async_agfs.pathlock_release(lease)
+
     async def write(
         self,
         *,
@@ -712,7 +730,7 @@ class ContentWriteCoordinator:
     ) -> Dict[str, Any]:
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
         try:
-            lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(lock_path)
+            lease = await self._try_acquire_pathlock(lock_path)
         except LockAcquisitionError as exc:
             raise ResourceBusyError(
                 f"resource is busy and cannot be written now: {uri}",
@@ -747,7 +765,7 @@ class ContentWriteCoordinator:
                     change_type="added" if mode == "create" else "modified",
                 )
                 post_process_started = True
-            await self._viking_fs._async_agfs.pathlock_release(lease)
+            await self._release_pathlock(lease)
             lock_released = True
             queue_status = (
                 await self._wait_for_request(telemetry_id=telemetry_id, timeout=timeout)
@@ -787,7 +805,7 @@ class ContentWriteCoordinator:
                     lease_ref=lease,
                 )
             if not lock_released:
-                await self._viking_fs._async_agfs.pathlock_release(lease)
+                await self._release_pathlock(lease)
             raise
         finally:
             if wait and telemetry_id:
@@ -1038,7 +1056,7 @@ class ContentWriteCoordinator:
 
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
         try:
-            lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(lock_path)
+            lease = await self._try_acquire_pathlock(lock_path)
         except LockAcquisitionError as exc:
             raise ResourceBusyError(
                 f"resource is busy and cannot be written now: {uri}",
@@ -1049,7 +1067,7 @@ class ContentWriteCoordinator:
         request_registered = False
         try:
             await self._write_in_place(uri, content, mode=mode, ctx=ctx, lease_ref=lease)
-            await self._viking_fs._async_agfs.pathlock_release(lease)
+            await self._release_pathlock(lease)
             released = True
             if wait and telemetry_id and self._vikingdb_has_queue():
                 get_request_wait_tracker().register_request(telemetry_id)
@@ -1092,7 +1110,7 @@ class ContentWriteCoordinator:
             )
         except Exception:
             if not released:
-                await self._viking_fs._async_agfs.pathlock_release(lease)
+                await self._release_pathlock(lease)
             raise
         finally:
             if request_registered:
