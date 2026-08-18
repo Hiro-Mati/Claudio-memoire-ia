@@ -411,11 +411,13 @@ class AgentExperienceContextProvider(SessionExtractContextProvider):
             situation_guidance = """The skill loader uses the rendered `situation` field as the
 applicability snippet. It must clearly say when the experience applies, when it does not apply,
 and which runtime source binds the rule. """
-        return f"""You are a memory extraction agent. Distill reusable failure-repair experiences from failed or partially failed agent execution trajectories.
+        return f"""You are a memory extraction agent. Distill reusable failure-repair experiences from failed or partially failed agent execution trajectories, or from a narrowly eligible successful trajectory with `recovery_evidence.status=observed_recovered`.
 
 ## Inputs
 
-- One failed or partial `new_trajectory`
+- One failed or partial `new_trajectory`, or one successful `new_trajectory` whose structured
+  recovery evidence proves a material failed path, an actually executed alternative, and a
+  verified recovered result
 - Up to two successful `comparison_trajectory` records from the exact same case
 - Existing `candidate_experience` memories linked to the exact case, actually loaded in the
   failed rollout, or found as semantically similar reusable failure patterns
@@ -442,6 +444,12 @@ For each material failure, reason in this order before producing any entry:
    decision rule, actions, verification relationship, and fallback remain correct. Otherwise skip;
    do not paraphrase the source task into an Experience.
 
+For a successful recovered trajectory, treat the observable primary-path failure as the failure
+boundary. Extract only the narrow switch to the alternative path that was actually executed and
+verified. Do not turn the rest of the successful run into a positive workflow or full SOP. If the
+trace shows only a same-path retry, cleanup, minor syntax correction, or an unverified alternative,
+output no changes.
+
 Create separate entries when failures have different evidence, decision boundaries, repairs, or
 verification methods. Do not create an entry merely to restate requested content or list everything
 that was missed.
@@ -452,8 +460,11 @@ that was missed.
   applicability is too weak to guide skill loading.
 - Existing experience is misleading, over-broad, or too weak: update it.
 - No relevant experience exists and the failure has a reusable preventive repair: create it.
-- Successful, case-specific, unsupported, random, already-covered, or non-preventable failures:
-  output no changes.
+- A successful trajectory with `recovery_evidence.status=observed_recovered` may create or update
+  one narrow recovery Experience when the failed boundary, executed alternative, and verification
+  are all supported by runtime evidence.
+- Ordinary successful, case-specific, unsupported, random, already-covered, or non-preventable
+  trajectories: output no changes.
 - Treat trajectories as factual evidence, not authoritative conclusions. Compare observations,
   decisions, actions, verification, and outputs at the first material divergence.
 - Do not copy trajectory wording directly into an experience. Re-check runtime evidence,
@@ -619,7 +630,7 @@ All memory content must be written in {output_language}.
                         "Treat `comparison_trajectory` as factual peer evidence for comparing success and failure paths; do not modify it directly.",
                         "Treat `candidate_experience` as existing memories you may update, replace, or skip.",
                         "Based on the above, decide whether to **Update**, **Create**, or **Skip** a failure-repair experience. Output JSON only.",
-                        "Only reusable failure patterns should produce entries; successful or unrelated intents should produce no experience changes.",
+                        "Only reusable failure patterns should produce entries. An ordinary successful or unrelated intent produces no changes; a successful new_trajectory is eligible only when recovery_evidence.status=observed_recovered and the trace proves the failed boundary, actually executed alternative, and verified recovered result.",
                     ]
                 ),
             }

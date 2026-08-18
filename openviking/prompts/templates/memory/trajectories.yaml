@@ -40,6 +40,31 @@ fields:
       unknown means the evidence is insufficient.
     merge_op: immutable
 
+  - name: recovery_evidence
+    type: string
+    description: |
+      Machine-readable JSON object describing whether this run visibly recovered from a material
+      failed path. Output ONLY a valid compact JSON object, not markdown and not a code block.
+
+      Required shape:
+      {"status":"none","failed_boundary":"","alternative_action":"","verification":""}
+
+      status must be exactly one of: none, observed_recovered, attempted_not_recovered, unknown.
+      Use observed_recovered only when all of the following are visible in the trajectory:
+      - a primary action, tool, source, or implementation path materially failed;
+      - the agent actually executed a different compatible path, not merely retried the same action;
+      - the alternative completed the requested result; and
+      - the final result was independently checked or directly confirmed by authoritative evidence.
+
+      failed_boundary: the observable failure that triggered the switch.
+      alternative_action: the different path that was actually executed successfully.
+      verification: the observed check or evidence that confirmed the recovered result.
+      Use attempted_not_recovered when an alternative was tried but the requested result still failed.
+      Use unknown when the trace is insufficient. Otherwise use none. Do not infer or propose an
+      untried fallback, and do not treat a same-path retry, cleanup, or minor syntax correction as a
+      material recovery.
+    merge_op: immutable
+
   - name: retrieval_anchor
     type: string
     description: |

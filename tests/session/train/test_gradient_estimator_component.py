@@ -293,6 +293,40 @@ async def test_experience_gradient_estimator_skips_success_trajectories():
 
 
 @pytest.mark.asyncio
+async def test_experience_gradient_estimator_allows_verified_observed_recovery():
+    analysis = _analysis(passed=True, outcome="success")
+    analysis.trajectories[0].metadata["recovery_evidence"] = (
+        '{"status":"observed_recovered","failed_boundary":"image endpoint returned 403",'
+        '"alternative_action":"procedural renderer produced compatible images",'
+        '"verification":"images and merged PDF were reopened and checked"}'
+    )
+    estimator = FakeExperienceGradientEstimator({})
+
+    gradients = await estimator.estimate(analysis, _experience_set(), _context())
+
+    assert gradients == []
+    assert len(estimator.calls) == 1
+    assert estimator.calls[0][0] is analysis.trajectories[0]
+
+
+@pytest.mark.asyncio
+async def test_experience_gradient_estimator_requires_passed_evaluation_for_recovery():
+    analysis = _analysis(passed=False, outcome="success")
+    analysis.trajectories[0].metadata["recovery_evidence"] = {
+        "status": "observed_recovered",
+        "failed_boundary": "primary path failed",
+        "alternative_action": "fallback ran",
+        "verification": "output was checked",
+    }
+    estimator = FakeExperienceGradientEstimator({})
+
+    gradients = await estimator.estimate(analysis, _experience_set(), _context())
+
+    assert gradients == []
+    assert estimator.calls == []
+
+
+@pytest.mark.asyncio
 async def test_experience_gradient_estimator_skips_internal_platform_failure_before_llm():
     analysis = _analysis(passed=False, outcome="failure")
     trajectory = analysis.trajectories[0]

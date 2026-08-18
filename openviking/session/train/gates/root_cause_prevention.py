@@ -220,9 +220,14 @@ def _experience_root_cause_prevention_prompt(
     comparison_content = _comparison_trajectory_context(trajectory)
     trajectory_uri = trajectory.uri if trajectory is not None else ""
     trajectory_outcome = trajectory.outcome if trajectory is not None else ""
+    trajectory_recovery_evidence = (
+        dict(getattr(trajectory, "metadata", {}) or {}).get("recovery_evidence", "")
+        if trajectory is not None
+        else ""
+    )
     target_experience_was_loaded = _target_experience_was_loaded(target)
 
-    return f"""You are a senior counterfactual failure diagnostician for agent experience extraction.
+    return f"""You are a senior counterfactual failure and recovery diagnostician for agent experience extraction.
 
 Review ONE proposed experience update.  The proposed experience will be injected
 through the skill experience loader in future sessions: the agent searches
@@ -249,7 +254,11 @@ Prior experience execution:
   failure boundary.
 
 Evidence authority:
-- Direct evaluation evidence establishes whether the source trajectory failed.
+- Direct evaluation evidence establishes whether the source trajectory failed or completed.
+- A successful source trajectory is eligible only when its structured recovery evidence is
+  `observed_recovered` and the runtime trace independently proves a material failed path, an
+  actually executed compatible alternative, and a verified recovered result. In that mode, judge
+  only the narrow failure-to-alternative switch; reject the surrounding positive workflow or SOP.
 - A successful comparison trajectory may establish the required observable action
   or output delta even when the failed trajectory does not explain why it was correct.
 - Do not reject a candidate merely because that successful action appears only in
@@ -274,9 +283,11 @@ Candidate-local review rule:
   return `pass: true`. Judge those siblings as separate candidates.
 
 Pass only when all are true:
-1. Direct evaluation evidence supports the failed outcome or unmet requirement,
-   and the source trajectory separately exposes an agent-controllable observation,
-   decision, action, verification, or output that caused or failed to prevent it.
+1. Either direct evaluation evidence supports a failed outcome or unmet requirement and the source
+   trajectory exposes the agent-controllable boundary, or the source is a successful
+   `observed_recovered` trajectory whose trace proves the failed boundary, executed alternative,
+   and final verification. A recovery candidate must encode that narrow observed switch rather
+   than the full successful path.
 2. The experience is directly preventive: it changes a future tool call, missing
    tool call, confirmation, calculation, policy branch, write, communication, or
    final answer before or at the failing boundary.
@@ -287,11 +298,12 @@ Pass only when all are true:
    evidence, decision boundary, and minimal repair. Do not fail an otherwise
    complete experience merely because the trajectory also contains unrelated
    failures that should become separate experiences.
-5. The failure is learnable by the agent. Missing required input, unavailable
-   external services, tool or infrastructure failures, and evaluator-only
-   requirements that are absent from the user request, authoritative source, or
-   runtime contract are not learnable experiences. When the internal cause is
-   unknown, reject instead of writing a generic verification reminder.
+5. The behavior change is learnable by the agent. Missing required input, unavailable external
+   services, tool or infrastructure failures, and evaluator-only requirements are not learnable
+   by themselves. However, a successful `observed_recovered` trajectory may teach a switch to a
+   compatible alternative that the agent actually executed and verified; encode the switch and
+   preserved constraint, not a guessed outage cause. When neither a controllable prevention nor a
+   confirmed recovery action exists, reject instead of writing a generic reminder.
 6. `Does not apply when` names a real task-pattern mismatch, not a temporal
    loader stage such as still reading/writing, before final_response, or before
    writes complete. Temporal wording would make the future agent skip reading an
@@ -331,7 +343,9 @@ concrete future behavior change, mandates unrequested conventional content,
 hardcodes factual outputs as a substitute for implementation, or would likely
 harm correct behavior.
 
-For failures that must not become an experience, use these terminal qualities:
+For failures that must not become an experience, use these terminal qualities. They remain
+terminal unless a successful `observed_recovered` source proves a compatible alternative that
+actually completed and verified the requested result:
 - `missing_required_input`: required runtime evidence was not supplied and the agent
   could not obtain an authoritative substitute.
 - `external_dependency_failure`: an external service was unavailable, reset, or timed out.
@@ -367,6 +381,7 @@ specific experience. Do not ask for any output schema.
 ## Source trajectory
 uri: {trajectory_uri}
 outcome: {trajectory_outcome}
+recovery_evidence: {json.dumps(trajectory_recovery_evidence, ensure_ascii=False, default=str)}
 
 {trajectory_content}
 

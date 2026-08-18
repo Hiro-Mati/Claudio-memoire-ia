@@ -178,6 +178,19 @@ def test_experience_schema_uses_target_comparison_guidance_without_authoritative
     assert "preserve that gate instead of weakening it" not in description
 
 
+def test_experience_instruction_allows_only_observed_successful_recovery():
+    provider = AgentExperienceContextProvider(
+        trajectory_summary="successful recovery",
+        trajectory_uri="viking://user/u/memories/trajectories/recovered.md",
+    )
+
+    instruction = provider.instruction()
+
+    assert "recovery_evidence.status=observed_recovered" in instruction
+    assert "same-path retry" in instruction
+    assert "Do not turn the rest of the successful run" in instruction
+
+
 @pytest.mark.asyncio
 async def test_agent_experience_prefetch_starts_with_new_trajectory_without_conversation():
     evidence_loader = _loader(ExperienceEvidenceBundle())

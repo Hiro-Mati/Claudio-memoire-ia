@@ -113,6 +113,8 @@ _CASE_EXACT_LITERAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
+_CASE_EXACT_YEAR_PATTERN = re.compile(r"(?<![\w])(?:19|20)\d{2}(?![\w])")
+
 CaseMatchLabel = Literal["MATCH", "COMPATIBLE", "UNKNOWN", "CONFLICT"]
 
 
@@ -227,6 +229,34 @@ def case_input_generalization_violations(value: Any) -> list[str]:
     return violations
 
 
+def generalize_case_year_literals(
+    identity: CaseIdentity,
+    input_value: Any,
+) -> tuple[CaseIdentity, str | None]:
+    """Replace exact years with a stable role before promoting a draft Case."""
+
+    identity_payload, identity_changed = _replace_exact_year_literals(
+        identity.model_dump(mode="json")
+    )
+    input_payload = _parse_json_object(input_value)
+    if input_payload is None:
+        return identity, None
+    generalized_input, input_changed = _replace_exact_year_literals(input_payload)
+    if identity_changed or input_changed:
+        variable_types = generalized_input.get("variable_types")
+        if isinstance(variable_types, list) and "target year" not in variable_types:
+            variable_types.append("target year")
+    return (
+        CaseIdentity.model_validate(identity_payload),
+        json.dumps(
+            generalized_input,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
+
+
 def case_generalization_violations(operation: ResolvedOperation) -> list[str]:
     """Return high-confidence one-run literals that must not enter a Case."""
 
@@ -307,6 +337,28 @@ def _literal_violations(value: Any, *, field_path: str) -> list[str]:
                 if literal:
                     violations.append(f"{path} contains {label}: {literal!r}")
     return violations
+
+
+def _replace_exact_year_literals(value: Any) -> tuple[Any, bool]:
+    if isinstance(value, str):
+        replaced, count = _CASE_EXACT_YEAR_PATTERN.subn("target_year", value)
+        return replaced, count > 0
+    if isinstance(value, dict):
+        changed = False
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            result[key], item_changed = _replace_exact_year_literals(item)
+            changed = changed or item_changed
+        return result, changed
+    if isinstance(value, list):
+        changed = False
+        result: list[Any] = []
+        for item in value:
+            replaced, item_changed = _replace_exact_year_literals(item)
+            result.append(replaced)
+            changed = changed or item_changed
+        return result, changed
+    return value, False
 
 
 def _iter_text_values(value: Any, path: str):

@@ -54,8 +54,11 @@ fields:
       - Decision boundary: <the earliest reusable point where the reminder changes behavior>
 
       Rules:
-      - Failure repair only. Do not output generic positive workflows, full SOPs, success-path
-        summaries, or case transcripts.
+      - Failure prevention or observed failure recovery only. A successful trajectory is eligible
+        only when its structured recovery evidence is `observed_recovered` and the runtime trace
+        proves the failed boundary, an actually executed alternative, and the verified recovered
+        result. Do not output generic positive workflows, full SOPs, success-path summaries, or
+        case transcripts.
       - One experience covers one reusable root failure pattern. Split unrelated failures; keep
         coupled symptoms together only when they share the same evidence, boundary, and repair.
         Do not compress several independently testable omissions into one reminder. A multi-step
@@ -85,8 +88,12 @@ fields:
       - For non-success trajectories, create or update an experience only when the evidence
         supports a narrow runtime reminder that would likely prevent or recover from the first
         materially outcome-changing mistake.
-      - For successful, case-specific, already-covered, unsupported, or not-preventable failures,
-        output no experience changes.
+      - For a successful trajectory marked `observed_recovered`, create or update at most one
+        narrow recovery lesson for each independently evidenced failed boundary. Preserve only the
+        observed trigger, compatible alternative that actually ran, unchanged task constraint, and
+        verification. Do not extract the surrounding successful workflow.
+      - For ordinary successful, case-specific, already-covered, unsupported, or not-preventable
+        trajectories, output no experience changes.
       - If a loaded experience was causal and marked over-broad, misleading, or too weak, update
         that existing experience; otherwise do not patch irrelevant loaded experiences.
       - Do not present advisory signals as runtime observations or causal facts. Derive every

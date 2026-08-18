@@ -51,6 +51,12 @@ logger = get_logger(__name__)
 _TRAJECTORY_MEMORY_TYPE = "trajectories"
 _TRAJECTORY_POST_VALIDATION_MAX_RETRIES = 3
 _TRAJECTORY_OUTCOMES = {"success", "failure", "partial", "unfinished", "unknown"}
+_TRAJECTORY_RECOVERY_STATUSES = {
+    "none",
+    "observed_recovered",
+    "attempted_not_recovered",
+    "unknown",
+}
 _TRAJECTORY_ANCHOR_RE = re.compile(
     r"^Stage: [^;]+; Boundary: [^;]+; Capability: [^;]+; Target: [^;]+; Outcome: "
     r"(success|failure|partial|unfinished|unknown);?\.?$"
@@ -546,6 +552,7 @@ def _trajectory_operation_validation_issues(
     required_fields = (
         "trajectory_name",
         "outcome",
+        "recovery_evidence",
         "retrieval_anchor",
         "experience_effects",
         "content",
@@ -606,7 +613,80 @@ def _trajectory_operation_validation_issues(
     if effects:
         issues.extend(_experience_effects_validation_issues(target_name, effects))
 
+    recovery = str(fields.get("recovery_evidence") or "").strip()
+    if recovery:
+        issues.extend(
+            _recovery_evidence_validation_issues(
+                target_name,
+                recovery,
+                outcome=outcome,
+            )
+        )
+
     return issues
+
+
+def _recovery_evidence_validation_issues(
+    target_name: str,
+    raw: str,
+    *,
+    outcome: str,
+) -> list[_TrajectoryValidationIssue]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return [
+            _TrajectoryValidationIssue(
+                target_name=target_name,
+                reason="trajectory recovery_evidence is not valid JSON",
+                details=str(exc),
+            )
+        ]
+    expected = {"status", "failed_boundary", "alternative_action", "verification"}
+    if not isinstance(value, dict) or set(value) != expected:
+        return [
+            _TrajectoryValidationIssue(
+                target_name=target_name,
+                reason="trajectory recovery_evidence has invalid keys",
+                details=f"expected={sorted(expected)}",
+            )
+        ]
+    status = str(value.get("status") or "").strip().lower()
+    if status not in _TRAJECTORY_RECOVERY_STATUSES:
+        return [
+            _TrajectoryValidationIssue(
+                target_name=target_name,
+                reason="trajectory recovery_evidence has invalid status",
+                details=status,
+            )
+        ]
+    text_fields = ("failed_boundary", "alternative_action", "verification")
+    if any(not isinstance(value.get(name), str) for name in text_fields):
+        return [
+            _TrajectoryValidationIssue(
+                target_name=target_name,
+                reason="trajectory recovery_evidence has non-string evidence",
+            )
+        ]
+    if status == "observed_recovered":
+        if outcome != "success":
+            return [
+                _TrajectoryValidationIssue(
+                    target_name=target_name,
+                    reason="observed recovery requires successful trajectory outcome",
+                    details=f"outcome={outcome}",
+                )
+            ]
+        missing = [name for name in text_fields if not value[name].strip()]
+        if missing:
+            return [
+                _TrajectoryValidationIssue(
+                    target_name=target_name,
+                    reason="observed recovery is missing evidence",
+                    details=", ".join(missing),
+                )
+            ]
+    return []
 
 
 def _experience_effects_validation_issues(
@@ -666,8 +746,8 @@ def _trajectory_validation_retry_instruction(issues: list[_TrajectoryValidationI
             *detail_lines,
             "",
             "Required repair:",
-            "- Include non-empty trajectory_name, outcome, retrieval_anchor, experience_effects, and content fields.",
-            "- Use the exact outcome, retrieval_anchor, and experience_effects formats from the trajectory schema, and keep their outcomes consistent.",
+            "- Include non-empty trajectory_name, outcome, recovery_evidence, retrieval_anchor, experience_effects, and content fields.",
+            "- Use the exact outcome, recovery_evidence, retrieval_anchor, and experience_effects formats from the trajectory schema, and keep their outcomes consistent.",
             "- Keep the content factual and regenerate the complete trajectory record rather than returning a partial field patch.",
             "Output ONLY the complete JSON object as an instance of OUTPUT_SCHEMA; "
             "do not output the OUTPUT_SCHEMA definition itself.",

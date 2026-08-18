@@ -172,7 +172,10 @@ class ExperienceGradientEstimator:
 
         requests: list[ExperienceGradientEstimateRequest] = []
         for trajectory in analysis.trajectories:
-            if not _should_update_experience_from_trajectory(trajectory):
+            if not _should_update_experience_from_trajectory(
+                trajectory,
+                evaluation=analysis.evaluation,
+            ):
                 continue
             source_rejection = experience_source_rejection_reason(trajectory)
             if source_rejection:
@@ -730,8 +733,35 @@ def _experience_set_from_context_metadata(context: ExperienceGradientContext) ->
     return experience_set
 
 
-def _should_update_experience_from_trajectory(trajectory: Trajectory) -> bool:
-    return str(getattr(trajectory, "outcome", "") or "").strip().lower() != "success"
+def _should_update_experience_from_trajectory(
+    trajectory: Trajectory,
+    *,
+    evaluation: RubricEvaluation | None = None,
+) -> bool:
+    outcome = str(getattr(trajectory, "outcome", "") or "").strip().lower()
+    if outcome != "success":
+        return True
+    return bool(
+        evaluation is not None
+        and evaluation.passed
+        and _trajectory_recovery_status(trajectory) == "observed_recovered"
+    )
+
+
+def _trajectory_recovery_status(trajectory: Trajectory) -> str:
+    raw = dict(getattr(trajectory, "metadata", {}) or {}).get("recovery_evidence")
+    if isinstance(raw, dict):
+        value = raw
+    elif isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            return ""
+    else:
+        return ""
+    if not isinstance(value, dict):
+        return ""
+    return str(value.get("status") or "").strip().lower()
 
 
 def _merge_diagnostics(target: dict[str, Any], diagnostics: dict[str, Any]) -> None:

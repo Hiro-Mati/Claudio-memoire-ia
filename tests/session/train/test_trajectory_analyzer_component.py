@@ -66,6 +66,10 @@ def _valid_trajectory_fields(**overrides):
     fields = {
         "trajectory_name": "task",
         "outcome": "failure",
+        "recovery_evidence": (
+            '{"status":"none","failed_boundary":"",'
+            '"alternative_action":"","verification":""}'
+        ),
         "retrieval_anchor": (
             "Stage: final_response; Boundary: completion verification; "
             "Capability: verify; Target: requested operation; Outcome: failure"
@@ -125,6 +129,25 @@ def test_trajectory_validation_keeps_only_foundational_memory_checks():
     issues = _trajectory_operation_validation_issues("task", invalid_effects)
     assert any(
         issue.reason == "trajectory experience_effects is not valid JSON" for issue in issues
+    )
+
+    invalid_recovery = _valid_trajectory_fields(recovery_evidence="not-json")
+    issues = _trajectory_operation_validation_issues("task", invalid_recovery)
+    assert any(
+        issue.reason == "trajectory recovery_evidence is not valid JSON" for issue in issues
+    )
+
+    recovered_failure = _valid_trajectory_fields(
+        recovery_evidence=(
+            '{"status":"observed_recovered","failed_boundary":"primary tool failed",'
+            '"alternative_action":"compatible fallback completed",'
+            '"verification":"persisted result was reopened and checked"}'
+        )
+    )
+    issues = _trajectory_operation_validation_issues("task", recovered_failure)
+    assert any(
+        issue.reason == "observed recovery requires successful trajectory outcome"
+        for issue in issues
     )
 
     mismatched_outcome = _valid_trajectory_fields(outcome="success")

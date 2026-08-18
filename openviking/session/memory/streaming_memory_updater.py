@@ -35,6 +35,7 @@ from openviking.session.memory.case_aggregation import (
     case_identity_generalization_violations,
     case_input_generalization_violations,
     fallback_case_identity,
+    generalize_case_year_literals,
     merged_case_pending_sources,
     merged_case_source_state,
     normalize_case_status,
@@ -1107,8 +1108,24 @@ async def merge_one_memory_type_operations(
                 "[streaming_memory_updater] repairing malformed merge plan JSON",
                 console=trace_console,
             )
-            repair_response = await vlm.get_completion_async(
-                messages=[
+            if memory_type == CASE_MEMORY_TYPE:
+                repair_messages = [
+                    *merge_messages,
+                    {
+                        "role": "user",
+                        "content": (
+                            "The previous MERGE_PLAN was malformed or incomplete. Regenerate "
+                            "one complete, concise MERGE_PLAN from the original context. Keep "
+                            "every required case_comparison, but do not explain labels. For a "
+                            "group that does not require full Case compaction, use an empty "
+                            "field_operations object. When compaction is required, keep each "
+                            "replacement field concise and use at most three observable rubric "
+                            "criteria. Output one complete JSON object only."
+                        ),
+                    },
+                ]
+            else:
+                repair_messages = [
                     {
                         "role": "system",
                         "content": (
@@ -1128,7 +1145,9 @@ async def merge_one_memory_type_operations(
                             "Return the complete syntax-repaired JSON object only."
                         ),
                     },
-                ],
+                ]
+            repair_response = await vlm.get_completion_async(
+                messages=repair_messages,
                 tools=None,
                 thinking=False,
             )
@@ -1331,60 +1350,71 @@ async def repair_missing_case_comparisons(
     missing_pairs: list[tuple[str, str]],
     all_proposals: dict[str, MemoryMergeProposal],
     completion_content: Any,
+    max_attempts: int = 3,
 ) -> list[CaseIdentityComparison]:
     if not missing_pairs:
         return []
+    expected_pairs = set(missing_pairs)
+    remaining_pairs = list(missing_pairs)
+    comparison_by_pair: dict[tuple[str, str], CaseIdentityComparison] = {}
     proposal_ids = sorted({proposal_id for pair in missing_pairs for proposal_id in pair})
     identities = {
         proposal_id: _compact_case_proposal_context(all_proposals[proposal_id])
         for proposal_id in proposal_ids
     }
-    response = await vlm.get_completion_async(
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Classify only the requested Case identity pairs. For each pair, label "
-                    "goal, subject, action_pattern, success_boundary, and "
-                    "context_constraints as MATCH, COMPATIBLE, UNKNOWN, or CONFLICT. "
-                    'Return JSON only with shape {"case_comparisons":[...]}; include '
-                    "every requested pair exactly once and no other pairs."
-                ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "pairs": [
-                            {"proposal_id": left, "candidate_id": right}
-                            for left, right in missing_pairs
-                        ],
-                        "identities": identities,
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ),
-            },
-        ],
-        tools=None,
-        thinking=False,
-    )
-    content = completion_content(response)
-    payload, parse_error = parse_json_strict(content)
-    if parse_error is not None:
-        raise MemoryMergePlanError(f"Invalid Case comparison repair JSON: {parse_error}")
-    try:
-        repaired = _CaseComparisonRepairResponse.model_validate(payload, strict=True)
-    except ValidationError as exc:
-        raise MemoryMergePlanError(f"Invalid Case comparison repair schema: {exc}") from exc
-    expected_pairs = set(missing_pairs)
-    comparison_by_pair = normalized_case_comparison_map(
-        repaired.case_comparisons,
-        expected_pairs=expected_pairs,
-    )
-    if set(comparison_by_pair) != expected_pairs:
-        missing = sorted(expected_pairs - set(comparison_by_pair))
-        raise MemoryMergePlanError(f"Case comparison repair coverage mismatch: missing={missing}")
+    last_error = ""
+    for _attempt in range(max(1, max_attempts)):
+        response = await vlm.get_completion_async(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Classify only the requested Case identity pairs. For each pair, label "
+                        "goal, subject, action_pattern, success_boundary, and "
+                        "context_constraints as MATCH, COMPATIBLE, UNKNOWN, or CONFLICT. "
+                        'Return JSON only with shape {"case_comparisons":[...]}; include '
+                        "every requested pair exactly once and no other pairs."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "pairs": [
+                                {"proposal_id": left, "candidate_id": right}
+                                for left, right in remaining_pairs
+                            ],
+                            "identities": identities,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                },
+            ],
+            tools=None,
+            thinking=False,
+        )
+        content = completion_content(response)
+        payload, parse_error = parse_json_strict(content)
+        if parse_error is not None:
+            last_error = f"Invalid Case comparison repair JSON: {parse_error}"
+            continue
+        try:
+            repaired = _CaseComparisonRepairResponse.model_validate(payload, strict=True)
+        except ValidationError as exc:
+            last_error = f"Invalid Case comparison repair schema: {exc}"
+            continue
+        accepted = normalized_case_comparison_map(
+            repaired.case_comparisons,
+            expected_pairs=set(remaining_pairs),
+        )
+        comparison_by_pair.update(accepted)
+        remaining_pairs = sorted(expected_pairs - set(comparison_by_pair))
+        if not remaining_pairs:
+            break
+        last_error = f"Case comparison repair coverage mismatch: missing={remaining_pairs}"
+    if remaining_pairs:
+        raise MemoryMergePlanError(last_error)
     return [comparison_by_pair[pair] for pair in missing_pairs]
 
 
@@ -1918,6 +1948,12 @@ def finalize_case_merge_operations(
                 raise MemoryMergePlanError(
                     "Draft Case promotion requires generalized_case_identity"
                 )
+            generalized_identity, generalized_input = generalize_case_year_literals(
+                generalized_identity,
+                fields.get("input"),
+            )
+            if generalized_input is not None:
+                fields["input"] = generalized_input
             identity_violations = case_identity_generalization_violations(generalized_identity)
             input_violations = case_input_generalization_violations(fields.get("input"))
             if identity_violations or input_violations:

@@ -706,6 +706,7 @@ async def test_experience_root_cause_prevention_gate_allows_preventive_experienc
     assert "Candidate-local review rule" in prompt
     assert "required to make the entire source trajectory succeed" in prompt
     assert "Direct evaluation evidence" in prompt
+    assert "observed_recovered" in prompt
     assert "unrelated failures" in prompt
     assert "evaluation-only language" not in prompt
     assert "language" not in prompt

@@ -16,6 +16,7 @@ from openviking.session.memory.case_aggregation import (
     case_generalization_post_validation,
     case_generalization_violations,
     fallback_case_identity,
+    generalize_case_year_literals,
     normalize_case_status,
     prepare_case_operation,
     score_case_comparison,
@@ -214,6 +215,58 @@ async def test_missing_case_comparison_repair_uses_only_compact_identity_context
     assert "large historical evidence" not in prompt
 
 
+@pytest.mark.asyncio
+async def test_missing_case_comparison_repair_retries_only_unresolved_pairs():
+    operation = prepare_case_operation(_case_operation(session_id="new-source"))
+    schema = create_default_registry().get("cases")
+    required = build_memory_merge_proposals(
+        operations=[operation], delete_files=[], schema=schema, extract_context=ExtractContext([])
+    )
+    required[0].proposal_id = "new:0"
+    required[0].patch.proposal_id = "new:0"
+    first = _case_file(uri="viking://user/u/memories/cases/first.md")
+    second = _case_file(uri="viking://user/u/memories/cases/second.md")
+    candidates = build_candidate_merge_proposals(
+        {candidate_id_for_uri(item.uri): item for item in (first, second)}
+    )
+    all_proposals = {proposal.proposal_id: proposal for proposal in [*required, *candidates]}
+    pairs = [("new:0", proposal.proposal_id) for proposal in candidates]
+
+    class FakeVLM:
+        calls = []
+
+        async def get_completion_async(self, **kwargs):
+            self.calls.append(kwargs)
+            requested = json.loads(kwargs["messages"][1]["content"])["pairs"]
+            selected = requested[:1] if len(self.calls) == 1 else requested
+            return json.dumps(
+                {
+                    "case_comparisons": [
+                        _comparison(
+                            proposal_id=item["proposal_id"],
+                            candidate_id=item["candidate_id"],
+                        ).model_dump()
+                        for item in selected
+                    ]
+                }
+            )
+
+    vlm = FakeVLM()
+    repaired = await repair_missing_case_comparisons(
+        vlm=vlm,
+        missing_pairs=pairs,
+        all_proposals=all_proposals,
+        completion_content=lambda value: value,
+    )
+
+    assert {(item.proposal_id, item.candidate_id) for item in repaired} == set(pairs)
+    assert len(vlm.calls) == 2
+    second_request = json.loads(vlm.calls[1]["messages"][1]["content"])["pairs"]
+    assert second_request == [
+        {"proposal_id": pairs[1][0], "candidate_id": pairs[1][1]}
+    ]
+
+
 def test_case_merge_payload_ignores_system_managed_and_immutable_fields():
     schema = create_default_registry().get("cases")
     payload = {
@@ -310,6 +363,27 @@ def test_case_generalization_rejects_run_values_and_requires_variable_types():
     assert any("pricing_final.xlsx" in item for item in violations)
     assert any("input.variable_types" in item for item in violations)
     assert any("parameter_slots" in item for item in violations)
+
+
+def test_case_promotion_generalizes_exact_years_without_another_llm_call():
+    identity = CaseIdentity(
+        goal="analyze 2024 source records",
+        subject="2024 publication data",
+        action_pattern="filter records for 2024",
+        success_boundary="deliver the 2024 analysis",
+        context_constraints=["the requested year is 2024"],
+    )
+    generalized_identity, generalized_input = generalize_case_year_literals(
+        identity,
+        '{"summary":"Analyze 2024 records","preconditions":["2024 data exists"],'
+        '"variable_types":[]}',
+    )
+
+    assert "2024" not in generalized_identity.compact_json()
+    assert "target_year" in generalized_identity.compact_json()
+    assert generalized_input is not None
+    assert "2024" not in generalized_input
+    assert json.loads(generalized_input)["variable_types"] == ["target year"]
 
 
 def test_case_generalization_retry_drops_only_invalid_case_operation():
