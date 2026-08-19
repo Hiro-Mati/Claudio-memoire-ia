@@ -449,6 +449,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
             reset_timeout=breaker_cfg.reset_timeout,
             max_reset_timeout=breaker_cfg.max_reset_timeout,
         )
+        self._max_requeue_attempts = getattr(breaker_cfg, "max_requeue_attempts", 8)
         self._breaker_open_last_log_at = 0.0
         self._breaker_open_suppressed_count = 0
         self._breaker_open_log_interval = 30.0
@@ -471,6 +472,53 @@ class TextEmbeddingHandler(DequeueHandlerBase):
             logger.warning("Embedding circuit breaker is open; re-enqueueing messages")
             self._breaker_open_last_log_at = now
             self._breaker_open_suppressed_count = 0
+
+    async def _requeue_embedding_msg(
+        self,
+        embedding_msg: EmbeddingMsg,
+        *,
+        throttle_for_breaker: bool = False,
+    ) -> tuple[bool, str]:
+        """Re-enqueue a retryable embedding message, subject to its durable cap."""
+        if embedding_msg.requeue_count >= self._max_requeue_attempts:
+            return (
+                False,
+                self._embedding_error_msg(
+                    embedding_msg,
+                    "Embedding requeue limit exhausted "
+                    f"({embedding_msg.requeue_count}/{self._max_requeue_attempts})",
+                ),
+            )
+        if not self._vikingdb.has_queue_manager:
+            return (
+                False,
+                self._embedding_error_msg(
+                    embedding_msg,
+                    "Cannot re-enqueue embedding message: no queue manager",
+                ),
+            )
+
+        if throttle_for_breaker:
+            wait = self._circuit_breaker.retry_after
+            if wait > 0:
+                await asyncio.sleep(wait)
+
+        embedding_msg.requeue_count += 1
+        try:
+            await self._vikingdb.enqueue_embedding_msg(embedding_msg)
+        except Exception as exc:
+            embedding_msg.requeue_count -= 1
+            return (
+                False,
+                self._embedding_error_msg(
+                    embedding_msg, f"Failed to re-enqueue message: {exc}"
+                ),
+            )
+
+        self._merge_request_stats(embedding_msg.telemetry_id, requeue_count=1)
+        get_request_wait_tracker().record_embedding_requeue(embedding_msg.telemetry_id)
+        self.report_requeue()
+        return True, ""
 
     @classmethod
     def _merge_request_stats(
@@ -616,26 +664,13 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     self._breaker_open_suppressed_count = 0
                 except CircuitBreakerOpen:
                     self._log_breaker_open_reenqueue_summary()
-                    if self._vikingdb.has_queue_manager:
-                        wait = self._circuit_breaker.retry_after
-                        if wait > 0:
-                            await asyncio.sleep(wait)
-                        await self._vikingdb.enqueue_embedding_msg(embedding_msg)
-                        self._merge_request_stats(
-                            embedding_msg.telemetry_id,
-                            requeue_count=1,
-                        )
-                        get_request_wait_tracker().record_embedding_requeue(
-                            embedding_msg.telemetry_id
-                        )
-                        self.report_requeue()
+                    requeued, error_msg = await self._requeue_embedding_msg(
+                        embedding_msg, throttle_for_breaker=True
+                    )
+                    if requeued:
                         report_success = True
                         return None
-                    # No queue manager — cannot re-enqueue, drop with error
-                    error_msg = self._embedding_error_msg(
-                        embedding_msg,
-                        "Circuit breaker open and no queue manager",
-                    )
+                    self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
                     request_failed_message = error_msg
                     report_error_args = (error_msg, data)
                     return None
@@ -715,34 +750,19 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         # Transient or unknown — re-enqueue for retry
                         logger.warning(error_msg)
                         self._circuit_breaker.record_failure(embed_err)
-                        if self._vikingdb.has_queue_manager:
-                            try:
-                                await self._vikingdb.enqueue_embedding_msg(embedding_msg)
-                                self._merge_request_stats(
-                                    embedding_msg.telemetry_id,
-                                    requeue_count=1,
-                                )
-                                get_request_wait_tracker().record_embedding_requeue(
-                                    embedding_msg.telemetry_id
-                                )
-                                self.report_requeue()
-                                logger.info(
-                                    "Re-enqueued embedding message after transient error "
-                                    f"({self._embedding_msg_log_context(embedding_msg)})"
-                                )
-                                report_success = True
-                                return None
-                            except Exception as requeue_err:
-                                logger.error(
-                                    self._embedding_error_msg(
-                                        embedding_msg,
-                                        f"Failed to re-enqueue message: {requeue_err}",
-                                    )
-                                )
+                        requeued, requeue_error = await self._requeue_embedding_msg(embedding_msg)
+                        if requeued:
+                            logger.info(
+                                "Re-enqueued embedding message after transient error "
+                                f"({self._embedding_msg_log_context(embedding_msg)})"
+                            )
+                            report_success = True
+                            return None
 
                         self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
-                        request_failed_message = error_msg
-                        report_error_args = (error_msg, data)
+                        terminal_error = f"{requeue_error}; last retryable error: {error_msg}"
+                        request_failed_message = terminal_error
+                        report_error_args = (terminal_error, data)
                         return None
 
                     # Add dense vector

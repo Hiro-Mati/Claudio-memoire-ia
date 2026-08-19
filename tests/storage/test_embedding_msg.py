@@ -27,3 +27,22 @@ def test_embedding_msg_roundtrip_preserves_id_for_request_wait_tracker():
         assert tracker.is_complete(telemetry_id)
     finally:
         tracker.cleanup(telemetry_id)
+
+
+def test_embedding_msg_roundtrip_preserves_requeue_count_and_reads_legacy_payload():
+    msg = EmbeddingMsg(
+        "hello",
+        {"uri": "viking://user/default/skills/demo"},
+        requeue_count=3,
+    )
+
+    restored = EmbeddingMsg.from_dict(msg.to_dict())
+    legacy = EmbeddingMsg.from_dict(
+        {
+            "message": "hello",
+            "context_data": {"uri": "viking://user/default/skills/demo"},
+        }
+    )
+
+    assert restored.requeue_count == 3
+    assert legacy.requeue_count == 0

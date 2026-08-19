@@ -754,6 +754,8 @@ class ContentWriteCoordinator:
                 if wait
                 else None
             )
+            if wait and queue_status:
+                self._raise_refresh_errors(queue_status)
             result_kwargs = {}
             if processing_mode == VECTORS_ONLY:
                 if vector_enqueued:
@@ -1073,6 +1075,7 @@ class ContentWriteCoordinator:
                     if telemetry_id
                     else await self._wait_for_queues(timeout=timeout)
                 )
+                self._raise_refresh_errors(queue_status)
             vector_status = self._memory_vector_status(
                 embedding_requested=embedding_requested,
                 wait=wait,

@@ -93,7 +93,14 @@ class SemanticProcessor(DequeueHandlerBase):
         """
         self.max_concurrent_llm = max_concurrent_llm
         self._default_ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
-        self._circuit_breaker = CircuitBreaker()
+        config = get_openviking_config()
+        breaker_cfg = getattr(getattr(config, "vlm", None), "circuit_breaker", None)
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=getattr(breaker_cfg, "failure_threshold", 5),
+            reset_timeout=getattr(breaker_cfg, "reset_timeout", 60.0),
+            max_reset_timeout=getattr(breaker_cfg, "max_reset_timeout", 600.0),
+        )
+        self._max_requeue_attempts = getattr(breaker_cfg, "max_requeue_attempts", 8)
 
     @classmethod
     def _cache_dag_stats(cls, telemetry_id: str, uri: str, stats: DagStats) -> None:
@@ -201,6 +208,12 @@ class SemanticProcessor(DequeueHandlerBase):
 
         from openviking.storage.queuefs import get_queue_manager
 
+        if msg.requeue_count >= self._max_requeue_attempts:
+            raise RuntimeError(
+                "Semantic requeue limit exhausted "
+                f"({msg.requeue_count}/{self._max_requeue_attempts})"
+            )
+
         # Throttle to prevent re-enqueue storm during OPEN window
         wait = self._circuit_breaker.retry_after
         if wait > 0:
@@ -209,10 +222,15 @@ class SemanticProcessor(DequeueHandlerBase):
         queue_manager = get_queue_manager()
         if queue_manager is not None:
             semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC)
-            await semantic_queue.enqueue(msg)
+            msg.requeue_count += 1
+            try:
+                await semantic_queue.enqueue(msg)
+            except Exception:
+                msg.requeue_count -= 1
+                raise
             logger.info(f"Re-enqueued semantic message: {msg.uri}")
         else:
-            logger.warning(f"No queue manager available, cannot re-enqueue: {msg.uri}")
+            raise RuntimeError(f"No queue manager available, cannot re-enqueue: {msg.uri}")
 
     async def _requeue_semantic_msg_after_error(
         self,
@@ -228,8 +246,9 @@ class SemanticProcessor(DequeueHandlerBase):
         except Exception as requeue_err:
             logger.error(f"Failed to re-enqueue semantic message: {requeue_err}")
             self._merge_request_stats(msg.telemetry_id, error_count=1)
-            get_request_wait_tracker().mark_semantic_failed(msg.telemetry_id, msg.id, str(error))
-            self.report_error(str(error), data)
+            error_msg = f"{requeue_err}; last retryable error: {error}"
+            get_request_wait_tracker().mark_semantic_failed(msg.telemetry_id, msg.id, error_msg)
+            self.report_error(error_msg, data)
             return
         self.report_success()
 
@@ -317,11 +336,9 @@ class SemanticProcessor(DequeueHandlerBase):
                 logger.warning(
                     f"Circuit breaker is open, re-enqueueing semantic message: {msg.uri}"
                 )
-                await self._reenqueue_semantic_msg(msg)
-                self._merge_request_stats(msg.telemetry_id, requeue_count=1)
-                get_request_wait_tracker().record_semantic_requeue(msg.telemetry_id)
-                self.report_requeue()
-                self.report_success()
+                await self._requeue_semantic_msg_after_error(
+                    msg, data, RuntimeError("Semantic circuit breaker is open")
+                )
                 return None
             collector = resolve_telemetry(msg.telemetry_id)
             telemetry_ctx = bind_telemetry(collector) if collector is not None else nullcontext()

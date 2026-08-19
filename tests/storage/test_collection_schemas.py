@@ -137,6 +137,7 @@ def test_embedding_handler_builds_circuit_breaker_from_config(monkeypatch):
         failure_threshold=7,
         reset_timeout=60.0,
         max_reset_timeout=600.0,
+        max_requeue_attempts=3,
     )
     monkeypatch.setattr(
         "openviking_cli.utils.config.get_openviking_config",
@@ -148,6 +149,7 @@ def test_embedding_handler_builds_circuit_breaker_from_config(monkeypatch):
     assert handler._circuit_breaker._failure_threshold == 7
     assert handler._circuit_breaker._base_reset_timeout == 60.0
     assert handler._circuit_breaker._max_reset_timeout == 600.0
+    assert handler._max_requeue_attempts == 3
 
 
 @pytest.mark.asyncio
@@ -339,6 +341,52 @@ async def test_embedding_handler_open_breaker_logs_summary_instead_of_per_item_w
     warnings = [record.message for record in caplog.records if record.levelno == logging.WARNING]
     assert warnings.count("Embedding circuit breaker is open; re-enqueueing messages") == 1
     assert status == {"success": 2, "requeue": 2, "error": 0}
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_fails_terminally_when_requeue_limit_is_exhausted(monkeypatch):
+    class _QueueingVikingDB:
+        is_closing = False
+        has_queue_manager = True
+
+        def __init__(self):
+            self.enqueued = []
+
+        async def enqueue_embedding_msg(self, msg):
+            self.enqueued.append(msg.to_dict())
+
+    embedder = _DummyEmbedder()
+    config = _DummyConfig(embedder)
+    config.embedding.circuit_breaker.max_requeue_attempts = 1
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: config,
+    )
+
+    vikingdb = _QueueingVikingDB()
+    handler = TextEmbeddingHandler(vikingdb)
+    status = {"success": 0, "requeue": 0, "error": 0}
+    handler.set_callbacks(
+        on_success=lambda: status.__setitem__("success", status["success"] + 1),
+        on_requeue=lambda: status.__setitem__("requeue", status["requeue"] + 1),
+        on_error=lambda *_: status.__setitem__("error", status["error"] + 1),
+    )
+
+    from openviking.utils.circuit_breaker import CircuitBreakerOpen
+
+    monkeypatch.setattr(
+        handler._circuit_breaker,
+        "check",
+        lambda: (_ for _ in ()).throw(CircuitBreakerOpen("open")),
+    )
+    payload = _build_queue_payload()
+    await handler.on_dequeue(payload)
+    retry_payload = {"data": json.dumps(vikingdb.enqueued[0])}
+    await handler.on_dequeue(retry_payload)
+
+    assert len(vikingdb.enqueued) == 1
+    assert vikingdb.enqueued[0]["requeue_count"] == 1
+    assert status == {"success": 1, "requeue": 1, "error": 1}
 
 
 @pytest.mark.asyncio

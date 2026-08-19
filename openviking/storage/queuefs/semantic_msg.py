@@ -57,6 +57,7 @@ class SemanticMsg:
     ingest_options: IngestOptions = field(default_factory=IngestOptions)
     coalesce_key: str = ""
     coalesce_version: int = 0
+    requeue_count: int = 0
     changes: Optional[Dict[str, List[str]]] = (
         None  # {"added": [...], "modified": [...], "deleted": [...]}
     )
@@ -79,6 +80,7 @@ class SemanticMsg:
         ingest_options: IngestOptions | Dict[str, Any] | None = None,
         coalesce_key: str = "",
         coalesce_version: int = 0,
+        requeue_count: int = 0,
         changes: Optional[Dict[str, List[str]]] = None,
     ):
         self.id = str(uuid4())
@@ -98,6 +100,7 @@ class SemanticMsg:
         self.ingest_options = IngestOptions.from_value(ingest_options)
         self.coalesce_key = coalesce_key
         self.coalesce_version = coalesce_version
+        self.requeue_count = requeue_count
         self.changes = changes
 
     def to_dict(self) -> Dict[str, Any]:
@@ -150,6 +153,7 @@ class SemanticMsg:
             ),
             coalesce_key=data.get("coalesce_key", ""),
             coalesce_version=data.get("coalesce_version", 0),
+            requeue_count=data.get("requeue_count", 0),
             changes=data.get("changes"),
         )
         if "id" in data and data["id"]:

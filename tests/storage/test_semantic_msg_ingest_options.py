@@ -39,3 +39,16 @@ def test_semantic_msg_reads_legacy_search_tag_fields():
         search_tags=["team=search"],
         search_tag_mode="append",
     )
+    assert msg.requeue_count == 0
+
+
+def test_semantic_msg_roundtrip_preserves_requeue_count():
+    msg = SemanticMsg(
+        uri="viking://resources/demo",
+        context_type="resource",
+        requeue_count=3,
+    )
+
+    restored = SemanticMsg.from_dict(msg.to_dict())
+
+    assert restored.requeue_count == 3

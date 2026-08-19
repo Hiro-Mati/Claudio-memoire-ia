@@ -185,9 +185,25 @@ class AddResourceProcessor(DequeueHandlerBase):
                 else:
                     result = deepcopy(replay_result)
                 await tracker.wait_for_descendants(msg.task_id, metadata.work_id)
+                queue_status = request_wait_tracker.build_queue_status(telemetry_id)
+                queue_errors = sum(
+                    int(group.get("error_count", 0) or 0)
+                    for group in queue_status.values()
+                    if isinstance(group, dict)
+                )
+                if queue_errors:
+                    error_msg = f"queue processing failed: {queue_status}"
+                    await tracker.fail(
+                        msg.task_id,
+                        error_msg,
+                        account_id=ctx.account_id,
+                        user_id=ctx.user.user_id,
+                    )
+                    self.report_error(error_msg, data)
+                    return None
                 result.setdefault(
                     "queue_status",
-                    request_wait_tracker.build_queue_status(telemetry_id),
+                    queue_status,
                 )
                 record_resource_queue_metrics(
                     telemetry=telemetry,

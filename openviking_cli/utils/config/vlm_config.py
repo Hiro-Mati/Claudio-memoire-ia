@@ -87,6 +87,28 @@ class VLMMediaConfig(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class VLMCircuitBreakerConfig(BaseModel):
+    """Circuit-breaker and bounded requeue policy for semantic VLM work."""
+
+    failure_threshold: int = Field(default=5, ge=1)
+    reset_timeout: float = Field(default=60.0, gt=0)
+    max_reset_timeout: float = Field(default=600.0, gt=0)
+    max_requeue_attempts: int = Field(
+        default=8,
+        ge=0,
+        description=(
+            "Maximum times one semantic queue message may be re-enqueued after a "
+            "retryable error or an open circuit breaker; 0 disables re-enqueue"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_bounds(self):
+        if self.max_reset_timeout < self.reset_timeout:
+            raise ValueError("vlm.circuit_breaker.max_reset_timeout must be >= reset_timeout")
+        return self
+
+
 class VLMConfig(BaseModel):
     """VLM configuration, supports multiple provider backends and multi-credential failover."""
 
@@ -135,6 +157,10 @@ class VLMConfig(BaseModel):
 
     max_concurrent: int = Field(
         default=32, description="Maximum number of concurrent LLM calls for semantic processing"
+    )
+    circuit_breaker: VLMCircuitBreakerConfig = Field(
+        default_factory=VLMCircuitBreakerConfig,
+        description="Circuit breaker and bounded requeue policy for semantic processing",
     )
 
     media: VLMMediaConfig = Field(

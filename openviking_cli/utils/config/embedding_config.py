@@ -611,6 +611,14 @@ class EmbeddingCircuitBreakerConfig(BaseModel):
         gt=0,
         description="Maximum circuit breaker reset timeout in seconds",
     )
+    max_requeue_attempts: int = Field(
+        default=8,
+        ge=0,
+        description=(
+            "Maximum times one embedding queue message may be re-enqueued after a "
+            "retryable error or an open circuit breaker; 0 disables re-enqueue"
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_bounds(self):
