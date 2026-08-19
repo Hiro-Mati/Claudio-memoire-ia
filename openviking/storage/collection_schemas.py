@@ -634,6 +634,14 @@ class TextEmbeddingHandler(DequeueHandlerBase):
         try:
             embedding_msg = EmbeddingMsg.from_json(data["data"])
             inserted_data = embedding_msg.context_data
+            embedding_started = time.monotonic()
+            logger.info(
+                "Embedding dequeue start: telemetry_id=%s embedding_root_id=%s requeue_count=%s %s",
+                embedding_msg.telemetry_id or "-",
+                embedding_msg.id,
+                embedding_msg.requeue_count,
+                self._embedding_msg_log_context(embedding_msg),
+            )
             account_id = inserted_data.get("account_id", "default")
             user = UserIdentifier(account_id=account_id, user_id="default")
             ctx = RequestContext(user=user, role=Role.ROOT)
@@ -688,12 +696,25 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         import time as _time
 
                         _embed_t0 = _time.monotonic()
+                        logger.info(
+                            "Embedding provider start: telemetry_id=%s embedding_root_id=%s %s",
+                            embedding_msg.telemetry_id or "-",
+                            embedding_msg.id,
+                            self._embedding_msg_log_context(embedding_msg),
+                        )
                         result = await embed_compat(
                             self._embedder,
                             embedding_msg.message,
                             is_query=False,
                         )
                         _embed_elapsed = _time.monotonic() - _embed_t0
+                        logger.info(
+                            "Embedding provider done: telemetry_id=%s embedding_root_id=%s elapsed_ms=%.1f %s",
+                            embedding_msg.telemetry_id or "-",
+                            embedding_msg.id,
+                            _embed_elapsed * 1000,
+                            self._embedding_msg_log_context(embedding_msg),
+                        )
                         try:
                             from openviking.metrics.datasources import EmbeddingEventDataSource
 
@@ -806,6 +827,13 @@ class TextEmbeddingHandler(DequeueHandlerBase):
 
                 # Write to vector database
                 try:
+                    upsert_started = time.monotonic()
+                    logger.info(
+                        "Embedding vector-db upsert start: telemetry_id=%s embedding_root_id=%s %s",
+                        embedding_msg.telemetry_id or "-",
+                        embedding_msg.id,
+                        self._embedding_msg_log_context(embedding_msg),
+                    )
                     raw_upsert_options = inserted_data.pop("_upsert_options", {})
                     upsert_options = normalize_upsert_options(
                         {**raw_upsert_options, "partial_update": True}
@@ -828,6 +856,14 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         options=upsert_options,
                     )
                     record_id = result
+                    logger.info(
+                        "Embedding vector-db upsert done: telemetry_id=%s embedding_root_id=%s elapsed_ms=%.1f record_id=%s %s",
+                        embedding_msg.telemetry_id or "-",
+                        embedding_msg.id,
+                        (time.monotonic() - upsert_started) * 1000,
+                        record_id or "-",
+                        self._embedding_msg_log_context(embedding_msg),
+                    )
                     if record_id:
                         logger.debug("Successfully wrote embedding: uri=%s", uri)
                 except CollectionNotFoundError as db_err:
@@ -869,6 +905,13 @@ class TextEmbeddingHandler(DequeueHandlerBase):
 
                 self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
                 self._record_request_success(embedding_msg)
+                logger.info(
+                    "Embedding request settled: outcome=done telemetry_id=%s embedding_root_id=%s elapsed_ms=%.1f %s",
+                    embedding_msg.telemetry_id or "-",
+                    embedding_msg.id,
+                    (time.monotonic() - embedding_started) * 1000,
+                    self._embedding_msg_log_context(embedding_msg),
+                )
                 report_success = True
                 self._circuit_breaker.record_success()
                 return inserted_data
@@ -922,6 +965,12 @@ class TextEmbeddingHandler(DequeueHandlerBase):
 
     @staticmethod
     def _record_request_failure(embedding_msg: EmbeddingMsg, message: str) -> None:
+        logger.info(
+            "Embedding request settled: outcome=failed telemetry_id=%s embedding_root_id=%s error=%s",
+            embedding_msg.telemetry_id or "-",
+            embedding_msg.id,
+            message,
+        )
         get_request_wait_tracker().mark_embedding_failed(
             embedding_msg.telemetry_id,
             embedding_msg.id,

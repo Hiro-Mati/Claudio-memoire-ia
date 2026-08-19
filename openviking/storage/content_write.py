@@ -8,6 +8,7 @@ import base64
 import binascii
 import hashlib
 import os
+import time
 from collections import defaultdict
 from typing import Any, Dict, Optional
 
@@ -710,6 +711,11 @@ class ContentWriteCoordinator:
         telemetry_id: str,
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
     ) -> Dict[str, Any]:
+        write_started = time.monotonic()
+        logger.info(
+            "Write refresh start: telemetry_id=%s uri=%s processing_mode=%s wait=%s",
+            telemetry_id or "-", uri, processing_mode, wait
+        )
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
         try:
             lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(lock_path)
@@ -718,6 +724,10 @@ class ContentWriteCoordinator:
                 f"resource is busy and cannot be written now: {uri}",
                 uri=uri,
             ) from exc
+        logger.info(
+            "Write pathlock acquired: telemetry_id=%s uri=%s elapsed_ms=%.1f",
+            telemetry_id or "-", uri, (time.monotonic() - write_started) * 1000
+        )
 
         previous_content: Optional[str] = None
         content_written = False
@@ -731,6 +741,10 @@ class ContentWriteCoordinator:
                 get_request_wait_tracker().register_request(telemetry_id)
             await self._write_in_place(uri, content, mode=mode, ctx=ctx, lease_ref=lease)
             content_written = True
+            logger.info(
+                "Write content persisted: telemetry_id=%s uri=%s elapsed_ms=%.1f",
+                telemetry_id or "-", uri, (time.monotonic() - write_started) * 1000
+            )
             if processing_mode == VECTORS_ONLY:
                 vector_enqueued = await self._vectorize_written_file(
                     uri=uri,
@@ -738,6 +752,11 @@ class ContentWriteCoordinator:
                     ctx=ctx,
                 )
                 post_process_started = True
+                logger.info(
+                    "Write vectorization enqueue finished: telemetry_id=%s uri=%s enqueued=%s elapsed_ms=%.1f",
+                    telemetry_id or "-", uri, vector_enqueued,
+                    (time.monotonic() - write_started) * 1000
+                )
             else:
                 await self._enqueue_semantic_refresh(
                     root_uri=root_uri,
@@ -749,6 +768,14 @@ class ContentWriteCoordinator:
                 post_process_started = True
             await self._viking_fs._async_agfs.pathlock_release(lease)
             lock_released = True
+            logger.info(
+                "Write pathlock released: telemetry_id=%s uri=%s elapsed_ms=%.1f",
+                telemetry_id or "-", uri, (time.monotonic() - write_started) * 1000
+            )
+            if wait:
+                logger.info(
+                    "Write waiting for queue: telemetry_id=%s uri=%s", telemetry_id or "-", uri
+                )
             queue_status = (
                 await self._wait_for_request(telemetry_id=telemetry_id, timeout=timeout)
                 if wait
@@ -756,6 +783,11 @@ class ContentWriteCoordinator:
             )
             if wait and queue_status:
                 self._raise_refresh_errors(queue_status)
+            if wait:
+                logger.info(
+                    "Write queue wait done: telemetry_id=%s uri=%s elapsed_ms=%.1f queue_status=%s",
+                    telemetry_id or "-", uri, (time.monotonic() - write_started) * 1000, queue_status
+                )
             result_kwargs = {}
             if processing_mode == VECTORS_ONLY:
                 if vector_enqueued:

@@ -163,11 +163,31 @@ class RequestWaitTracker:
         if not telemetry_id:
             return
         start = time.time()
+        next_progress_log_at = start + 30.0
         while True:
             if self.is_complete(telemetry_id):
                 return
             if timeout is not None and (time.time() - start) > timeout:
                 raise TimeoutError(f"Request processing not complete after {timeout}s")
+            now = time.time()
+            if now >= next_progress_log_at:
+                status = self.build_queue_status(telemetry_id)
+                with self._lock:
+                    state = self._states.get(telemetry_id)
+                    pending_embedding = len(state.pending_embedding_roots) if state else 0
+                    pending_semantic = len(state.pending_semantic_roots) if state else 0
+                import logging
+
+                logging.getLogger(__name__).info(
+                    "Request wait still pending: telemetry_id=%s elapsed_s=%.1f "
+                    "pending_embedding=%s pending_semantic=%s queue_status=%s",
+                    telemetry_id,
+                    now - start,
+                    pending_embedding,
+                    pending_semantic,
+                    status,
+                )
+                next_progress_log_at = now + 30.0
             await asyncio.sleep(poll_interval)
 
     def build_queue_status(self, telemetry_id: str) -> Dict[str, Dict[str, object]]:

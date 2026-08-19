@@ -103,6 +103,12 @@ async def _enqueue_embedding_message(
     """Persist one embedding message and settle request tracking on enqueue failure."""
     wait_tracker = get_request_wait_tracker()
     wait_tracker.register_embedding_root(embedding_msg.telemetry_id, embedding_msg.id)
+    logger.info(
+        "Embedding enqueue start: telemetry_id=%s embedding_root_id=%s uri=%s",
+        embedding_msg.telemetry_id or "-",
+        embedding_msg.id,
+        embedding_msg.context_data.get("uri", "-"),
+    )
 
     try:
         enqueue_id = await embedding_queue.enqueue(embedding_msg)
@@ -121,6 +127,12 @@ async def _enqueue_embedding_message(
             failure_message,
         )
         return False
+    logger.info(
+        "Embedding enqueue done: telemetry_id=%s embedding_root_id=%s queue_id=%s",
+        embedding_msg.telemetry_id or "-",
+        embedding_msg.id,
+        enqueue_id,
+    )
     return True
 
 
