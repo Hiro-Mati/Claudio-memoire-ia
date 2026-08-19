@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Content endpoints for OpenViking HTTP Server."""
 
+import time
 from typing import Literal
 from urllib.parse import quote
 
@@ -249,6 +250,16 @@ async def write(
     _ctx: RequestContext = Depends(get_request_context),
 ):
     """Write text content to a file (replace, append, or create) and refresh semantics/vectors."""
+    handler_started = time.monotonic()
+    logger.info(
+        "Content write handler entered: account=%s user=%s uri=%s wait=%s processing_mode=%s content_bytes=%s",
+        _ctx.account_id,
+        _ctx.user.user_id,
+        request.uri,
+        request.wait,
+        request.processing_mode,
+        len(request.content.encode("utf-8")),
+    )
     service = get_service()
     uri = resolve_path_variables(request.uri)
     execution = await run_operation(
@@ -263,6 +274,13 @@ async def write(
             timeout=request.timeout,
             processing_mode=request.processing_mode,
         ),
+    )
+    logger.info(
+        "Content write handler finished: account=%s user=%s uri=%s elapsed_ms=%.1f",
+        _ctx.account_id,
+        _ctx.user.user_id,
+        uri,
+        (time.monotonic() - handler_started) * 1000,
     )
     return Response(
         status="ok",
