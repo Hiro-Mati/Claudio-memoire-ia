@@ -10,7 +10,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, cast
 
 from openviking.telemetry import tracer
 from openviking_cli.utils import get_logger
@@ -39,6 +39,30 @@ class StreamingBatcherConfig:
 
 
 @dataclass(slots=True)
+class StreamingBatchItemOutcome(Generic[R]):
+    """Result or exception for one item in an item-aware batch process call."""
+
+    result: R | None = None
+    exception: Exception | None = None
+
+    @classmethod
+    def success(cls, result: R) -> StreamingBatchItemOutcome[R]:
+        return cls(result=result)
+
+    @classmethod
+    def failure(cls, exception: Exception) -> StreamingBatchItemOutcome[R]:
+        return cls(exception=exception)
+
+
+@dataclass(slots=True)
+class StreamingBatchResults(Generic[R]):
+    """Per-item outcomes plus an optional aggregate result for ``flush`` callers."""
+
+    item_outcomes: list[StreamingBatchItemOutcome[R]]
+    aggregate_result: R | None = None
+
+
+@dataclass(slots=True)
 class StreamingBatcher(Generic[T, R]):
     """A reusable async batcher whose submit waits for its batch result.
 
@@ -50,10 +74,11 @@ class StreamingBatcher(Generic[T, R]):
     """
 
     name: str
-    process_batch: Callable[[list[T], str], Awaitable[R]]
+    process_batch: Callable[[list[T], str], Awaitable[R]] | None = None
     config: StreamingBatcherConfig = field(default_factory=StreamingBatcherConfig)
     item_size: Callable[[T], int] | None = None
     result_metadata: Callable[[R], dict[str, Any] | None] | None = None
+    process_batch_items: Callable[[list[T], str], Awaitable[StreamingBatchResults[R]]] | None = None
     _buffer: list[_PendingBatchItem[T, R]] = field(init=False, repr=False)
     _buffer_lock: asyncio.Lock = field(init=False, repr=False)
     _flush_lock: asyncio.Lock = field(init=False, repr=False)
@@ -62,6 +87,8 @@ class StreamingBatcher(Generic[T, R]):
     _last_result: R | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if (self.process_batch is None) == (self.process_batch_items is None):
+            raise ValueError("exactly one of process_batch or process_batch_items is required")
         self._buffer = []
         self._buffer_lock = asyncio.Lock()
         self._flush_lock = asyncio.Lock()
@@ -148,20 +175,71 @@ class StreamingBatcher(Generic[T, R]):
                             "input_size",
                             sum(self._item_size(item.payload) for item in batch_items),
                         )
-                        result = await self.process_batch(
-                            [item.payload for item in batch_items],
-                            reason,
-                        )
-                        metadata = self._get_result_metadata(result)
-                        if metadata is not None:
-                            metadata.setdefault("batch_id", batch_id)
-                            metadata.setdefault("batch_trace_id", batch_trace_id)
+                        if self.process_batch_items is not None:
+                            batch_results = await self.process_batch_items(
+                                [item.payload for item in batch_items],
+                                reason,
+                            )
+                            if len(batch_results.item_outcomes) != len(batch_items):
+                                raise ValueError(
+                                    f"{self.name} returned "
+                                    f"{len(batch_results.item_outcomes)} item outcomes for "
+                                    f"{len(batch_items)} items"
+                                )
+                            self._annotate_item_results(
+                                batch_results,
+                                batch_id=batch_id,
+                                batch_trace_id=batch_trace_id,
+                            )
+                        else:
+                            assert self.process_batch is not None
+                            result = await self.process_batch(
+                                [item.payload for item in batch_items],
+                                reason,
+                            )
+                            self._annotate_result(
+                                result,
+                                batch_id=batch_id,
+                                batch_trace_id=batch_trace_id,
+                            )
                 except Exception as exc:
                     for pending_batch in batches[batch_index:]:
                         for item in pending_batch:
                             if not item.future.done():
                                 item.future.set_exception(exc)
                     raise
+
+                if self.process_batch_items is not None:
+                    successful_results: list[R] = []
+                    failure_count = 0
+                    for item, outcome in zip(
+                        batch_items,
+                        batch_results.item_outcomes,
+                        strict=True,
+                    ):
+                        if item.future.done():
+                            continue
+                        if outcome.exception is not None:
+                            failure_count += 1
+                            item.future.set_exception(outcome.exception)
+                        else:
+                            item_result = cast(R, outcome.result)
+                            item.future.set_result(item_result)
+                            successful_results.append(item_result)
+
+                    aggregate_result = batch_results.aggregate_result
+                    if aggregate_result is None and successful_results:
+                        aggregate_result = successful_results[-1]
+                    if aggregate_result is not None:
+                        self._last_result = aggregate_result
+                        last_result = aggregate_result
+                    if failure_count:
+                        logger.warning(
+                            "[%s] batch process call completed with %s isolated item failure(s)",
+                            self.name,
+                            failure_count,
+                        )
+                    continue
 
                 self._last_result = result
                 last_result = result
@@ -270,6 +348,38 @@ class StreamingBatcher(Generic[T, R]):
             return self.result_metadata(result)
         metadata = getattr(result, "metadata", None)
         return metadata if isinstance(metadata, dict) else None
+
+    def _annotate_result(self, result: R, *, batch_id: str, batch_trace_id: str) -> None:
+        metadata = self._get_result_metadata(result)
+        if metadata is not None:
+            metadata.setdefault("batch_id", batch_id)
+            metadata.setdefault("batch_trace_id", batch_trace_id)
+
+    def _annotate_item_results(
+        self,
+        batch_results: StreamingBatchResults[R],
+        *,
+        batch_id: str,
+        batch_trace_id: str,
+    ) -> None:
+        seen: set[int] = set()
+        results = [
+            outcome.result
+            for outcome in batch_results.item_outcomes
+            if outcome.exception is None and outcome.result is not None
+        ]
+        if batch_results.aggregate_result is not None:
+            results.append(batch_results.aggregate_result)
+        for result in results:
+            result_id = id(result)
+            if result_id in seen:
+                continue
+            seen.add(result_id)
+            self._annotate_result(
+                result,
+                batch_id=batch_id,
+                batch_trace_id=batch_trace_id,
+            )
 
 
 @dataclass(slots=True)

@@ -79,6 +79,8 @@ from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.memory.utils.streaming_batcher import (
     StreamingBatcher,
     StreamingBatcherConfig,
+    StreamingBatchItemOutcome,
+    StreamingBatchResults,
 )
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import tracer
@@ -184,6 +186,16 @@ class StreamingMemoryUpdateResult:
     apply_result: MemoryUpdateResult
     request_count: int
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _MergedRequestPartition:
+    """One mergeable request subset, or one isolated failing request."""
+
+    indexes: list[int]
+    requests: list[MemoryUpdateRequest]
+    operations: ResolvedOperations | None = None
+    exception: Exception | None = None
 
 
 @dataclass(slots=True)
@@ -357,18 +369,18 @@ class StreamingMemoryUpdater:
         self,
         group_key: MemoryMergeGroupKey,
     ) -> StreamingBatcher[MemoryUpdateRequest, StreamingMemoryUpdateResult]:
-        async def process_batch(
+        async def process_batch_items(
             requests: list[MemoryUpdateRequest],
             reason: str,
-        ) -> StreamingMemoryUpdateResult:
-            return await self._process_batch(group_key, requests, reason)
+        ) -> StreamingBatchResults[StreamingMemoryUpdateResult]:
+            return await self._process_batch_items(group_key, requests, reason)
 
         batcher = StreamingBatcher(
             name=(
                 "openviking-streaming-memory-updater:"
                 f"{group_key.peer_id or 'self'}:{group_key.memory_type}"
             ),
-            process_batch=process_batch,
+            process_batch_items=process_batch_items,
             config=StreamingBatcherConfig(
                 max_items_per_batch=self._operation_limit_for_group(group_key),
                 max_wait_seconds=self.config.max_wait_seconds,
@@ -497,6 +509,143 @@ class StreamingMemoryUpdater:
             console=self.config.trace_console,
         )
         merged_operations = await self._merge_requests(requests)
+        return await self._apply_merged_batch(
+            group_key=group_key,
+            requests=requests,
+            reason=reason,
+            merged_operations=merged_operations,
+        )
+
+    async def _process_batch_items(
+        self,
+        group_key: MemoryMergeGroupKey,
+        requests: list[MemoryUpdateRequest],
+        reason: str,
+    ) -> StreamingBatchResults[StreamingMemoryUpdateResult]:
+        """Merge with bisection before writes and settle each submit independently."""
+
+        input_operations = sum(_operation_count(request.operations) for request in requests)
+        tracer.info(
+            "StreamingMemoryUpdater flush started "
+            f"group={group_key} reason={reason} request_count={len(requests)} "
+            f"input_operations={input_operations}",
+            console=self.config.trace_console,
+        )
+        partitions = await self._partition_mergeable_requests(
+            group_key=group_key,
+            indexed_requests=list(enumerate(requests)),
+        )
+        item_outcomes: list[StreamingBatchItemOutcome[StreamingMemoryUpdateResult] | None] = [
+            None
+        ] * len(requests)
+        successful_results: list[StreamingMemoryUpdateResult] = []
+        isolation_applied = len(partitions) > 1
+
+        for partition in partitions:
+            if partition.exception is not None:
+                for index in partition.indexes:
+                    item_outcomes[index] = StreamingBatchItemOutcome.failure(partition.exception)
+                continue
+
+            assert partition.operations is not None
+            try:
+                result = await self._apply_merged_batch(
+                    group_key=group_key,
+                    requests=partition.requests,
+                    reason=reason,
+                    merged_operations=partition.operations,
+                    metadata={
+                        "failure_isolation_applied": isolation_applied,
+                        "original_batch_request_count": len(requests),
+                        "isolated_subbatch_count": len(partitions),
+                    },
+                )
+            except Exception as exc:
+                # Applying may already have produced side effects. Never retry or
+                # bisect this partition after writes have started.
+                for index in partition.indexes:
+                    item_outcomes[index] = StreamingBatchItemOutcome.failure(exc)
+                continue
+
+            successful_results.append(result)
+            for index in partition.indexes:
+                item_outcomes[index] = StreamingBatchItemOutcome.success(result)
+
+        if any(outcome is None for outcome in item_outcomes):
+            raise RuntimeError("memory batch isolation left an item without an outcome")
+
+        aggregate_result = (
+            combine_streaming_memory_results(*successful_results) if successful_results else None
+        )
+        return StreamingBatchResults(
+            item_outcomes=[outcome for outcome in item_outcomes if outcome is not None],
+            aggregate_result=aggregate_result,
+        )
+
+    async def _partition_mergeable_requests(
+        self,
+        *,
+        group_key: MemoryMergeGroupKey,
+        indexed_requests: list[tuple[int, MemoryUpdateRequest]],
+    ) -> list[_MergedRequestPartition]:
+        """Recursively isolate merge failures without executing any writes."""
+
+        indexes = [index for index, _ in indexed_requests]
+        requests = [request for _, request in indexed_requests]
+        try:
+            operations = await self._merge_requests(requests)
+        except Exception as exc:
+            if len(indexed_requests) == 1:
+                logger.warning(
+                    "StreamingMemoryUpdater isolated failing merge request "
+                    "group=%s request_index=%s error=%s",
+                    group_key,
+                    indexes[0],
+                    exc,
+                )
+                return [
+                    _MergedRequestPartition(
+                        indexes=indexes,
+                        requests=requests,
+                        exception=exc,
+                    )
+                ]
+
+            midpoint = len(indexed_requests) // 2
+            tracer.info(
+                "StreamingMemoryUpdater bisecting failed merge batch "
+                f"group={group_key} request_count={len(indexed_requests)} "
+                f"left_count={midpoint} right_count={len(indexed_requests) - midpoint} "
+                f"error={exc}",
+                console=self.config.trace_console,
+            )
+            left = await self._partition_mergeable_requests(
+                group_key=group_key,
+                indexed_requests=indexed_requests[:midpoint],
+            )
+            right = await self._partition_mergeable_requests(
+                group_key=group_key,
+                indexed_requests=indexed_requests[midpoint:],
+            )
+            return [*left, *right]
+
+        return [
+            _MergedRequestPartition(
+                indexes=indexes,
+                requests=requests,
+                operations=operations,
+            )
+        ]
+
+    async def _apply_merged_batch(
+        self,
+        *,
+        group_key: MemoryMergeGroupKey,
+        requests: list[MemoryUpdateRequest],
+        reason: str,
+        merged_operations: ResolvedOperations,
+        metadata: dict[str, Any] | None = None,
+    ) -> StreamingMemoryUpdateResult:
         first_request = requests[0]
         apply_result = await self._apply_operations(
             operations=merged_operations,
@@ -511,6 +660,7 @@ class StreamingMemoryUpdater:
                 "flush_reason": reason,
                 "operation_count": _operation_count(merged_operations),
                 "merge_group": _merge_group_key_label(group_key),
+                **(metadata or {}),
             },
         )
         self._last_result = result
