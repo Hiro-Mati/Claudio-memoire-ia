@@ -36,11 +36,6 @@ function makeEngine(opts?: {
 
   const client = {
     addSessionMessage,
-    addSessionMessages: vi.fn().mockResolvedValue({
-      added: 2,
-      duplicate: false,
-      pending_tokens: 100,
-    }),
     commitSession: vi.fn().mockResolvedValue({
       status: "accepted",
       task_id: "task-1",
@@ -76,7 +71,6 @@ function makeEngine(opts?: {
     engine,
     client: client as unknown as {
       addSessionMessage: ReturnType<typeof vi.fn>;
-      addSessionMessages: ReturnType<typeof vi.fn>;
       commitSession: ReturnType<typeof vi.fn>;
       getSession: ReturnType<typeof vi.fn>;
     },
@@ -86,65 +80,6 @@ function makeEngine(opts?: {
 }
 
 describe("context-engine afterTurn()", () => {
-  it("declares the OpenClaw durable-turn transcript contract", () => {
-    const { engine } = makeEngine();
-
-    expect(engine.info.transcriptSemantics).toEqual({
-      currentTurnFence: "before-current-turn-entry-v1",
-      turnAdvancementIdempotency: "atomic-idempotent-v1",
-    });
-    expect(engine.commitTurn).toBeTypeOf("function");
-  });
-
-  it("uses commitTurn batch capture for durable OpenClaw hosts", async () => {
-    const { engine, client } = makeEngine();
-
-    await expect(engine.commitTurn({
-      advancementKey: "advance-1",
-      sessionId: "s1",
-      messages: [
-        { role: "user", content: "hello" },
-        { role: "assistant", content: "hi" },
-      ],
-    })).resolves.toEqual({ status: "committed" });
-
-    expect(client.addSessionMessages).toHaveBeenCalledWith(
-      "s1",
-      expect.arrayContaining([
-        expect.objectContaining({ role: "user" }),
-        expect.objectContaining({ role: "assistant" }),
-      ]),
-      "openclaw:advance-1",
-    );
-    expect(client.addSessionMessage).not.toHaveBeenCalled();
-  });
-
-  it("returns duplicate when the server already applied the advancement key", async () => {
-    const { engine, client } = makeEngine();
-    client.addSessionMessages.mockResolvedValueOnce({ added: 0, duplicate: true });
-
-    await expect(engine.commitTurn({
-      advancementKey: "advance-1",
-      sessionId: "s1",
-      messages: [{ role: "user", content: "hello" }],
-    })).resolves.toEqual({ status: "duplicate" });
-  });
-
-  it("does not double-capture through afterTurn on durable OpenClaw hosts", async () => {
-    const { engine, client } = makeEngine();
-
-    await engine.afterTurn!({
-      sessionId: "s1",
-      sessionFile: "",
-      messages: [{ role: "user", content: "hello" }],
-      prePromptMessageCount: 0,
-      runtimeSettings: { schemaVersion: 1 },
-    });
-
-    expect(client.addSessionMessage).not.toHaveBeenCalled();
-    expect(client.addSessionMessages).not.toHaveBeenCalled();
-  });
-
   it("does nothing when autoCapture is disabled", async () => {
     const { engine, client } = makeEngine({ autoCapture: false });
 

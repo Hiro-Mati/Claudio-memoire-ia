@@ -1219,26 +1219,11 @@ class Session:
             role == "user" and len(parts) > 1 and all(isinstance(part, ToolPart) for part in parts)
         )
 
-    def _append_messages(
-        self,
-        messages: List[Message],
-        *,
-        idempotency_key: Optional[str] = None,
-    ) -> List[Message]:
+    def _append_messages(self, messages: List[Message]) -> None:
         """Append messages through the same authoritative lock as commit Phase 1."""
-        return run_async(
-            self._append_messages_authoritatively(
-                messages,
-                idempotency_key=idempotency_key,
-            )
-        )
+        run_async(self._append_messages_authoritatively(messages))
 
-    async def _append_messages_authoritatively(
-        self,
-        messages: List[Message],
-        *,
-        idempotency_key: Optional[str] = None,
-    ) -> List[Message]:
+    async def _append_messages_authoritatively(self, messages: List[Message]) -> None:
         """Reload and append under the session path lock.
 
         Different workers can hold stale Session objects. Without sharing the
@@ -1246,14 +1231,10 @@ class Session:
         be overwritten even though add_message already returned successfully.
         """
         if not messages:
-            return []
+            return
         if not self._viking_fs:
-            if idempotency_key and any(
-                message.turn_id == idempotency_key for message in self._messages
-            ):
-                return []
             self._apply_appended_messages_to_state(messages)
-            return messages
+            return
 
         session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
         lease = await self._viking_fs._async_agfs.pathlock_acquire_tree(
@@ -1280,14 +1261,6 @@ class Session:
                 # append. Message correctness remains rooted in messages.jsonl.
                 self._meta = in_memory_meta
 
-            # OpenClaw retries durable turn advancement after process or plugin
-            # failures.  The check and append share the session path lock, so a
-            # repeated advancement key cannot append the accepted turn twice.
-            if idempotency_key and any(
-                message.turn_id == idempotency_key for message in self._messages
-            ):
-                return []
-
             self._apply_appended_messages_to_state(messages)
             batch_content = "".join(message.to_jsonl() + "\n" for message in messages)
             if live_messages_missing:
@@ -1305,7 +1278,6 @@ class Session:
                     lease_ref=lease,
                 )
             await self._save_meta(lease_ref=lease)
-            return messages
         finally:
             await self._viking_fs._async_agfs.pathlock_release(lease)
 
@@ -1408,35 +1380,20 @@ class Session:
     def add_messages(
         self,
         messages_spec: List[dict],
-        *,
-        idempotency_key: Optional[str] = None,
     ) -> List[Message]:
         """Synchronously add multiple messages in one authoritative batch."""
-        if idempotency_key:
-            messages_spec = [
-                {**spec, "turn_id": idempotency_key}
-                for spec in messages_spec
-            ]
         messages = self._build_messages(messages_spec)
-        return self._append_messages(messages, idempotency_key=idempotency_key)
+        self._append_messages(messages)
+        return messages
 
     async def add_messages_async(
         self,
         messages_spec: List[dict],
-        *,
-        idempotency_key: Optional[str] = None,
     ) -> List[Message]:
         """Asynchronously add multiple messages without blocking the caller loop."""
-        if idempotency_key:
-            messages_spec = [
-                {**spec, "turn_id": idempotency_key}
-                for spec in messages_spec
-            ]
         messages = self._build_messages(messages_spec)
-        return await self._append_messages_authoritatively(
-            messages,
-            idempotency_key=idempotency_key,
-        )
+        await self._append_messages_authoritatively(messages)
+        return messages
 
     def add_message(
         self,
