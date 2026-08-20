@@ -7,6 +7,7 @@ Provides file system operations: ls, mkdir, rm, mv, tree, stat, read, abstract, 
 """
 
 import asyncio
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from openviking.core.namespace import classify_uri, context_type_for_uri
@@ -653,9 +654,32 @@ class FSService:
         processing_mode: str = "semantic_and_vectors",
     ) -> Dict[str, Any]:
         """Write to an existing file and refresh semantics/vectors."""
+        started = time.monotonic()
+        logger.info(
+            "FSService write start: uri=%s mode=%s wait=%s processing_mode=%s",
+            uri,
+            mode,
+            wait,
+            processing_mode,
+        )
         uri = validate_viking_uri(uri)
+        logger.info(
+            "FSService write uri validated: uri=%s elapsed_ms=%.1f",
+            uri,
+            (time.monotonic() - started) * 1000,
+        )
         viking_fs = self._ensure_initialized()
+        logger.info(
+            "FSService write filesystem ready: uri=%s elapsed_ms=%.1f",
+            uri,
+            (time.monotonic() - started) * 1000,
+        )
         coordinator = ContentWriteCoordinator(viking_fs=viking_fs, vikingdb=self._vikingdb)
+        logger.info(
+            "FSService write dispatching coordinator: uri=%s elapsed_ms=%.1f",
+            uri,
+            (time.monotonic() - started) * 1000,
+        )
         return await coordinator.write(
             uri=uri,
             content=content,

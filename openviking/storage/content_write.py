@@ -100,6 +100,16 @@ class ContentWriteCoordinator:
         timeout: Optional[float] = None,
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
     ) -> Dict[str, Any]:
+        coordinator_started = time.monotonic()
+        telemetry_id = get_current_telemetry().telemetry_id
+        logger.info(
+            "Content write coordinator entered: telemetry_id=%s uri=%s mode=%s wait=%s processing_mode=%s",
+            telemetry_id or "-",
+            uri,
+            mode,
+            wait,
+            processing_mode,
+        )
         try:
             normalized_uri = canonicalize_uri(uri, ctx)
         except NamespaceShapeError as exc:
@@ -108,6 +118,12 @@ class ContentWriteCoordinator:
         processing_mode = normalize_processing_mode(processing_mode)
         self._validate_target_uri(normalized_uri)
         self._viking_fs._ensure_mutable_access(normalized_uri, ctx)
+        logger.info(
+            "Content write coordinator validated: telemetry_id=%s uri=%s elapsed_ms=%.1f",
+            telemetry_id or "-",
+            normalized_uri,
+            (time.monotonic() - coordinator_started) * 1000,
+        )
 
         if mode == "create":
             return await self._create_and_write(
@@ -119,15 +135,35 @@ class ContentWriteCoordinator:
                 processing_mode=processing_mode,
             )
 
+        logger.info(
+            "Content write target stat start: telemetry_id=%s uri=%s",
+            telemetry_id or "-", normalized_uri
+        )
         stat = await self._safe_stat(normalized_uri, ctx=ctx)
+        logger.info(
+            "Content write target stat done: telemetry_id=%s uri=%s elapsed_ms=%.1f is_dir=%s",
+            telemetry_id or "-",
+            normalized_uri,
+            (time.monotonic() - coordinator_started) * 1000,
+            stat.get("isDir"),
+        )
         if stat.get("isDir"):
             raise InvalidArgumentError(f"write only supports existing files, got directory: {uri}")
 
         context_type = context_type_for_uri(normalized_uri)
+        logger.info(
+            "Content write root resolve start: telemetry_id=%s uri=%s",
+            telemetry_id or "-", normalized_uri
+        )
         root_uri = await self._resolve_root_uri(normalized_uri, ctx=ctx, anchor_to_parent=True)
+        logger.info(
+            "Content write root resolve done: telemetry_id=%s uri=%s root_uri=%s elapsed_ms=%.1f",
+            telemetry_id or "-",
+            normalized_uri,
+            root_uri,
+            (time.monotonic() - coordinator_started) * 1000,
+        )
         written_bytes = len(content.encode("utf-8"))
-        telemetry_id = get_current_telemetry().telemetry_id
-
         if context_type == "memory":
             return await self._write_memory_with_refresh(
                 uri=normalized_uri,
@@ -142,6 +178,12 @@ class ContentWriteCoordinator:
                 processing_mode=processing_mode,
             )
 
+        logger.info(
+            "Content write dispatching direct refresh: telemetry_id=%s uri=%s elapsed_ms=%.1f",
+            telemetry_id or "-",
+            normalized_uri,
+            (time.monotonic() - coordinator_started) * 1000,
+        )
         return await self._write_direct_with_refresh(
             uri=normalized_uri,
             root_uri=root_uri,
@@ -1381,7 +1423,18 @@ class ContentWriteCoordinator:
                 if parent is not None:
                     root_uri = parent.uri
 
+        telemetry_id = get_current_telemetry().telemetry_id
+        logger.info(
+            "Content write root stat start: telemetry_id=%s root_uri=%s",
+            telemetry_id or "-", root_uri
+        )
         stat = await self._safe_stat(root_uri, ctx=ctx, allow_not_found=_allow_not_found)
+        logger.info(
+            "Content write root stat done: telemetry_id=%s root_uri=%s is_dir=%s",
+            telemetry_id or "-",
+            root_uri,
+            stat.get("isDir"),
+        )
         if stat.get("not_found") or not stat.get("isDir"):
             parent = VikingURI(uri).parent
             if parent is None:
