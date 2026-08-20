@@ -233,6 +233,7 @@ async def find(
         limit=limit,
         score_threshold=min_score,
         level=level,
+        retrieval_purpose="agent_recall",
     )
     return _format_search_result(result)
 
@@ -261,6 +262,7 @@ async def search(
         limit=limit,
         score_threshold=min_score,
         level=level,
+        retrieval_purpose="agent_recall",
     )
     return _format_search_result(result)
 
