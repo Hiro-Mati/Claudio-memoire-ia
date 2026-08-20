@@ -442,6 +442,7 @@ class FSService:
         self,
         *,
         root_uri: str,
+        source_uri: str,
         copied_uri: str,
         context_type: str,
         ctx: RequestContext,
@@ -480,6 +481,7 @@ class FSService:
             ),
             changes={"added": [copied_uri]},
             generation_trigger="content_copy",
+            copy_source_uri=source_uri,
         )
         if telemetry_id:
             get_request_wait_tracker().register_semantic_root(telemetry_id, msg.id)
@@ -541,6 +543,7 @@ class FSService:
         try:
             result["semantic_status"] = await self._enqueue_copy_refresh(
                 root_uri=refresh_parent_uri,
+                source_uri=from_uri,
                 copied_uri=to_uri,
                 context_type=context_type,
                 ctx=ctx,
