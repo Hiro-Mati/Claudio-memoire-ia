@@ -70,6 +70,12 @@ def parse_args() -> argparse.Namespace:
         help="Concurrent OpenViking session.commit submissions during train (default: 150)",
     )
     parser.add_argument(
+        "--commit-timeout-seconds",
+        type=float,
+        default=None,
+        help="Maximum wait per OpenViking session.commit task; unset waits indefinitely.",
+    )
+    parser.add_argument(
         "--commit-case-spec",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -313,6 +319,7 @@ async def main_async() -> int:
             batch_size=args.batch_size,
             concurrency=args.concurrency,
             commit_concurrency=args.commit_concurrency,
+            commit_timeout_seconds=args.commit_timeout_seconds,
             commit_case_spec_enabled=args.commit_case_spec,
             config_path=str(Path(args.config).expanduser()) if args.config else None,
             server_url=args.server_url,

@@ -25,8 +25,10 @@ def test_train_concurrency_defaults_to_150(monkeypatch) -> None:
 
     assert args.concurrency == 150
     assert args.commit_concurrency == 150
+    assert args.commit_timeout_seconds is None
     assert config.concurrency == 150
     assert config.commit_concurrency == 150
+    assert config.commit_timeout_seconds is None
 
 
 def test_train_concurrency_explicit_overrides_are_preserved(monkeypatch) -> None:
@@ -43,6 +45,8 @@ def test_train_concurrency_explicit_overrides_are_preserved(monkeypatch) -> None
             "80",
             "--commit-concurrency",
             "90",
+            "--commit-timeout-seconds",
+            "900",
         ],
     )
 
@@ -52,12 +56,15 @@ def test_train_concurrency_explicit_overrides_are_preserved(monkeypatch) -> None
         domain="airline",
         concurrency=80,
         commit_concurrency=90,
+        commit_timeout_seconds=900,
     )
 
     assert args.concurrency == 80
     assert args.commit_concurrency == 90
+    assert args.commit_timeout_seconds == 900
     assert config.concurrency == 80
     assert config.commit_concurrency == 90
+    assert config.commit_timeout_seconds == 900
 
 
 def test_server_headers_are_repeatable(monkeypatch) -> None:
