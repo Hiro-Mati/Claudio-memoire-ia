@@ -21,9 +21,10 @@ from openviking.models.rerank import RerankClient
 from openviking.retrieve.memory_lifecycle import hotness_score
 from openviking.retrieve.retrieval_stats import get_stats_collector
 from openviking.server.identity import RequestContext
-from openviking.storage.vikingdb_manager import VikingDBManager, VikingDBManagerProxy
 from openviking.storage.expr import FilterExpr
+from openviking.storage.vikingdb_manager import VikingDBManager, VikingDBManagerProxy
 from openviking.telemetry import get_current_telemetry
+from openviking.utils.tags import normalize_search_tags
 from openviking.utils.time_utils import parse_iso_datetime
 from openviking.utils.token_estimation import (
     estimate_text_tokens,
@@ -615,7 +616,9 @@ class HierarchicalRetriever:
                     category=c.get("category", ""),
                     score=final_score,
                     relations=relations,
-                    search_tags=list(c.get("search_tags") or []),
+                    search_tags=normalize_search_tags(
+                        c.get("search_tags"), discard_invalid=True
+                    ),
                 )
             )
 
