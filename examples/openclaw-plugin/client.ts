@@ -800,6 +800,42 @@ export class OpenVikingClient {
     );
   }
 
+  async addSessionMessages(
+    sessionId: string,
+    messages: Array<{
+      role: string;
+      peer_id?: string;
+      created_at?: string;
+      parts: Array<{
+        type: "text" | "tool" | "context";
+        text?: string;
+        tool_name?: string;
+        tool_output?: string;
+        tool_status?: string;
+        tool_input?: Record<string, unknown>;
+        tool_id?: string;
+        uri?: string;
+        abstract?: string;
+        context_type?: "memory" | "resource" | "skill";
+      }>;
+    }>,
+    idempotencyKey: string,
+    actorPeerId?: string,
+  ): Promise<{ added: number; duplicate: boolean; pending_tokens?: number }> {
+    return this.request<{ added: number; duplicate: boolean; pending_tokens?: number }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages/batch`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          messages,
+          idempotency_key: idempotencyKey,
+        }),
+      },
+      undefined,
+      actorPeerId,
+    );
+  }
+
   /** GET session — server auto-creates if absent; returns session meta including message stats and token usage. */
   async getSession(sessionId: string, actorPeerId?: string): Promise<{
     message_count?: number;

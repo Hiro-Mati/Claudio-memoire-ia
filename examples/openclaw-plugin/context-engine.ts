@@ -17,6 +17,7 @@ import {
   assembleOpenVikingSession,
   afterTurnOpenVikingSession,
   compactOpenVikingSession,
+  commitAcceptedOpenVikingTurn,
   commitOpenVikingSession,
 } from "./services/context-lifecycle-service.js";
 
@@ -25,6 +26,11 @@ type ContextEngineInfo = {
   name: string;
   version?: string;
   ownsCompaction: true;
+  acceptedHostParams: string[];
+  transcriptSemantics: {
+    currentTurnFence: "before-current-turn-entry-v1";
+    turnAdvancementIdempotency: "atomic-idempotent-v1";
+  };
 };
 
 type AssembleResult = {
@@ -71,8 +77,17 @@ type ContextEngine = {
     isHeartbeat?: boolean;
     tokenBudget?: number;
     runtimeContext?: Record<string, unknown>;
+    runtimeSettings?: { schemaVersion?: number };
     sessionKey?: string;
   }) => Promise<void>;
+  commitTurn: (params: {
+    advancementKey: string;
+    messages: AgentMessage[];
+    sessionId: string;
+    sessionKey?: string;
+    isHeartbeat?: boolean;
+    runtimeContext?: Record<string, unknown>;
+  }) => Promise<{ status: "committed" | "duplicate" }>;
   assemble: (params: {
     sessionId: string;
     sessionKey?: string;
@@ -324,6 +339,11 @@ export function createMemoryOpenVikingContextEngine(params: {
       name,
       version,
       ownsCompaction: true,
+      acceptedHostParams: ["sessionKey", "prompt", "runtimeSettings", "runtimeContext"],
+      transcriptSemantics: {
+        currentTurnFence: "before-current-turn-entry-v1",
+        turnAdvancementIdempotency: "atomic-idempotent-v1",
+      },
     },
 
     commitOVSession: doCommitOVSession,
@@ -336,6 +356,32 @@ export function createMemoryOpenVikingContextEngine(params: {
 
     async ingestBatch(): Promise<IngestBatchResult> {
       return { ingestedCount: 0 };
+    },
+
+    async afterTurn(afterTurnParams): Promise<void> {
+      // Durable-turn OpenClaw hosts call commitTurn with the exact accepted
+      // transcript range. Keep afterTurn capture only for older hosts that do
+      // not expose runtimeSettings / commitTurn advancement.
+      if (afterTurnParams.runtimeSettings?.schemaVersion === 1) {
+        return;
+      }
+      const tokenBudget = validTokenBudget(afterTurnParams.tokenBudget) ?? 128_000;
+      await afterTurnOpenVikingSession({
+        sessionId: afterTurnParams.sessionId,
+        sessionKey: resolveSessionKey(afterTurnParams),
+        messages: afterTurnParams.messages,
+        prePromptMessageCount: afterTurnParams.prePromptMessageCount,
+        isHeartbeat: afterTurnParams.isHeartbeat,
+        tokenBudget,
+        runtimeContext: afterTurnParams.runtimeContext,
+        cfg,
+        getClient,
+        logger,
+        resolveAgentId,
+        rememberSessionAgentId,
+        isBypassedSession,
+        diag,
+      });
     },
 
     async assemble(assembleParams): Promise<AssembleResult> {
@@ -368,16 +414,14 @@ export function createMemoryOpenVikingContextEngine(params: {
       });
     },
 
-    async afterTurn(afterTurnParams): Promise<void> {
-      const tokenBudget = validTokenBudget(afterTurnParams.tokenBudget) ?? 128_000;
-      await afterTurnOpenVikingSession({
-        sessionId: afterTurnParams.sessionId,
-        sessionKey: resolveSessionKey(afterTurnParams),
-        messages: afterTurnParams.messages,
-        prePromptMessageCount: afterTurnParams.prePromptMessageCount,
-        isHeartbeat: afterTurnParams.isHeartbeat,
-        tokenBudget,
-        runtimeContext: afterTurnParams.runtimeContext,
+    async commitTurn(commitParams): Promise<{ status: "committed" | "duplicate" }> {
+      const status = await commitAcceptedOpenVikingTurn({
+        advancementKey: commitParams.advancementKey,
+        sessionId: commitParams.sessionId,
+        sessionKey: resolveSessionKey(commitParams),
+        messages: commitParams.messages,
+        isHeartbeat: commitParams.isHeartbeat,
+        runtimeContext: commitParams.runtimeContext,
         cfg,
         getClient,
         logger,
@@ -386,6 +430,7 @@ export function createMemoryOpenVikingContextEngine(params: {
         isBypassedSession,
         diag,
       });
+      return { status };
     },
 
     async compact(compactParams): Promise<CompactResult> {

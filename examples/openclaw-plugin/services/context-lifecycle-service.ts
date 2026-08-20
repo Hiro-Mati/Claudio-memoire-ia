@@ -122,6 +122,32 @@ export type CompactOpenVikingSessionParams = {
 
 type AfterTurnClient = Pick<OpenVikingClient, "addSessionMessage" | "getSession" | "commitSession" | "getTask">;
 
+type CommitTurnClient = Pick<OpenVikingClient, "addSessionMessages">;
+
+export type CommitAcceptedOpenVikingTurnParams = {
+  advancementKey: string;
+  sessionId: string;
+  sessionKey?: string;
+  messages: AgentMessage[];
+  isHeartbeat?: boolean;
+  runtimeContext?: Record<string, unknown>;
+  cfg: {
+    autoCapture: boolean;
+    peer_role?: OpenVikingPeerRole;
+  };
+  getClient: () => Promise<CommitTurnClient>;
+  logger: ContextEngineLifecycleLogger;
+  resolveAgentId: (sessionId: string, sessionKey?: string, ovSessionId?: string) => string;
+  rememberSessionAgentId?: (ctx: {
+    agentId?: string;
+    sessionId?: string;
+    sessionKey?: string;
+    ovSessionId?: string;
+  }) => void;
+  isBypassedSession: (params: { sessionId?: string; sessionKey?: string }) => boolean;
+  diag: (stage: string, sessionId: string, data: Record<string, unknown>) => void;
+};
+
 export type AfterTurnOpenVikingSessionParams = {
   sessionId: string;
   sessionKey?: string;
@@ -785,6 +811,97 @@ function messageDigest(messages: AgentMessage[], maxCharsPerMsg = 2000): Array<{
       truncated,
     };
   });
+}
+
+export async function commitAcceptedOpenVikingTurn({
+  advancementKey,
+  sessionId,
+  sessionKey,
+  messages,
+  isHeartbeat,
+  runtimeContext,
+  cfg,
+  getClient,
+  resolveAgentId,
+  rememberSessionAgentId,
+  isBypassedSession,
+  diag,
+}: CommitAcceptedOpenVikingTurnParams): Promise<"committed" | "duplicate"> {
+  const ovSessionId = openClawSessionToOvStorageId(sessionId, sessionKey);
+  if (!cfg.autoCapture || isHeartbeat || isBypassedSession({ sessionId, sessionKey })) {
+    diag("commitTurn_skip", ovSessionId, {
+      reason: !cfg.autoCapture
+        ? "auto_capture_disabled"
+        : isHeartbeat
+          ? "heartbeat"
+          : "session_bypassed",
+      advancementKey,
+    });
+    return "committed";
+  }
+
+  const sender = extractRuntimeSenderId(runtimeContext);
+  const runtimeAgentId = extractRuntimeAgentId(runtimeContext);
+  rememberSessionAgentId?.({
+    agentId: runtimeAgentId,
+    sessionId,
+    sessionKey,
+    ovSessionId,
+  });
+  const agentId = resolveAgentId(sessionId, sessionKey, ovSessionId);
+  const senderRoleId = toRoleId(sender.senderId);
+  const createdAt = pickLatestCreatedAt(messages);
+  const { messages: extractedRaw } = extractNewTurnMessages(messages, 0);
+  const extracted = coalesceConsecutiveToolMessages(extractedRaw);
+  const batch = extracted
+    .map((message) => ({
+      role: message.role,
+      peer_id: resolveOpenVikingMessagePeerId({
+        peerRole: cfg.peer_role ?? "assistant",
+        role: message.role,
+        personPeerId: senderRoleId,
+        assistantPeerId: agentId,
+      }),
+      created_at: createdAt,
+      parts: message.parts.map((part) => {
+        if (part.type === "text") {
+          return {
+            type: "text" as const,
+            text: part.text
+              .replace(/<relevant-memories>[\s\S]*?<\/relevant-memories>/gi, " ")
+              .replace(/\s+/g, " ")
+              .trim(),
+          };
+        }
+        return {
+          type: "tool" as const,
+          tool_id: part.toolCallId,
+          tool_name: part.toolName,
+          tool_input: part.toolInput,
+          tool_output: part.toolOutput,
+          tool_status: part.toolStatus,
+        };
+      }),
+    }))
+    .filter((message) => message.parts.length > 0);
+
+  if (batch.length === 0) {
+    return "committed";
+  }
+
+  const result = await (await getClient()).addSessionMessages(
+    ovSessionId,
+    batch,
+    `openclaw:${advancementKey}`,
+  );
+  const status = result.duplicate ? "duplicate" : "committed";
+  diag("commitTurn_result", ovSessionId, {
+    advancementKey,
+    status,
+    added: result.added,
+    messageCount: batch.length,
+  });
+  return status;
 }
 
 export async function afterTurnOpenVikingSession({

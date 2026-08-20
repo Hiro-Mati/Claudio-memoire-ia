@@ -992,6 +992,38 @@ async def test_batch_add_message_accepts_mixed_parts(client: httpx.AsyncClient, 
     assert isinstance(session.messages[0].parts[1], ImagePart)
 
 
+async def test_batch_add_message_is_idempotent_by_advancement_key(client: httpx.AsyncClient):
+    create_resp = await client.post("/api/v1/sessions", json={})
+    session_id = create_resp.json()["result"]["session_id"]
+    payload = {
+        "messages": [
+            {"role": "user", "content": "remember this"},
+            {"role": "assistant", "content": "remembered"},
+        ],
+        "idempotency_key": "openclaw:advance-1",
+    }
+
+    first = await client.post(
+        f"/api/v1/sessions/{session_id}/messages/batch",
+        json=payload,
+    )
+    retry = await client.post(
+        f"/api/v1/sessions/{session_id}/messages/batch",
+        json=payload,
+    )
+
+    assert first.status_code == 200
+    assert first.json()["result"]["added"] == 2
+    assert first.json()["result"]["duplicate"] is False
+    assert retry.status_code == 200
+    assert retry.json()["result"]["added"] == 0
+    assert retry.json()["result"]["duplicate"] is True
+
+    get_resp = await client.get(f"/api/v1/sessions/{session_id}")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["result"]["message_count"] == 2
+
+
 async def test_batch_add_message_ignores_removed_auto_commit_policy(client: httpx.AsyncClient):
     create_resp = await client.post("/api/v1/sessions", json={})
     session_id = create_resp.json()["result"]["session_id"]

@@ -163,6 +163,7 @@ class BatchAddMessageRequest(BaseModel):
     """Request model for adding multiple messages in a single request."""
 
     messages: List[AddMessageRequest] = Field(..., max_length=100)
+    idempotency_key: Optional[str] = Field(default=None, min_length=1, max_length=256)
     telemetry: TelemetryRequest = False
 
 
@@ -806,9 +807,21 @@ async def batch_add_messages(
             )
         add_many_async = getattr(session, "add_messages_async", None)
         if callable(add_many_async):
-            msgs = await add_many_async(specs)
+            if request.idempotency_key:
+                msgs = await add_many_async(
+                    specs,
+                    idempotency_key=request.idempotency_key,
+                )
+            else:
+                msgs = await add_many_async(specs)
         else:
-            msgs = session.add_messages(specs)
+            if request.idempotency_key:
+                msgs = session.add_messages(
+                    specs,
+                    idempotency_key=request.idempotency_key,
+                )
+            else:
+                msgs = session.add_messages(specs)
         await service.sessions.maybe_schedule_auto_commit(
             session_id,
             _ctx,
@@ -819,6 +832,7 @@ async def batch_add_messages(
             "session_id": session_id,
             "message_count": len(session.messages),
             "added": len(msgs),
+            "duplicate": bool(request.idempotency_key and not msgs),
             # Post-write value so a commit policy can decide without a
             # follow-up get_session round trip.
             "pending_tokens": _session_pending_tokens(session),
