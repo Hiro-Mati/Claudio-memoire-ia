@@ -1692,14 +1692,20 @@ async def repair_missing_case_comparisons(
 def _compact_case_proposal_context(proposal: MemoryMergeProposal) -> dict[str, Any]:
     if proposal.operation is not None:
         fields = dict(proposal.operation.memory_fields or {})
+        identity = (
+            parse_case_identity(fields.get(PROPOSED_CASE_IDENTITY_FIELD))
+            or parse_case_identity(fields.get(CASE_IDENTITY_FIELD))
+            or fallback_case_identity(fields)
+        )
     else:
         memory_file = proposal.patch.before_file or proposal.patch.after_file
         fields = dict(memory_file.extra_fields or {})
-    identity = (
-        parse_case_identity(fields.get(PROPOSED_CASE_IDENTITY_FIELD))
-        or parse_case_identity(fields.get(CASE_IDENTITY_FIELD))
-        or fallback_case_identity(fields)
-    )
+        # Stored candidates only have a canonical identity. Ignore legacy
+        # operation-scoped proposals that may have leaked into older files.
+        identity = (
+            parse_case_identity(fields.get(CASE_IDENTITY_FIELD))
+            or fallback_case_identity(fields)
+        )
     return {
         "case_name": str(fields.get("case_name") or ""),
         "case_identity": identity.model_dump(mode="json"),

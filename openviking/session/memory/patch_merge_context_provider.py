@@ -10,7 +10,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from openviking.server.identity import RequestContext
-from openviking.session.memory.case_aggregation import CASE_PENDING_SOURCES_FIELD
+from openviking.session.memory.case_aggregation import (
+    CASE_PENDING_SOURCES_FIELD,
+    PROPOSED_CASE_IDENTITY_FIELD,
+)
 from openviking.session.memory.dataclass import MemoryFile, MemoryTypeSchema
 from openviking.session.memory.session_extract_context_provider import (
     SessionExtractContextProvider,
@@ -24,6 +27,7 @@ _SYSTEM_HIDDEN_FIELDS = {
     "feedback_stats",
     "_case_source_ids",
     CASE_PENDING_SOURCES_FIELD,
+    PROPOSED_CASE_IDENTITY_FIELD,
 }
 _MAX_EXTRA_CANDIDATE_FILES = 10
 _MAX_CASE_EXTRA_CANDIDATE_FILES = 3

@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+from openviking.session.memory.case_aggregation import PROPOSED_CASE_IDENTITY_FIELD
 from openviking.session.memory.utils import add_line_numbers, line_count, slice_content_lines
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.telemetry import tracer
@@ -29,6 +30,7 @@ _LLM_HIDDEN_MEMORY_FIELDS = {
     "feedback_stats",
     "_case_source_ids",
     "_case_pending_sources",
+    PROPOSED_CASE_IDENTITY_FIELD,
 }
 
 

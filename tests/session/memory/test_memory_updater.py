@@ -1719,6 +1719,62 @@ class TestConsecutivePatchesSameURI:
         assert "user_ids" not in parsed
 
     @pytest.mark.asyncio
+    async def test_apply_upsert_cleans_legacy_case_proposed_identity(self):
+        memory_type = "cases"
+        uri = "viking://user/alice/memories/cases/demo.md"
+        schema = MemoryTypeSchema(
+            memory_type=memory_type,
+            description="case memory",
+            fields=[
+                MemoryField(
+                    name="case_identity",
+                    field_type=FieldType.STRING,
+                    merge_op=MergeOp.IMMUTABLE,
+                ),
+            ],
+        )
+        registry = MemoryTypeRegistry(load_schemas=False)
+        registry.register(schema)
+        store = {
+            uri: MemoryFileUtils.write(
+                MemoryFile(
+                    uri=uri,
+                    content="legacy case",
+                    memory_type=memory_type,
+                    extra_fields={
+                        "case_identity": '{"goal":"stored"}',
+                        "_proposed_case_identity": '{"goal":"stale"}',
+                    },
+                )
+            )
+        }
+        mock_viking_fs = MagicMock()
+
+        async def mock_read_file(uri, **kwargs):
+            return store.get(uri)
+
+        async def mock_write_file(uri, content, **kwargs):
+            store[uri] = content
+
+        mock_viking_fs.read_file = mock_read_file
+        mock_viking_fs.write_file = mock_write_file
+
+        updater = MemoryUpdater(registry=registry)
+        updater._get_viking_fs = MagicMock(return_value=mock_viking_fs)
+        op = ResolvedOperation(
+            old_memory_file_content=None,
+            memory_fields={"case_identity": '{"goal":"stored"}'},
+            memory_type=memory_type,
+            uris=[uri],
+        )
+
+        await updater._apply_upsert(op, MagicMock())
+
+        parsed = parse_memory_file_with_fields(store[uri])
+        assert parsed["case_identity"] == '{"goal":"stored"}'
+        assert "_proposed_case_identity" not in parsed
+
+    @pytest.mark.asyncio
     async def test_apply_upsert_skips_failed_field_and_keeps_other_fields(self, monkeypatch):
         memory_type = "notes"
         uri = "viking://user/test/memories/notes/demo.md"

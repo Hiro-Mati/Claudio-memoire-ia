@@ -24,6 +24,10 @@ from openviking.message import Message
 from openviking.message.part import TextPart
 from openviking.pyagfs.exceptions import AGFSNotFoundError
 from openviking.server.identity import RequestContext
+from openviking.session.memory.case_aggregation import (
+    CASE_MEMORY_TYPE,
+    PROPOSED_CASE_IDENTITY_FIELD,
+)
 from openviking.session.memory.dataclass import (
     MemoryFile,
     MemoryTypeSchema,
@@ -217,6 +221,16 @@ def _schema_should_persist_content(schema: Any) -> bool:
     )
 
 
+def _strip_transient_memory_fields(
+    metadata: Dict[str, Any],
+    *,
+    memory_type: str,
+) -> None:
+    """Remove operation-scoped fields before serializing persistent memory."""
+    if memory_type == CASE_MEMORY_TYPE:
+        metadata.pop(PROPOSED_CASE_IDENTITY_FIELD, None)
+
+
 async def resolve_memory_fields(
     fields: Dict[str, Any],
     *,
@@ -299,6 +313,7 @@ async def render_operation_after_file_content(
         schema=schema,
         old_file=old_file,
     )
+    _strip_transient_memory_fields(metadata, memory_type=schema.memory_type)
     source = getattr(op, "source", None)
     source_extraction_id = getattr(source, "extraction_id", None) if source else None
     if source_extraction_id:
@@ -1301,6 +1316,7 @@ class MemoryUpdater:
                 old_file=old_content,
                 uri=uri,
             )
+            _strip_transient_memory_fields(metadata, memory_type=schema.memory_type)
             if (
                 schema.memory_type == "experiences"
                 and "trigger_code" not in resolved_op.memory_fields

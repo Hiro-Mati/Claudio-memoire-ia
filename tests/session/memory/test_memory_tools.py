@@ -161,6 +161,43 @@ class TestMemoryTools:
         ].extra_fields["feedback_stats"] == {"injected_count": 3, "negative_count": 1}
 
     @pytest.mark.asyncio
+    async def test_read_tool_hides_legacy_proposed_case_identity_from_llm_output(self):
+        class MockPageIdMap:
+            def get_page_id(self, uri):
+                return None
+
+        class MockVikingFS:
+            async def read_file(self, uri, ctx=None, **kwargs):
+                return (
+                    "Case content.\n\n"
+                    "<!-- MEMORY_FIELDS\n"
+                    "{\n"
+                    '  "memory_type": "cases",\n'
+                    '  "case_name": "report",\n'
+                    '  "case_identity": "{\\"goal\\":\\"canonical\\"}",\n'
+                    '  "_proposed_case_identity": "{\\"goal\\":\\"stale\\"}"\n'
+                    "}\n"
+                    "-->"
+                )
+
+        uri = "viking://user/default/memories/cases/report.md"
+        tool_ctx = ToolContext(
+            viking_fs=MockVikingFS(),
+            request_ctx=RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER),
+            default_search_uris=[],
+            read_file_contents={},
+            page_id_map=MockPageIdMap(),
+        )
+
+        result = await MemoryReadTool().execute(tool_ctx, uri=uri)
+
+        assert result["case_identity"] == '{"goal":"canonical"}'
+        assert "_proposed_case_identity" not in result
+        assert tool_ctx.read_file_contents[uri].extra_fields[
+            "_proposed_case_identity"
+        ] == '{"goal":"stale"}'
+
+    @pytest.mark.asyncio
     async def test_read_tool_uses_offset_and_limit_for_visible_content(self):
         class MockPageIdMap:
             def get_page_id(self, uri):

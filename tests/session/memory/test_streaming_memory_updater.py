@@ -33,6 +33,7 @@ from openviking.session.memory.streaming_memory_updater import (
     StreamingMemoryUpdater,
     StreamingMemoryUpdaterConfig,
     StreamingMemoryUpdateResult,
+    _compact_case_proposal_context,
     build_candidate_merge_proposals,
     build_memory_merge_proposals,
     classify_memory_merge_mode,
@@ -1610,6 +1611,54 @@ async def test_render_operation_after_file_content_persists_source_trace_id():
 
 
 @pytest.mark.asyncio
+async def test_render_case_operation_strips_proposed_identity_from_new_file():
+    schema = _registry().get("cases")
+    op = _case_op("case_transient_identity")
+    op.memory_fields["case_identity"] = '{"goal":"stored"}'
+    op.memory_fields["_proposed_case_identity"] = '{"goal":"proposed"}'
+
+    rendered = await render_operation_after_file_content(
+        op,
+        schema=schema,
+        extract_context=ExtractContext([]),
+    )
+    parsed = MemoryFileUtils.read(rendered, uri=op.uris[0])
+
+    assert parsed.extra_fields["case_identity"] == '{"goal":"stored"}'
+    assert "_proposed_case_identity" not in parsed.extra_fields
+
+
+@pytest.mark.asyncio
+async def test_render_case_operation_cleans_legacy_proposed_identity():
+    schema = _registry().get("cases")
+    op = _case_op("case_legacy_transient_identity")
+    op.old_memory_file_content = MemoryFile(
+        uri=op.uris[0],
+        content="legacy case",
+        memory_type="cases",
+        extra_fields={
+            "case_name": "case_legacy_transient_identity",
+            "case_identity": '{"goal":"stored"}',
+            "_proposed_case_identity": '{"goal":"stale"}',
+        },
+    )
+    op.memory_fields = {
+        "case_name": "case_legacy_transient_identity",
+        "case_identity": '{"goal":"stored"}',
+    }
+
+    rendered = await render_operation_after_file_content(
+        op,
+        schema=schema,
+        extract_context=ExtractContext([]),
+    )
+    parsed = MemoryFileUtils.read(rendered, uri=op.uris[0])
+
+    assert parsed.extra_fields["case_identity"] == '{"goal":"stored"}'
+    assert "_proposed_case_identity" not in parsed.extra_fields
+
+
+@pytest.mark.asyncio
 async def test_cross_extraction_merge_deletes_existing_loser_from_validated_group(monkeypatch):
     existing_uri = "viking://user/u/memories/notes/existing.md"
     winner_uri = "viking://user/u/memories/notes/winner.md"
@@ -1889,6 +1938,39 @@ async def test_merge_plan_can_select_existing_candidate_as_canonical():
     assert merged.upsert_operations[0].old_memory_file_content == candidate_file
     assert merged.upsert_operations[0].memory_fields["content"] == "merged content"
     assert merged.upsert_operations[0].memory_fields["source_extraction_id"] == "extract_1"
+
+
+def test_stored_case_candidate_ignores_legacy_proposed_identity():
+    canonical_identity = {
+        "goal": "prepare a reusable report",
+        "subject": "report document",
+        "action_pattern": "analyze source data and write report",
+        "success_boundary": "report is complete and usable",
+        "context_constraints": ["source data is available"],
+    }
+    stale_identity = {
+        "goal": "prepare a one-off spreadsheet",
+        "subject": "spreadsheet",
+        "action_pattern": "filter exact rows",
+        "success_boundary": "specific workbook is saved",
+        "context_constraints": ["use a fixed date"],
+    }
+    candidate_file = MemoryFile(
+        uri="viking://user/u/memories/cases/report.md",
+        content="Reusable report task.",
+        memory_type="cases",
+        extra_fields={
+            "case_name": "report",
+            "case_identity": json.dumps(canonical_identity),
+            "_proposed_case_identity": json.dumps(stale_identity),
+        },
+    )
+    proposal = build_candidate_merge_proposals({"candidate:existing": candidate_file})[0]
+
+    context = _compact_case_proposal_context(proposal)
+
+    assert context["case_identity"]["goal"] == canonical_identity["goal"]
+    assert context["case_identity"]["subject"] == canonical_identity["subject"]
 
 
 @pytest.mark.asyncio

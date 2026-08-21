@@ -394,6 +394,38 @@ async def test_patch_merge_context_provider_hides_feedback_stats_from_patch_diff
 
 
 @pytest.mark.asyncio
+async def test_patch_merge_context_provider_hides_proposed_case_identity():
+    uri = "viking://user/u/memories/cases/report.md"
+    before = MemoryFile(
+        uri=uri,
+        content="same content",
+        memory_type="cases",
+        extra_fields={
+            "memory_type": "cases",
+            "case_name": "report",
+            "case_identity": '{"goal":"canonical"}',
+            "_proposed_case_identity": '{"goal":"stale"}',
+        },
+    )
+    after = before.model_copy(deep=True)
+    after.extra_fields["_proposed_case_identity"] = '{"goal":"new proposal"}'
+    provider = PatchMergeContextProvider(
+        memory_type="cases",
+        required_file_uris=[],
+        patches=[PatchMergePatch(before_file=before, after_file=after)],
+    )
+    provider.search_files = AsyncMock(return_value=[])
+
+    messages = await provider.prefetch()
+    content = messages[0]["content"]
+
+    assert "_proposed_case_identity" not in content
+    assert "stale" not in content
+    assert "new proposal" not in content
+    assert "(no changes)" in content
+
+
+@pytest.mark.asyncio
 async def test_patch_merge_context_provider_renders_case_pending_sources_once():
     pending_source = {
         "source_id": "session:new-3",
