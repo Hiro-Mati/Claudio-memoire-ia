@@ -10,7 +10,7 @@ definitions, with discriminator support for polymorphic fields.
 import re
 from typing import Annotated, Any, Dict, List, Optional, Tuple, Type, Union
 
-from pydantic import BaseModel, Field, WithJsonSchema, create_model
+from pydantic import BaseModel, Field, WithJsonSchema, create_model, model_validator
 from pydantic.config import ConfigDict
 
 from openviking.session.memory.dataclass import (
@@ -37,6 +37,33 @@ def to_pascal_case(s: str) -> str:
     return "".join(word.title() for word in words)
 
 
+# from typing import Literal
+#
+# class PageDecision(BaseModel):
+#     """Temporary page-level reasoning for memory bad-case analysis."""
+#
+#     page_id: int = Field(..., description="The related page_id from read results.")
+#     remove: List[str] = Field(
+#         ...,
+#         description=(
+#             "For UPDATE, list exact affected `- ...` bullets or standalone summary sentences. "
+#             "Use [] for KEEP or DELETE."
+#         ),
+#     )
+#     has_unaffected_facts: bool = Field(
+#         ...,
+#         description="Whether the page contains any fact outside remove that must be preserved.",
+#     )
+#     action: Literal["KEEP", "UPDATE", "DELETE"] = Field(
+#         ...,
+#         description=(
+#             "KEEP when no fact is affected; UPDATE when remove is non-empty and "
+#             "has_unaffected_facts is true; DELETE when the whole page is affected and "
+#             "has_unaffected_facts is false. For DELETE, leave remove empty."
+#         ),
+#     )
+
+
 class SchemaModelGenerator:
     """
     Dynamic Pydantic model generator from memory type schemas.
@@ -49,14 +76,18 @@ class SchemaModelGenerator:
         self,
         schemas: List[MemoryTypeSchema],
         template_context: Optional[Dict[str, Any]] = None,
+        # include_decision_reasoning: bool = True,
     ):
         if hasattr(schemas, "list_all"):
-            schemas = schemas.list_all()
-        self.schemas = schemas
+            self._all_schemas = schemas.list_all(include_disabled=True)
+            schemas = schemas.list_all(include_disabled=False)
+        else:
+            self._all_schemas = list(schemas)
+        self.schemas = list(schemas)
         self._template_context = dict(template_context or {})
+        # self._include_decision_reasoning = include_decision_reasoning
         self._model_cache: Dict[str, Type[BaseModel]] = {}
         self._flat_data_models: Dict[str, Type[BaseModel]] = {}
-        self._union_model: Optional[Type[BaseModel]] = None
         self._operations_model: Optional[Type[BaseModel]] = None
 
     def _render_description(self, description: str) -> str:
@@ -130,16 +161,27 @@ class SchemaModelGenerator:
             ),
         )
 
+        immutable_field_names = []
+
         # Add business fields from schema
         for field in memory_type.fields:
             if field.system_managed:
                 continue
             base_type = self._map_field_type(field.field_type)
             if field.merge_op == MergeOp.IMMUTABLE:
-                # Immutable fields: only base type, required
+                if memory_type.memory_type == "cases":
+                    field_definitions[field.name] = (
+                        base_type,
+                        Field(..., description=self._render_description(field.description)),
+                    )
+                    continue
+                # Existing items are located by page_id and their immutable fields
+                # are restored from the read file in ExtractLoop.resolve_operations().
+                # New items still require these fields via the conditional validator below.
+                immutable_field_names.append(field.name)
                 field_definitions[field.name] = (
                     base_type,
-                    Field(..., description=self._render_description(field.description)),
+                    Field(None, description=self._render_description(field.description)),
                 )
             else:
                 # Mutable fields: Union[base_type, patch_type], optional
@@ -153,10 +195,45 @@ class SchemaModelGenerator:
                     Optional[union_type],
                     Field(None, description=desc),
                 )
+        validators = {}
+        model_config = ConfigDict(extra="ignore")
+        if immutable_field_names:
+            required_for_new = tuple(immutable_field_names)
+
+            def require_immutable_fields_for_new(item):
+                if item.page_id >= 100:
+                    missing = [
+                        name for name in required_for_new if getattr(item, name, None) is None
+                    ]
+                    if missing:
+                        raise ValueError(
+                            "New memory items require immutable fields: " + ", ".join(missing)
+                        )
+                return item
+
+            validators["require_immutable_fields_for_new"] = model_validator(mode="after")(
+                require_immutable_fields_for_new
+            )
+            model_config = ConfigDict(
+                extra="ignore",
+                json_schema_extra={
+                    "allOf": [
+                        {
+                            "if": {
+                                "properties": {"page_id": {"minimum": 100}},
+                                "required": ["page_id"],
+                            },
+                            "then": {"required": list(required_for_new)},
+                        }
+                    ]
+                },
+            )
+
         # Create the model
         model = create_model(
             model_name,
-            __config__=ConfigDict(extra="ignore"),
+            __config__=model_config,
+            __validators__=validators,
             **field_definitions,
         )
 
@@ -175,57 +252,10 @@ class SchemaModelGenerator:
             Dictionary mapping memory_type to generated model class
         """
         models: Dict[str, Type[BaseModel]] = {}
-        for memory_type in self.schemas:
+        schemas = self._all_schemas if include_disabled else self.schemas
+        for memory_type in schemas:
             models[memory_type.memory_type] = self.create_flat_data_model(memory_type)
         return models
-
-    def create_discriminated_union_model(self) -> Type[BaseModel]:
-        """
-        Create a unified MemoryData model with discriminator support.
-
-        The model uses 'memory_type' as the discriminator field to
-        determine which fields model to use.
-
-        Returns:
-            Unified Pydantic model with discriminator (a wrapper model containing the union)
-        """
-        if self._union_model is not None:
-            return self._union_model
-
-        # Generate all flat data models first (including disabled for completeness)
-        self.generate_all_models(include_disabled=True)
-
-        # Build the annotated union with discriminator - only use enabled types
-        if not self.schemas:
-            raise ValueError("No memory types in schemas")
-
-        # Create union of flat data models
-        enabled_memory_types = self.schemas
-        flat_model_union_types = tuple(
-            self._flat_data_models[mt.memory_type] for mt in enabled_memory_types
-        )
-
-        if flat_model_union_types:
-            FlatDataUnion = Union[tuple(flat_model_union_types)]  # type: ignore
-        else:
-            # Fallback if no types are enabled
-            class GenericMemoryData(BaseModel):
-                """Generic memory data (fallback)."""
-
-                memory_type: str = Field(..., description="Memory type identifier")
-
-            FlatDataUnion = GenericMemoryData  # type: ignore
-
-        # Wrap the union in a BaseModel for JSON schema generation
-        class MemoryDataWrapper(BaseModel):
-            """Wrapper model for memory data union."""
-
-            data: FlatDataUnion = Field(..., description="Memory data")  # type: ignore
-
-            model_config = ConfigDict(extra="forbid")
-
-        self._union_model = MemoryDataWrapper
-        return self._union_model
 
     def create_structured_operations_model(self, role_scope: Optional[RoleScope] = None) -> Type[BaseModel]:
         """
@@ -251,10 +281,17 @@ class SchemaModelGenerator:
         # Build field definitions for each memory_type
         field_definitions: Dict[str, Tuple[Type[Any], Any]] = {}
 
-        # field_definitions["reasoning"] = (
-        #     str,
-        #     Field("", description="reasoning"),
-        # )
+        # if self._include_decision_reasoning:
+        #     field_definitions["decision_reasoning"] = (
+        #         List[PageDecision],
+        #         Field(
+        #             default_factory=list,
+        #             description=(
+        #                 "Before choosing operations, return one decision for every related "
+        #                 "read page."
+        #             ),
+        #         ),
+        #     )
 
         for mt in enabled_memory_types:
             flat_model = self.create_flat_data_model(mt, role_scope)
@@ -357,27 +394,11 @@ class SchemaModelGenerator:
         StructuredMemoryOperations.is_empty = is_empty
         StructuredMemoryOperations.to_legacy_operations = to_legacy_operations
         StructuredMemoryOperations._memory_type_fields = memory_type_fields  # type: ignore
-        # Opt this model into treating a bare `[]` LLM response as an empty-ops result
-        # (every field is default_factory=list); see parse_json_with_stability Layer 3.
+        # Every top-level field defaults to a list, so [] is a valid no-operations result.
         StructuredMemoryOperations._allow_empty_list_response = True  # type: ignore
 
         self._operations_model = StructuredMemoryOperations
         return self._operations_model
-
-    def get_llm_json_schema(self, role_scope: Optional[RoleScope] = None) -> Dict[str, Any]:
-        """Get the JSON schema for the structured LLM operations model."""
-        return self.create_structured_operations_model(role_scope).model_json_schema()
-
-    def get_memory_data_json_schema(self) -> Dict[str, Any]:
-        """
-        Get the JSON schema just for the flat memory data union.
-
-        Returns:
-            JSON schema for MemoryData
-        """
-        memory_model = self.create_discriminated_union_model()
-        return memory_model.model_json_schema()
-
 
 class SchemaPromptGenerator:
     """

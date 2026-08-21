@@ -256,7 +256,7 @@ class ExperienceGradientEstimator:
             operations = await self._run_extract_loop(request.trajectory, context)
             if operations is None:
                 return []
-            gradients = _operations_to_gradients(
+            gradients = await _operations_to_gradients(
                 operations=operations,
                 trajectory=request.trajectory,
                 analysis=analysis,
@@ -336,7 +336,7 @@ class ExperienceGradientEstimator:
             _sync_prefetched_comparison_trajectories(provider, trajectory)
             analysis_obj = _analysis_from_context_metadata(context)
             experience_set = _experience_set_from_context_metadata(context)
-            gradients = _operations_to_gradients(
+            gradients = await _operations_to_gradients(
                 operations=operations,
                 trajectory=trajectory,
                 analysis=analysis_obj,
@@ -789,7 +789,7 @@ def _context_with_analysis_messages(
     )
 
 
-def _operations_to_gradients(
+async def _operations_to_gradients(
     *,
     operations: Any,
     trajectory: Trajectory,
@@ -803,7 +803,7 @@ def _operations_to_gradients(
         if getattr(op, "memory_type", None) != "experiences":
             continue
         fields = dict(getattr(op, "memory_fields", {}) or {})
-        after_file = render_operation_after_file(op, schema=schema)
+        after_file = await render_operation_after_file(op, schema=schema)
         if not any(
             str(
                 after_file.content if name == "content" else after_file.extra_fields.get(name) or ""

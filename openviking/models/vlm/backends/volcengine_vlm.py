@@ -2,18 +2,19 @@
 # SPDX-License-Identifier: AGPL-3.0
 """VolcEngine VLM backend implementation."""
 
+import asyncio
 import base64
 import json
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from openviking.telemetry import tracer
-from openviking.utils.model_retry import retry_model_call_async, retry_model_call_sync
+from openviking.utils.multimodal import redact_image_data_urls
 from openviking_cli.utils import get_logger
 
 from ..base import ToolCall, VLMResponse
-from ..message_format import format_messages
 from .openai_vlm import OpenAIVLM
 
 logger = get_logger(__name__)
@@ -22,29 +23,28 @@ VOLCENGINE_CLIENT_REQUEST_ID_HEADER = "X-Client-Request-Id"
 VOLCENGINE_CLIENT_REQUEST_ID = "ToB-direct,OpenViking_Service,openviking-service_cn-beijing"
 
 
-class VolcEngineTextResponse(str):
-    """String-compatible text response that retains provider termination metadata."""
-
-    finish_reason: str
-    usage: Dict[str, Any]
-
-    def __new__(
-        cls,
-        content: str,
-        *,
-        finish_reason: str = "stop",
-        usage: Optional[Dict[str, Any]] = None,
-    ):
-        instance = super().__new__(cls, content)
-        instance.finish_reason = finish_reason
-        instance.usage = dict(usage or {})
-        return instance
-
-
 def _build_volcengine_headers(extra_headers: Optional[Dict[str, str]]) -> Dict[str, str]:
     headers = dict(extra_headers or {})
     if not any(k.lower() == VOLCENGINE_CLIENT_REQUEST_ID_HEADER.lower() for k in headers):
         headers[VOLCENGINE_CLIENT_REQUEST_ID_HEADER] = VOLCENGINE_CLIENT_REQUEST_ID
+    return headers
+
+
+def build_volcengine_request_headers(
+    extra_headers: Optional[Dict[str, str]],
+) -> Dict[str, str]:
+    """Return per-request headers with a unique default client request ID.
+
+    The existing prefix identifies OpenViking service traffic. A UUID suffix
+    makes an individual Ark request searchable while custom client request ID
+    values remain unchanged.
+    """
+    headers = _build_volcengine_headers(extra_headers)
+    header_key = next(
+        key for key in headers if key.lower() == VOLCENGINE_CLIENT_REQUEST_ID_HEADER.lower()
+    )
+    if headers[header_key] == VOLCENGINE_CLIENT_REQUEST_ID:
+        headers[header_key] = f"{VOLCENGINE_CLIENT_REQUEST_ID},{uuid.uuid4().hex}"
     return headers
 
 
@@ -60,7 +60,7 @@ class VolcEngineVLM(OpenAIVLM):
         if not self.api_base:
             self.api_base = "https://ark.cn-beijing.volces.com/api/v3"
         if not self.model:
-            self.model = "doubao-seed-2-0-pro-260215"
+            self.model = "doubao-seed-2-0-lite-260428"
 
     def _parse_tool_calls(self, message) -> List[ToolCall]:
         """Parse tool calls from VolcEngine response message."""
@@ -77,40 +77,31 @@ class VolcEngineVLM(OpenAIVLM):
         return tool_calls
 
     def _build_vlm_response(self, response, has_tools: bool) -> Union[str, VLMResponse]:
-        """Build a response while retaining finish_reason for text-only calls."""
+        """Build response from Chat Completions response. Returns str or VLMResponse based on has_tools."""
+        if isinstance(response, str):
+            return VLMResponse(content=response) if has_tools else response
+
         choice = response.choices[0]
         message = choice.message
-        if message.content:
-            tracer.info(f"message.content={message.content}")
         if hasattr(message, "tool_calls") and message.tool_calls:
             tracer.info(f"message.tool_calls={message.tool_calls}")
-        usage = {}
-        if hasattr(response, "usage") and response.usage:
-            usage = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
-                "prompt_tokens_details": getattr(response.usage, "prompt_tokens_details", None),
-            }
         if has_tools:
+            usage = {}
+            if hasattr(response, "usage") and response.usage:
+                usage = {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens,
+                    "prompt_tokens_details": getattr(response.usage, "prompt_tokens_details", None),
+                }
+
             return VLMResponse(
                 content=message.content,
                 tool_calls=self._parse_tool_calls(message),
                 finish_reason=choice.finish_reason or "stop",
                 usage=usage,
             )
-        return VolcEngineTextResponse(
-            message.content or "",
-            finish_reason=choice.finish_reason or "stop",
-            usage=usage,
-        )
-
-    def _clean_text_response(self, response: str) -> VolcEngineTextResponse:
-        return VolcEngineTextResponse(
-            self._clean_response(str(response)),
-            finish_reason=getattr(response, "finish_reason", "stop") or "stop",
-            usage=getattr(response, "usage", None),
-        )
+        return message.content or ""
 
     def get_client(self):
         """Get sync client"""
@@ -144,6 +135,39 @@ class VolcEngineVLM(OpenAIVLM):
             max_retries=0,
         )
 
+    def supports_media(
+        self,
+        *,
+        media_type: str,
+        filename: str,
+        size_bytes: int,
+    ) -> bool:
+        from .volcengine_media import supports_media
+
+        return supports_media(
+            media_type=media_type,
+            filename=filename,
+            size_bytes=size_bytes,
+        )
+
+    async def get_media_completion_async(
+        self,
+        *,
+        prompt: str,
+        media_path: Path,
+        filename: str,
+        media_type: str,
+    ) -> str:
+        from .volcengine_media import understand_media
+
+        return await understand_media(
+            self,
+            prompt=prompt,
+            media_path=media_path,
+            filename=filename,
+            media_type=media_type,
+        )
+
     def get_completion(
         self,
         prompt: str = "",
@@ -156,11 +180,11 @@ class VolcEngineVLM(OpenAIVLM):
         effective_thinking = self.thinking if thinking is None else thinking
         kwargs_messages = messages or [{"role": "user", "content": prompt}]
         kwargs = {
-            "model": self.model or "doubao-seed-2-0-pro-260215",
+            "model": self.model or "doubao-seed-2-0-lite-260428",
             "messages": kwargs_messages,
             "temperature": self.temperature,
             "thinking": {"type": "disabled" if not effective_thinking else "enabled"},
-            "extra_headers": self.extra_headers,
+            "extra_headers": build_volcengine_request_headers(self.extra_headers),
         }
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
@@ -169,25 +193,16 @@ class VolcEngineVLM(OpenAIVLM):
             kwargs["tool_choice"] = tool_choice or "auto"
 
         client = self.get_client()
+        t0 = time.perf_counter()
+        response = client.chat.completions.create(**kwargs)
+        elapsed = time.perf_counter() - t0
+        self._update_token_usage_from_response(response, duration_seconds=elapsed)
+        result = self._build_vlm_response(response, has_tools=bool(tools))
+        if tools:
+            return result
+        return self._clean_response(str(result))
 
-        def _call() -> Union[str, VLMResponse]:
-            t0 = time.perf_counter()
-            response = client.chat.completions.create(**kwargs)
-            elapsed = time.perf_counter() - t0
-            self._update_token_usage_from_response(response, duration_seconds=elapsed)
-            result = self._build_vlm_response(response, has_tools=bool(tools))
-            if tools:
-                return result
-            return self._clean_text_response(result)
-
-        return retry_model_call_sync(
-            _call,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name="VolcEngine VLM completion",
-        )
-
-    @tracer("volcengine.vlm.call", ignore_result=True, ignore_args=True)
+    @tracer("volcengine.vlm.call", ignore_result=True, ignore_args=["messages"])
     async def get_completion_async(
         self,
         prompt: str = "",
@@ -200,11 +215,11 @@ class VolcEngineVLM(OpenAIVLM):
         effective_thinking = self.thinking if thinking is None else thinking
         kwargs_messages = messages or [{"role": "user", "content": prompt}]
         kwargs = {
-            "model": self.model or "doubao-seed-2-0-pro-260215",
+            "model": self.model or "doubao-seed-2-0-lite-260428",
             "messages": kwargs_messages,
             "temperature": self.temperature,
             "thinking": {"type": "disabled" if not effective_thinking else "enabled"},
-            "extra_headers": self.extra_headers,
+            "extra_headers": build_volcengine_request_headers(self.extra_headers),
         }
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
@@ -212,7 +227,11 @@ class VolcEngineVLM(OpenAIVLM):
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
 
-        tracer.info(f"request: {format_messages(kwargs_messages)}")
+        # 用 tracer.info 打印请求
+        tracer.info(
+            "request: "
+            f"{json.dumps(redact_image_data_urls(kwargs_messages), ensure_ascii=False, indent=2)}"
+        )
         if tools:
             tracer.info(
                 f"tools: {json.dumps([t['function']['name'] for t in tools], ensure_ascii=False)}"
@@ -220,22 +239,29 @@ class VolcEngineVLM(OpenAIVLM):
 
         client = self.get_async_client()
 
-        async def _call() -> Union[str, VLMResponse]:
-            t0 = time.perf_counter()
-            response = await client.chat.completions.create(**kwargs)
-            elapsed = time.perf_counter() - t0
-            self._update_token_usage_from_response(response, duration_seconds=elapsed)
-            result = self._build_vlm_response(response, has_tools=bool(tools))
-            if tools:
-                return result
-            return self._clean_text_response(result)
+        last_error = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                t0 = time.perf_counter()
+                response = await client.chat.completions.create(**kwargs)
+                elapsed = time.perf_counter() - t0
+                self._update_token_usage_from_response(response, duration_seconds=elapsed)
+                result = self._build_vlm_response(response, has_tools=bool(tools))
+                if tools:
+                    return result
+                content = self._clean_response(str(result))
+                if content:
+                    tracer.info(f"message.content={content}")
+                return content
+            except Exception as e:
+                last_error = e
+                if attempt < self.max_retries:
+                    await asyncio.sleep(2**attempt)
 
-        return await retry_model_call_async(
-            _call,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name="VolcEngine VLM async completion",
-        )
+        if last_error:
+            raise last_error
+        else:
+            raise RuntimeError("Unknown error in async completion")
 
     def _detect_image_format(self, data: bytes) -> str:
         """Detect image format from magic bytes.
@@ -373,11 +399,11 @@ class VolcEngineVLM(OpenAIVLM):
             kwargs_messages = [{"role": "user", "content": content}]
 
         kwargs = {
-            "model": self.model or "doubao-seed-2-0-pro-260215",
+            "model": self.model or "doubao-seed-2-0-lite-260428",
             "messages": kwargs_messages,
             "temperature": self.temperature,
             "thinking": {"type": "disabled" if not effective_thinking else "enabled"},
-            "extra_headers": self.extra_headers,
+            "extra_headers": build_volcengine_request_headers(self.extra_headers),
         }
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
@@ -393,7 +419,7 @@ class VolcEngineVLM(OpenAIVLM):
         result = self._build_vlm_response(response, has_tools=bool(tools))
         if tools:
             return result
-        return self._clean_text_response(result)
+        return self._clean_response(str(result))
 
     async def get_vision_completion_async(
         self,
@@ -417,11 +443,11 @@ class VolcEngineVLM(OpenAIVLM):
             kwargs_messages = [{"role": "user", "content": content}]
 
         kwargs = {
-            "model": self.model or "doubao-seed-2-0-pro-260215",
+            "model": self.model or "doubao-seed-2-0-lite-260428",
             "messages": kwargs_messages,
             "temperature": self.temperature,
             "thinking": {"type": "disabled" if not effective_thinking else "enabled"},
-            "extra_headers": self.extra_headers,
+            "extra_headers": build_volcengine_request_headers(self.extra_headers),
         }
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
@@ -437,4 +463,4 @@ class VolcEngineVLM(OpenAIVLM):
         result = self._build_vlm_response(response, has_tools=bool(tools))
         if tools:
             return result
-        return self._clean_text_response(result)
+        return self._clean_response(str(result))

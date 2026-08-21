@@ -15,16 +15,23 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from openviking.core.context import ContextLevel
 from openviking.core.retrieval_targets import default_target_directories
 from openviking.models.embedder.base import EmbedResult, embed_compat
 from openviking.models.rerank import RerankClient
 from openviking.retrieve.memory_lifecycle import hotness_score
 from openviking.retrieve.retrieval_stats import get_stats_collector
 from openviking.server.identity import RequestContext
-from openviking.storage import VikingDBManager, VikingDBManagerProxy
 from openviking.storage.expr import FilterExpr
+from openviking.storage.semantic_sidecar import body_for_preview
+from openviking.storage.vikingdb_manager import VikingDBManager, VikingDBManagerProxy
 from openviking.telemetry import get_current_telemetry
 from openviking.utils.time_utils import parse_iso_datetime
+from openviking.utils.token_estimation import (
+    estimate_text_tokens,
+    truncate_text_to_token_budget,
+)
+from openviking_cli.exceptions import InvalidArgumentError
 from openviking_cli.retrieve.types import (
     ContextType,
     MatchedContext,
@@ -46,7 +53,6 @@ class HierarchicalRetriever:
     """Hierarchical retriever with dense and sparse vector support."""
 
     MAX_CONVERGENCE_ROUNDS = 3  # Stop after multiple rounds with unchanged topk
-    MAX_RELATIONS = 5  # Maximum relations per resource
     DIRECTORY_DOMINANCE_RATIO = 1.2  # Directory score must exceed max child score
     GLOBAL_SEARCH_TOPK = 10  # Global retrieval count (more candidates = better rerank precision)
     MAX_PARALLEL_CHILD_SEARCHES = 4  # Limit per-request fan-out against remote vector stores
@@ -70,6 +76,7 @@ class HierarchicalRetriever:
         self.vector_store = storage
         self.embedder = embedder
         self.rerank_config = rerank_config
+        self.rerank_max_input_tokens = rerank_config.max_input_tokens if rerank_config else 0
         self.retrieval_config = retrieval_config or RetrievalConfig()
         self.hotness_alpha = self.retrieval_config.hotness_alpha
         self.score_propagation_alpha = self.retrieval_config.score_propagation_alpha
@@ -114,8 +121,13 @@ class HierarchicalRetriever:
         t0 = time.monotonic()
         telemetry = get_current_telemetry()
         effective_threshold = self._resolve_threshold(score_threshold)
+        image_query = bool(getattr(query, "image_query", False))
         if mode is None:
             mode = RetrieverMode.QUICK if not self._rerank_client else RetrieverMode.THINKING
+        if image_query:
+            mode = RetrieverMode.QUICK
+            if level is None:
+                level = [2]
 
         # 创建 proxy 包装器，绑定当前 ctx
         vector_proxy = VikingDBManagerProxy(self.vector_store, ctx)
@@ -137,8 +149,15 @@ class HierarchicalRetriever:
         query_vector = None
         sparse_query_vector = None
         if self.embedder:
+            if image_query and not getattr(self.embedder, "supports_multimodal", False):
+                raise InvalidArgumentError("Image search requires a multimodal embedding model.")
             with telemetry.measure("search.embed_query"):
-                result: EmbedResult = await embed_compat(self.embedder, query.query, is_query=True)
+                embedding_input = getattr(query, "embedding_input", None) or query.query
+                result: EmbedResult = await embed_compat(
+                    self.embedder,
+                    embedding_input,
+                    is_query=True,
+                )
                 query_vector = result.dense_vector
                 sparse_query_vector = result.sparse_vector
 
@@ -149,8 +168,13 @@ class HierarchicalRetriever:
             root_uris = default_target_directories(ctx, context_type=query.context_type)
 
         context_type = query.context_type.value if query.context_type else None
+        if image_query and context_type is None:
+            context_type = ContextType.RESOURCE.value
 
         if mode == RetrieverMode.QUICK:
+            search_limit = (
+                max(limit * 5, 50) if image_query else max(limit, self.GLOBAL_SEARCH_TOPK)
+            )
             with telemetry.measure("search.vector_retrieval"):
                 quick_results = await vector_proxy.search_in_tenant(
                     query_vector=query_vector,
@@ -159,7 +183,7 @@ class HierarchicalRetriever:
                     target_directories=target_dirs,
                     extra_filter=scope_dsl,
                     level=level,
-                    limit=max(limit, self.GLOBAL_SEARCH_TOPK),
+                    limit=search_limit,
                 )
             telemetry.count("vector.searches", 1)
             telemetry.count("vector.scored", len(quick_results))
@@ -226,7 +250,7 @@ class HierarchicalRetriever:
             # Step 3: Pick recursive entry points from directory hits and explicit roots.
             directory_scores = [self._finite_score(r.get("_score", 0.0)) for r in global_results]
             if self._rerank_client and mode == RetrieverMode.THINKING:
-                directory_scores = self._rerank_scores(
+                directory_scores = await self._rerank_scores(
                     query.query,
                     [str(r.get("abstract", "")) for r in global_results],
                     directory_scores,
@@ -318,7 +342,7 @@ class HierarchicalRetriever:
             return score >= threshold
         return score > threshold
 
-    def _rerank_scores(
+    async def _rerank_scores(
         self,
         query: str,
         documents: List[str],
@@ -328,23 +352,44 @@ class HierarchicalRetriever:
         if not self._rerank_client or not documents:
             return fallback_scores
 
+        rerank_query = query
+        rerank_documents = [
+            (index, document) for index, document in enumerate(documents) if document.strip()
+        ]
+        if not rerank_documents:
+            return fallback_scores
+
+        if self.rerank_max_input_tokens > 0:
+            max_query_tokens = self.rerank_max_input_tokens * 3 // 4
+            if estimate_text_tokens(query) > max_query_tokens:
+                rerank_query = truncate_text_to_token_budget(query, max_query_tokens)
+            document_tokens = self.rerank_max_input_tokens - estimate_text_tokens(rerank_query)
+            rerank_documents = [
+                (index, truncate_text_to_token_budget(document, document_tokens))
+                for index, document in rerank_documents
+            ]
+
         try:
-            scores = self._rerank_client.rerank_batch(query, documents)
+            scores = await asyncio.to_thread(
+                self._rerank_client.rerank_batch,
+                rerank_query,
+                [document for _, document in rerank_documents],
+            )
         except Exception as e:
             logger.warning(
                 "[HierarchicalRetriever] Rerank failed, fallback to vector scores: %s", e
             )
             return fallback_scores
 
-        if not scores or len(scores) != len(documents):
+        if not scores or len(scores) != len(rerank_documents):
             logger.warning(
                 "[HierarchicalRetriever] Invalid rerank result, fallback to vector scores"
             )
             return fallback_scores
 
-        normalized_scores: List[float] = []
-        for score, fallback in zip(scores, fallback_scores, strict=True):
-            normalized_scores.append(self._finite_score(score, fallback))
+        normalized_scores = list(fallback_scores)
+        for score, (index, _) in zip(scores, rerank_documents, strict=True):
+            normalized_scores[index] = self._finite_score(score, fallback_scores[index])
         return normalized_scores
 
     async def _recursive_search(
@@ -453,7 +498,7 @@ class HierarchicalRetriever:
                 query_scores = [self._finite_score(r.get("_score", 0.0)) for r in results]
                 if self._rerank_client and mode == RetrieverMode.THINKING:
                     documents = [str(r.get("abstract", "")) for r in results]
-                    query_scores = self._rerank_scores(query, documents, query_scores)
+                    query_scores = await self._rerank_scores(query, documents, query_scores)
 
                 for r, score in zip(results, query_scores, strict=True):
                     uri = r.get("uri", "")
@@ -530,8 +575,6 @@ class HierarchicalRetriever:
         """
         results = []
         for c in candidates:
-            relations = []
-
             # Fix: clamp inf/nan scores from vector search (#inf-score)
             semantic_score = self._finite_score(c.get("_final_score", c.get("_score", 0.0)))
 
@@ -559,6 +602,14 @@ class HierarchicalRetriever:
                 final_score = 0.0
             level = c.get("level", 2)
             display_uri = self._append_level_suffix(c.get("uri", ""), level)
+            abstract = c.get("abstract", "")
+            if level in {ContextLevel.ABSTRACT, ContextLevel.OVERVIEW}:
+                # New records persist body-only rerank scalars, but imported or
+                # legacy indexes may still contain the full OKF document. Keep
+                # the public find/search preview contract body-only at its final
+                # conversion boundary. L2 user Markdown is intentionally left
+                # untouched, including ordinary YAML frontmatter.
+                abstract = body_for_preview(abstract)
 
             results.append(
                 MatchedContext(
@@ -567,10 +618,10 @@ class HierarchicalRetriever:
                     if c.get("context_type")
                     else ContextType.RESOURCE,
                     level=level,
-                    abstract=c.get("abstract", ""),
+                    abstract=abstract,
                     category=c.get("category", ""),
                     score=final_score,
-                    relations=relations,
+                    search_tags=list(c.get("search_tags") or []),
                 )
             )
 

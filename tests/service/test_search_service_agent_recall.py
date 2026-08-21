@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,7 +13,6 @@ from openviking_cli.retrieve import (
     FindResult,
     MatchedContext,
     QueryResult,
-    RelatedContext,
     TypedQuery,
 )
 from openviking_cli.session.user_id import UserIdentifier
@@ -24,12 +24,16 @@ def _memory_file(status: str | None) -> str:
 
 
 def _context(uri: str, *, relations=None) -> MatchedContext:
-    return MatchedContext(
+    context = MatchedContext(
         uri=uri,
         context_type=ContextType.MEMORY,
         score=0.9,
-        relations=list(relations or []),
     )
+    if relations is not None:
+        # Current retrieval results no longer expose relations. Keep a dynamic
+        # attribute here to cover compatibility with older result objects.
+        context.relations = list(relations)
+    return context
 
 
 class _FakeVikingFS:
@@ -71,8 +75,8 @@ async def test_agent_recall_only_returns_promoted_cases_and_filters_provenance(r
     experience = _context(
         experience_uri,
         relations=[
-            RelatedContext(uri=promoted_uri, abstract="promoted"),
-            RelatedContext(uri=draft_uri, abstract="draft"),
+            SimpleNamespace(uri=promoted_uri, abstract="promoted"),
+            SimpleNamespace(uri=draft_uri, abstract="draft"),
         ],
     )
     query_result = QueryResult(

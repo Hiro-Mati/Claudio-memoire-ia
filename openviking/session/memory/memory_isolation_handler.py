@@ -74,6 +74,8 @@ class MemoryIsolationHandler:
         return messages if isinstance(messages, list) else []
 
     def _message_target_id(self, msg: Any) -> Optional[str]:
+        if not self._is_peer_owner_message(msg):
+            return None
         raw_peer_id = getattr(msg, "peer_id", None)
         peer_id = safe_peer_id(raw_peer_id)
         if peer_id and self._can_write_peer(peer_id):
@@ -90,6 +92,10 @@ class MemoryIsolationHandler:
             if target_id != _SELF_PEER_ID:
                 return target_id
         return targets[0] if targets else None
+
+    @staticmethod
+    def _is_peer_owner_message(msg: Any) -> bool:
+        return getattr(msg, "role", None) == "user"
 
     def get_read_scope(self) -> RoleScope:
         user_ids = set()
@@ -135,10 +141,54 @@ class MemoryIsolationHandler:
             return True
         if self.allowed_memory_types is not None and memory_type not in self.allowed_memory_types:
             return False
+        if not self.allow_self and not getattr(memory_type_schema, "peer_enabled", True):
+            return False
         return True
 
     def _can_write_peer(self, peer_id: str) -> bool:
         return self.allow_peer and peer_id in self.allowed_peer_ids
+
+    def _unique_peer_target_id_in_messages(self) -> Optional[str]:
+        targets = [
+            peer_id
+            for msg in self._messages()
+            if (peer_id := safe_peer_id(getattr(msg, "peer_id", None)))
+            and self._is_peer_owner_message(msg)
+            and self._can_write_peer(peer_id)
+        ]
+        peer_ids = list(dict.fromkeys(targets))
+        return peer_ids[0] if len(peer_ids) == 1 else None
+
+    def _unique_target_id_in_messages(self) -> Optional[str]:
+        targets = [
+            target_id for msg in self._messages() if (target_id := self._message_target_id(msg))
+        ]
+        target_ids = list(dict.fromkeys(targets))
+        return target_ids[0] if len(target_ids) == 1 else None
+
+    def _range_is_fully_in_bounds(self, ranges: Any) -> bool:
+        parts = str(ranges).split(",")
+        if not parts or any(not part.strip() for part in parts):
+            return False
+
+        message_count = len(self._messages())
+        if message_count == 0:
+            return False
+
+        try:
+            for part in parts:
+                bounds = part.strip().split("-")
+                if len(bounds) == 1:
+                    start = end = int(bounds[0])
+                elif len(bounds) == 2 and all(bound.strip() for bound in bounds):
+                    start, end = (int(bound) for bound in bounds)
+                else:
+                    return False
+                if start < 0 or start > end or end >= message_count:
+                    return False
+        except ValueError:
+            return False
+        return True
 
     def render_schema_directories(self, memory_type_schema: MemoryTypeSchema) -> List[str]:
         user_id = self.ctx.user.user_id if self.ctx and self.ctx.user else "default"
@@ -161,22 +211,29 @@ class MemoryIsolationHandler:
             )
         return directories
 
-    def _range_targets(self, ranges: Any) -> List[str]:
+    def _range_targets(self, ranges: Any) -> tuple[List[str], bool]:
         if not ranges or not self._extract_context:
-            return []
+            return [], False
+        range_is_fully_in_bounds = self._range_is_fully_in_bounds(ranges)
         try:
             msg_range = self._extract_context.read_message_ranges(str(ranges))
         except Exception:
             logger.warning("Failed to parse memory ranges for peer memory: %s", ranges)
-            return []
+            return [], False
 
         target_ids = []
+        has_message = False
+        has_user_message = False
         for msg_group in getattr(msg_range, "elements", []) or []:
             for msg in msg_group:
+                has_message = True
+                if self._is_peer_owner_message(msg):
+                    has_user_message = True
                 target_id = self._message_target_id(msg)
                 if target_id:
                     target_ids.append(target_id)
-        return list(dict.fromkeys(target_ids))
+        can_fallback = range_is_fully_in_bounds and has_message and not has_user_message
+        return list(dict.fromkeys(target_ids)), can_fallback
 
     def _resolve_operation_target_id(self, raw_peer_id: Any) -> Optional[str]:
         peer_id = safe_peer_id(raw_peer_id)
@@ -184,12 +241,11 @@ class MemoryIsolationHandler:
             return _SELF_PEER_ID
         if peer_id and self._can_write_peer(peer_id):
             return peer_id
-        fallback_target_id = self._first_target_id_in_messages()
-        if fallback_target_id:
-            return fallback_target_id
+        if raw_peer_id not in (None, ""):
+            return None
         if self.allow_self:
             return _SELF_PEER_ID
-        return None
+        return self._unique_peer_target_id_in_messages()
 
     def calculate_memory_uris(
         self,
@@ -210,11 +266,15 @@ class MemoryIsolationHandler:
         has_ranges = operation.memory_fields.get("ranges") is not None
         if not getattr(memory_type_schema, "peer_enabled", True):
             operation.memory_fields.pop("peer_id", None)
-            target_ids = [_SELF_PEER_ID]
+            target_ids = [_SELF_PEER_ID] if self.allow_self else []
         elif operation.memory_fields.get("ranges") is not None:
-            target_ids = self._range_targets(
+            target_ids, can_fallback = self._range_targets(
                 operation.memory_fields.get("ranges"),
             )
+            if not target_ids and can_fallback:
+                fallback_target = self._unique_target_id_in_messages()
+                if fallback_target:
+                    target_ids = [fallback_target]
             operation.memory_fields.pop("peer_id", None)
         else:
             target_id = self._resolve_operation_target_id(

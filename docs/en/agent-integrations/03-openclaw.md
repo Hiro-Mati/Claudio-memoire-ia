@@ -9,7 +9,7 @@ Source: [examples/openclaw-plugin](https://github.com/volcengine/OpenViking/tree
 | Component | Required Version |
 | --- | --- |
 | Node.js | >= 22 |
-| OpenClaw | >= 2026.4.8 |
+| OpenClaw | >= 2026.5.27 |
 
 The plugin connects to a running OpenViking server — see the [Deployment Guide](../guides/03-deployment.md) if you need one.
 
@@ -115,6 +115,7 @@ bash uninstall-openviking.sh
 
 ## See also
 
+- [Capability Reference](./16-capability-reference.md)
 - [Full install guide](https://github.com/volcengine/OpenViking/blob/main/examples/openclaw-plugin/INSTALL.md) — every install path and parameter
 - [Plugin design notes](https://github.com/volcengine/OpenViking/blob/main/examples/openclaw-plugin/README.md) — architecture, identity & routing, hook lifecycle
 - [Agent operator guide](https://github.com/volcengine/OpenViking/blob/main/examples/openclaw-plugin/INSTALL-AGENT.md) — for agents driving installation on behalf of a user

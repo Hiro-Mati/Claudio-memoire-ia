@@ -144,11 +144,20 @@ async def test_policy_optimizer_records_retry_as_one_gate_attempt(monkeypatch):
     )
     monkeypatch.setattr(policy_optimizer_module, "_seed_read_file_contents", lambda *args: None)
     monkeypatch.setattr(policy_optimizer_module, "_log_merge_input", lambda **kwargs: None)
+
+    async def operations_to_plan_items(**kwargs):
+        return [candidate]
+
+    async def remember_gated_plan_operations(*args, **kwargs):
+        return None
+
     monkeypatch.setattr(
-        policy_optimizer_module, "_operations_to_plan_items", lambda **kwargs: [candidate]
+        policy_optimizer_module, "_operations_to_plan_items", operations_to_plan_items
     )
     monkeypatch.setattr(
-        policy_optimizer_module, "_remember_gated_plan_operations", lambda *args, **kwargs: None
+        policy_optimizer_module,
+        "_remember_gated_plan_operations",
+        remember_gated_plan_operations,
     )
     monkeypatch.setattr(
         PatchMergePolicyOptimizer,

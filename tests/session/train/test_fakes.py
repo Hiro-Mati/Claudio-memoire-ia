@@ -8,8 +8,25 @@ from types import SimpleNamespace
 from typing import Any
 
 
+class AsyncPathLockFake:
+    def __init__(self):
+        self._next_id = 0
+
+    async def pathlock_acquire_tree(self, path: str, timeout_secs: float | None = None):
+        del timeout_secs
+        self._next_id += 1
+        return {"lease_ref": f"tree-{self._next_id}", "path": path}
+
+    async def pathlock_acquire_exact_batch(self, paths: list[str]):
+        self._next_id += 1
+        return {"lease_ref": f"exact-{self._next_id}", "paths": list(paths)}
+
+    async def pathlock_release(self, lease_ref):
+        del lease_ref
+
+
 class InMemoryAGFS:
-    """Tiny synchronous AGFS fake with enough semantics for PathLockEngine."""
+    """Tiny synchronous AGFS fake for training integration tests."""
 
     def __init__(self, files: dict[str, str] | None = None):
         self.files: dict[str, bytes] = {}
@@ -176,6 +193,7 @@ class InMemoryVikingFS:
         self.files = files
         self.writes = []
         self.agfs = InMemoryAGFS()
+        self._async_agfs = AsyncPathLockFake()
         for uri in files:
             self.agfs.ensure_parent_dirs(self._uri_to_path(uri))
 

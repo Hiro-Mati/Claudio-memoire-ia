@@ -242,10 +242,7 @@ def test_render_graph_html_edge_details_include_source_and_target_uris():
     assert "const sourceUri = edge.from || edge.source || '';" in html
     assert "const targetUri = edge.to || edge.target || '';" in html
     assert (
-        """detailContent.innerHTML = renderMarkdown(`- from_uri: ${escapeHtml(sourceUri)}
-- to_uri: ${escapeHtml(targetUri)}
-
-${escapeHtml(edge.description || '(no description)')}`);"""
+        r"""detailContent.innerHTML = renderMarkdown(`- from_uri: ${escapeHtml(sourceUri)}\n- to_uri: ${escapeHtml(targetUri)}\n\n${escapeHtml(edge.description || '(no description)')}`);"""
         in html
     )
 

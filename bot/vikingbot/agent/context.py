@@ -6,7 +6,7 @@ import platform
 import time as _time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -27,6 +27,10 @@ def normalize_system_prompt_profile(value: str | None) -> str:
     return profile
 
 
+if TYPE_CHECKING:
+    from vikingbot.config.schema import Config
+
+
 class ContextBuilder:
     """
     Builds the context (system prompt + messages) for the agent.
@@ -43,11 +47,15 @@ class ContextBuilder:
         workspace: Path,
         sandbox_manager: SandboxManager | None = None,
         sender_id: str = None,
+        actor_peer_id: str = None,
         sender_name: str = None,
         is_group_chat: bool = False,
         eval: bool = False,
         openviking_connection: dict[str, Any] | None = None,
         system_prompt_profile: str = "full",
+        remote_skills_summary: str = "",
+        enable_subagents: bool = True,
+        config: "Config | None" = None,
     ):
         self.workspace = workspace
         self._templates_ensured = False
@@ -55,18 +63,22 @@ class ContextBuilder:
         self._memory = None
         self._skills = None
         self._sender_id = sender_id
+        self._actor_peer_id = actor_peer_id or sender_id
         self._sender_name = sender_name
         self._is_group_chat = is_group_chat
         self._eval = eval
         self._openviking_connection = openviking_connection
         self.system_prompt_profile = normalize_system_prompt_profile(system_prompt_profile)
+        self._remote_skills_summary = remote_skills_summary
+        self._enable_subagents = enable_subagents
+        self._config = config
         self.latest_relevant_memories: str | None = None
 
     @property
     def memory(self):
         """Lazy-load MemoryStore when first needed."""
         if self._memory is None:
-            self._memory = MemoryStore(self.workspace)
+            self._memory = MemoryStore(self.workspace, config=self._config)
         return self._memory
 
     @property
@@ -159,7 +171,7 @@ class ContextBuilder:
 
         # 2. Available skills: only show summary (agent uses read_file to load)
         skills_summary = self.skills.build_skills_summary()
-        if skills_summary:
+        if skills_summary or self._remote_skills_summary:
             required_skill_note = ""
             required_skill_candidates = [
                 "skills/experience_loader/SKILL.md",
@@ -172,24 +184,42 @@ class ContextBuilder:
                         f"`{skill_path}` and apply its instructions.\n"
                     )
                     break
+            local_section = ""
+            if skills_summary:
+                local_section = f"""## Local Skills
+
+Read local SKILL.md files with the read_file tool.
+{skills_summary}"""
+            remote_section = ""
+            if self._remote_skills_summary:
+                remote_section = f"""## OpenViking Skills
+
+These are remote Skill summaries. Read a selected SKILL.md with openviking_multi_read.
+Do not use read_file for their viking:// locations. Text references stay remote; the
+runtime automatically materializes files only when a tool requires a local path.
+After activation, use the canonical resource URIs appended to SKILL.md. When multiple
+remote Skills are active, their tool policies are intersected. Use `workspace:<relative-path>`
+or an absolute path for an ordinary workspace file.
+{self._remote_skills_summary}"""
             parts.append(f"""# Skills
 
-The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
-Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
+The following local and remote Skills extend your capabilities.
 {required_skill_note}
-{skills_summary}""")
+{local_section}
+
+{remote_section}""")
 
         # Viking peer profile (only if ov tools are enabled). In the current
         # OpenViking identity model, the bot API key owns the User, and the
         # message sender is represented as a peer under that User.
         if ov_tools_enable:
-            # Fetch current sender's peer profile
+            # Fetch the authenticated actor's peer profile.
             start = _time.time()
             profile = await self.memory.get_viking_peer_profile(
                 workspace_id=workspace_id,
-                peer_id=self._sender_id,
+                peer_id=self._actor_peer_id,
                 openviking_connection=self._openviking_connection,
-                actor_peer_id=self._sender_id,
+                actor_peer_id=self._actor_peer_id,
             )
             cost = round(_time.time() - start, 2)
             logger.info(
@@ -203,14 +233,14 @@ Skills with available="false" need dependencies installed first - you can try in
             # is retained for compatibility with older deployments.
             additional_peer_ids = self._dedupe_ids(
                 [*(profile_user_list or []), *(memory_peer_ids or [])],
-                exclude={self._sender_id} if self._sender_id else set(),
+                exclude={self._actor_peer_id} if self._actor_peer_id else set(),
             )
             if additional_peer_ids:
                 profiles = await self.memory.get_viking_peer_profiles(
                     workspace_id=workspace_id,
                     peer_ids=additional_peer_ids,
                     openviking_connection=self._openviking_connection,
-                    use_peer_actor_scope=bool(self._sender_id),
+                    use_peer_actor_scope=bool(self._actor_peer_id),
                 )
                 if profiles:
                     parts.append(profiles)
@@ -258,7 +288,7 @@ Skills with available="false" need dependencies installed first - you can try in
         if ov_tools_enable:
             start = _time.time()
             # Default recall runs under the configured/request OpenViking user.
-            # sender_id is passed separately as peer identity.
+            # actor_peer_id is passed separately as peer identity.
             search_peer_ids = memory_peer_ids if memory_peer_ids else None
             viking_memory = await self.memory.get_viking_memory_context(
                 current_message=current_message,
@@ -287,8 +317,6 @@ Skills with available="false" need dependencies installed first - you can try in
                 "- For relevant summary or uri entries, use openviking_multi_read on their URIs to fetch full details to help you to resolve the query. "
             )
 
-
-
         parts.append(
             "Reply in the same language as the user's query, ignoring the language of the reference materials. User's query:"
         )
@@ -308,17 +336,23 @@ Skills with available="false" need dependencies installed first - you can try in
         else:
             workspace_display = workspace_path
 
+        capabilities = [
+            "- Read, search, and grep OpenViking files",
+            "- Read, write, and edit local files",
+            "- Execute shell commands",
+            "- Search the web and fetch web pages",
+            "- Send messages to users on chat channels",
+        ]
+        if self._enable_subagents:
+            capabilities.append("- Spawn subagents for complex background tasks")
+        capabilities_text = "\n".join(capabilities)
+
         return f"""# vikingbot 🐈
 
 You are VikingBot, an AI assistant built based on the OpenViking context database.
 When acquiring information, data, and knowledge, you **prioritize using openviking tools to read and search OpenViking (a context database) above all other sources**.
 You have access to tools that allow you to:
-- Read, search, and grep OpenViking files
-- Read, write, and edit local files
-- Execute shell commands
-- Search the web and fetch web pages
-- Send messages to users on chat channels
-- Spawn subagents for complex background tasks
+{capabilities_text}
 
 ## Runtime
 {runtime}
@@ -367,7 +401,7 @@ Note: generic workspace docs, skills catalog, soul/persona text, memory instruct
         self,
         history: list[dict[str, Any]],
         current_message: str,
-        media: list[str] | None = None,
+        media: list[str | dict[str, Any]] | None = None,
         session_key: SessionKey | None = None,
         ov_tools_enable: bool = True,
         profile_user_list: list[str] | None = None,
@@ -450,7 +484,7 @@ Note: generic workspace docs, skills catalog, soul/persona text, memory instruct
         user_info = await self._build_user_memory(
             session_key,
             current_message,
-            self._sender_id,
+            self._actor_peer_id,
             memory_peer_ids,
             memory_owner_user_ids,
             ov_tools_enable=ov_tools_enable,
@@ -464,13 +498,41 @@ Note: generic workspace docs, skills catalog, soul/persona text, memory instruct
 
         return messages
 
-    def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
-        """Build user message content with optional base64-encoded images."""
+    def _build_user_content(
+        self,
+        text: str,
+        media: list[str | dict[str, Any]] | None,
+    ) -> str | list[dict[str, Any]]:
+        """Build user content from trusted local paths or validated image URL parts."""
         if not media:
             return text
 
         images = []
-        for path in media:
+        for item in media:
+            if isinstance(item, dict):
+                image_url = item.get("image_url")
+                url = image_url.get("url") if isinstance(image_url, dict) else None
+                if item.get("type") == "image_url" and isinstance(url, str):
+                    images.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": url,
+                                **(
+                                    {"detail": image_url["detail"]}
+                                    if image_url.get("detail")
+                                    else {}
+                                ),
+                            },
+                        }
+                    )
+                continue
+
+            if item.startswith(("https://", "data:image/")):
+                images.append({"type": "image_url", "image_url": {"url": item}})
+                continue
+
+            path = item
             p = Path(path)
             mime, _ = mimetypes.guess_type(path)
             if not p.is_file() or not mime or not mime.startswith("image/"):

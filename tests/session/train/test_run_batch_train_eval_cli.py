@@ -13,7 +13,7 @@ from openviking.session.train.run_batch_train_eval import _parse_server_header, 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def test_train_concurrency_defaults_to_150(monkeypatch) -> None:
+def test_train_concurrency_defaults_to_200(monkeypatch) -> None:
     monkeypatch.setattr(
         sys,
         "argv",
@@ -23,11 +23,11 @@ def test_train_concurrency_defaults_to_150(monkeypatch) -> None:
     args = parse_args()
     config = BatchTrainEvalConfig(dataset="tau2", domain="airline")
 
-    assert args.concurrency == 150
-    assert args.commit_concurrency == 150
+    assert args.concurrency == 200
+    assert args.commit_concurrency == 200
     assert args.commit_timeout_seconds is None
-    assert config.concurrency == 150
-    assert config.commit_concurrency == 150
+    assert config.concurrency == 200
+    assert config.commit_concurrency == 200
     assert config.commit_timeout_seconds is None
 
 
@@ -151,15 +151,15 @@ def test_build_http_client_preserves_config_headers_by_default(monkeypatch) -> N
     assert "extra_headers" not in captured
 
 
-def test_tau2_launchers_use_concurrency_150() -> None:
+def test_tau2_launchers_use_concurrency_200() -> None:
     launcher = (REPO_ROOT / "benchmark/tau2/train/run_batch_train_eval.sh").read_text()
     restart_launcher = (
         REPO_ROOT / "benchmark/tau2/train/restart_vikingbot_train_eval.sh"
     ).read_text()
 
-    assert "--concurrency 150" in launcher
-    assert "--commit-concurrency 150" in launcher
-    assert "--commit-concurrency 150" in restart_launcher
+    assert "--concurrency 200" in launcher
+    assert "--commit-concurrency 200" in launcher
+    assert "--commit-concurrency 200" in restart_launcher
 
 
 def test_no_eval_each_epoch_overrides_tau2_wrapper_default(monkeypatch) -> None:

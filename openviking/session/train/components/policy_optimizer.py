@@ -114,7 +114,7 @@ class PatchMergePolicyOptimizer:
             policy_set=policy_set,
             context=context,
         )
-        items = _operations_to_plan_items(
+        items = await _operations_to_plan_items(
             operations=operations,
             gradients=patch_gradients,
             policy_set=policy_set,
@@ -218,7 +218,7 @@ class PatchMergePolicyOptimizer:
             gate_runner = context.gate_runner
             if gate_runner is None or self.memory_type != "experiences":
                 return None
-            items = _operations_to_plan_items(
+            items = await _operations_to_plan_items(
                 operations=operations,
                 gradients=gradients,
                 policy_set=policy_set,
@@ -230,7 +230,7 @@ class PatchMergePolicyOptimizer:
                 analyses=list(context.analyses or []),
                 policy_set=policy_set,
             )
-            _remember_gated_plan_operations(
+            await _remember_gated_plan_operations(
                 operations,
                 gated,
                 schema=self._get_schema(),
@@ -355,7 +355,7 @@ class PatchMergePolicyOptimizer:
         return operations
 
 
-def _retain_gated_plan_operations(
+async def _retain_gated_plan_operations(
     operations: Any,
     gated: list[PolicyPlanItem],
     *,
@@ -388,7 +388,7 @@ def _retain_gated_plan_operations(
             or fields.get("name")
             or _fallback_policy_name(operation, memory_type="experiences")
         )
-        after_content = render_operation_after_file(operation, schema=schema).content
+        after_content = (await render_operation_after_file(operation, schema=schema)).content
         if (target_uri, target_name, after_content) in allowed_upserts:
             retained_upserts.append(operation)
 
@@ -400,7 +400,7 @@ def _retain_gated_plan_operations(
     ]
 
 
-def _remember_gated_plan_operations(
+async def _remember_gated_plan_operations(
     operations: Any,
     gated: list[PolicyPlanItem],
     *,
@@ -411,7 +411,7 @@ def _remember_gated_plan_operations(
     """Carry independently valid plan items across model repair attempts."""
 
     selected = deepcopy(operations)
-    _retain_gated_plan_operations(selected, gated, schema=schema)
+    await _retain_gated_plan_operations(selected, gated, schema=schema)
     for operation in getattr(selected, "upsert_operations", []) or []:
         if getattr(operation, "memory_type", None) != "experiences":
             continue
@@ -728,7 +728,7 @@ def _policy_to_memory_file(policy: Policy, *, memory_type: str = "experiences") 
     )
 
 
-def _operations_to_plan_items(
+async def _operations_to_plan_items(
     *,
     operations: Any,
     gradients: list[SemanticGradient],
@@ -743,7 +743,7 @@ def _operations_to_plan_items(
     confidence = max(confidence_values) if confidence_values else None
     name_field = _name_field_for_memory_type(memory_type)
 
-    upsert_output_count = _upsert_output_count(
+    upsert_output_count = await _upsert_output_count(
         operations,
         memory_type=memory_type,
         schema=schema,
@@ -756,7 +756,7 @@ def _operations_to_plan_items(
             continue
         fields = dict(getattr(op, "memory_fields", {}) or {})
         old_file = getattr(op, "old_memory_file_content", None)
-        after_file = render_operation_after_file(op, schema=schema)
+        after_file = await render_operation_after_file(op, schema=schema)
         plan_fields = dict(fields)
         for field_name in schema.content_field_names():
             if field_name == "content":
@@ -1224,7 +1224,7 @@ def _superseded_source_trajectory_links(
     return _source_trajectory_links_from_experience(superseded_policy)
 
 
-def _upsert_output_count(
+async def _upsert_output_count(
     operations: Any,
     *,
     memory_type: str,
@@ -1234,7 +1234,7 @@ def _upsert_output_count(
     for op in getattr(operations, "upsert_operations", []) or []:
         if getattr(op, "memory_type", None) != memory_type:
             continue
-        after_file = render_operation_after_file(op, schema=schema)
+        after_file = await render_operation_after_file(op, schema=schema)
         if _memory_file_has_schema_content(after_file, schema=schema):
             count += 1
     return count

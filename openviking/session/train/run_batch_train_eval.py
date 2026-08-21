@@ -54,20 +54,20 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Train/eval batch size. Default uses the remote case loader page size (currently 1000)."
+            "Train/eval batch size. Default uses the remote case loader page size (currently 100)."
         ),
     )
     parser.add_argument(
         "--concurrency",
         type=int,
-        default=150,
-        help="Concurrent rollout executions for train and eval (default: 150)",
+        default=200,
+        help="Concurrent rollout executions for train and eval (default: 200)",
     )
     parser.add_argument(
         "--commit-concurrency",
         type=int,
-        default=150,
-        help="Concurrent OpenViking session.commit submissions during train (default: 150)",
+        default=200,
+        help="Concurrent OpenViking session.commit submissions during train (default: 200)",
     )
     parser.add_argument(
         "--commit-timeout-seconds",

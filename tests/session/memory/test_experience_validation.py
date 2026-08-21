@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from openviking.session.memory.dataclass import ResolvedOperation, ResolvedOperations
 from openviking.session.memory.experience_validation import (
     build_memory_extraction_post_validation,
@@ -77,7 +79,8 @@ def test_experience_structure_rejects_spot_verify_fixed_count():
     assert any("sampling count" in issue for issue in issues)
 
 
-def test_normal_extraction_hook_retries_then_drops_invalid_experience(monkeypatch):
+@pytest.mark.asyncio
+async def test_normal_extraction_hook_retries_then_drops_invalid_experience(monkeypatch):
     invalid_content = _experience_body(
         procedure="1. Test 3 sample rows.\n2. Save the artifact.",
         verification="- Reopen the source and compare it.\n- Recompute the saved result.",
@@ -102,11 +105,11 @@ def test_normal_extraction_hook_retries_then_drops_invalid_experience(monkeypatc
         errors=[],
     )
 
-    retry = hook(operations, 0)
+    retry = await hook(operations, 0)
     assert retry is not None and retry.retry is True
     assert "sampling counts" in retry.instruction
 
-    final = hook(operations, 1)
+    final = await hook(operations, 1)
     assert final is None
     assert operations.upsert_operations == []
     assert any("Dropped invalid memory operations" in error for error in operations.errors)

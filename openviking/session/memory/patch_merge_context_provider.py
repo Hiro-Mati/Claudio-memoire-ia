@@ -294,6 +294,9 @@ may use the explicitly allowed empty field_operations described below.
         """Resolve required files plus semantic-search candidates for this merge."""
 
         required_uris = _dedupe_uris(self.required_file_uris)
+        if not any(patch.before_file is None for patch in self.patches):
+            return required_uris
+
         if self.memory_type == "cases":
             max_extra_candidate_files = _MAX_CASE_EXTRA_CANDIDATE_FILES
         else:

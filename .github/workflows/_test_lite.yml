@@ -81,9 +81,10 @@ jobs:
     - name: Build C++ extensions
       run: uv run python setup.py build_ext --inplace
 
-    - name: Run Lite Integration Test (Quick Start)
-      shell: bash
+    - name: Run cuVS CPU-only regression tests
       run: |
-        export PYTHONPATH=$PYTHONPATH:$(pwd)
-        # Using bash shell ensures this works across platforms (including Windows via Git Bash)
-        uv run python tests/integration/test_quick_start_lite.py
+        uv run pytest -q -o addopts='' \
+          tests/vectordb/test_cuvs_config.py \
+          tests/vectordb/test_cuvs_index.py \
+          tests/vectordb/test_cuvs_collection.py \
+          tests/vectordb/test_str_to_uint64.py

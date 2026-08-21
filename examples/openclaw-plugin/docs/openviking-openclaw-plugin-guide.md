@@ -252,7 +252,7 @@ transformContext auto recall 流程：
 | `POST /api/v1/system/wait` | 等待 semantic/vector 队列处理完成 | 暂未单独封装；`/add-resource`、opt-in `add_resource`、`add_skill` 可用 `wait=true` | 导入后马上检索时建议等待 |
 | `GET /api/v1/observer/queue` | 队列指标 | 暂未封装 | 排查资源/skill 处理积压 |
 | `GET /api/v1/observer/vikingdb` | VikingDB collection/vector 状态 | 暂未封装 | 排查向量库连接和索引数量 |
-| `GET /api/v1/observer/vlm` | VLM token 用量 | 暂未封装 | 观测摘要、抽取、视觉处理成本 |
+| `GET /api/v1/observer/models` | 模型状态 | 暂未封装 | 观测 VLM、Embedding 和 Rerank 模型状态 |
 | `GET /api/v1/observer/system` | 汇总 observer 状态 | 暂未封装 | 生产监控推荐项 |
 | `GET /api/v1/debug/health` | 认证版健康检查 | 暂未封装 | 返回 `{ healthy: true/false }` |
 
@@ -260,7 +260,7 @@ transformContext auto recall 流程：
 
 | API | 官方用途 | 当前插件映射 | 关键参数 / 返回 |
 | --- | --- | --- | --- |
-| `POST /api/v1/search/find` | 快速语义检索，不依赖 session context | 自动召回、`memory_recall`、`ov_search`、`memory_forget` | body: `query`、`target_uri`、`limit`、`score_threshold`；返回 `memories[]`、`resources[]`、`skills[]`，每项含 `uri`、`level`、`abstract`、`score`、`category`、`relations`：`client.ts:428` |
+| `POST /api/v1/search/find` | 快速语义检索，不依赖 session context | 自动召回、`memory_recall`、`ov_search`、`memory_forget` | body: `query`、`target_uri`、`limit`、`score_threshold`；返回 `memories[]`、`resources[]`、`skills[]`，每项含 `uri`、`level`、`abstract`、`score`、`category`：`client.ts:428` |
 | `POST /api/v1/search/search` | 带 session context 和 intent analysis 的检索 | 暂未使用 | body 可带 `session_id`；返回 `query_plan` / `query_results`。当前插件为了稳定和低延迟统一用 `find()`，session context 由插件自己组装 |
 | `POST /api/v1/search/grep` | 正则/关键词内容搜索 | `ov_archive_search` | body: `uri`、`pattern`、`case_insensitive`、`node_limit`；插件限定在 `viking://session/{id}/history` 内搜 archive：`client.ts:897` |
 | `POST /api/v1/search/glob` | glob 文件匹配 | 暂未封装 | body: `pattern`、`uri`、`node_limit`；适合按 `**/*.md`、`src/**/*.ts` 找资源路径 |
@@ -273,14 +273,11 @@ transformContext auto recall 流程：
 | `GET /api/v1/fs/tree?uri=...` | 递归树 | 暂未封装 | 支持 `level_limit`、`node_limit`，返回 flat array + `rel_path` |
 | `GET /api/v1/fs/stat?uri=...` | 查元信息/是否存在 | 暂未封装 | 返回 `name`、`size`、`mode`、`isDir`、`uri`、`mtime`、`ctime` |
 | `POST /api/v1/fs/mkdir` | 创建目录 | 暂未封装 | body: `uri`，父目录自动创建 |
-| `POST /api/v1/fs/mv` | 移动/重命名 | 暂未封装 | body: `from_uri`、`to_uri`，会保留元数据和 relations |
+| `POST /api/v1/fs/mv` | 移动/重命名 | 暂未封装 | body: `from_uri`、`to_uri`，会保留元数据 |
 | `DELETE /api/v1/fs?uri=...&recursive=...` | 删除资源/目录 | `memory_forget`、`deleteUri` | 插件默认 `recursive=false`，用于删除具体 memory URI：`client.ts:934` |
 | `GET /api/v1/content/abstract?uri=...` | 读取 L0 abstract | 暂未封装 | 约 100 token 摘要，适合快速判断目录/文件主题 |
 | `GET /api/v1/content/overview?uri=...` | 读取 L1 overview | 暂未封装 | 目录级结构化概览，适合介于 abstract 和 full content 之间的排查 |
 | `GET /api/v1/content/read?uri=...&offset=...&limit=...` | 读取 L2 full content | 自动召回读取 level=2 命中内容、`ov_read` | `ov_read` 暴露 `uri` 参数，未暴露 `offset/limit`：`client.ts:470` |
-| `GET /api/v1/relations?uri=...` | 查看资源关系 | 暂未封装 | 返回 `from_uri`、`to_uri`、`reason`、`created_at` |
-| `POST /api/v1/relations/link` | 创建有向关系 | 暂未封装 | body: `from_uri`、`to_uri`/`uris`、`reason` |
-| `POST /api/v1/relations/unlink` | 删除有向关系 | 暂未封装 | body: `from_uri`、`to_uri`；幂等 |
 
 #### 6.2.4 Resources / Skills Import
 
@@ -393,7 +390,7 @@ bash install.sh --source tos --channel prod --version 2026.6.2
 | 组件 | 要求 |
 | --- | --- |
 | Node.js | >= 22 |
-| OpenClaw | >= 2026.4.8 |
+| OpenClaw | >= 2026.5.27 |
 | OpenViking Server | >= 0.4.1 |
 
 兼容性声明在 `install-manifest.json` 的 `compatibility` 字段。
@@ -468,7 +465,7 @@ OpenViking 服务端配置与 OpenClaw 插件配置是两层配置，位置不�
     "provider": "volcengine",
     "api_base": "https://ark.cn-beijing.volces.com/api/v3",
     "api_key": "$ARK_API_KEY",
-    "model": "doubao-seed-2-0-pro-260215",
+    "model": "doubao-seed-2-0-lite-260428",
     "max_concurrent": 20
   }
 }

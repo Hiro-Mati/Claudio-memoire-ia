@@ -30,7 +30,6 @@ from openviking.session.train import (
     TrajectoryRolloutAnalyzer,
 )
 from openviking.session.train.components.gradient_estimator import ExperienceGradientEstimator
-from openviking.storage.transaction import init_lock_manager, reset_lock_manager
 from openviking.telemetry import start_current_span, tracer
 from openviking.telemetry.tracer import init_tracer_from_server_config
 from openviking_cli.utils.config import get_openviking_config
@@ -57,20 +56,9 @@ class RealRubricTrajectoryAnalyzer:
         self.calls = []
         self.unlocked_count = 1
 
-    @tracer(
-        "train.test.real_llm_e2e.real_rubric_trajectory_analyzer",
-        ignore_result=True,
-        ignore_args=True,
-    )
-    async def analyze(self, rollout, context):
-        from openviking.session.train import (
-            CriterionResult,
-            RolloutAnalysis,
-            RubricEvaluation,
-            Trajectory,
-        )
+    async def evaluate_rollout(self, rollout):
+        from openviking.session.train import CriterionResult, RubricEvaluation
 
-        self.calls.append((rollout, context))
         evaluation_payload = await _evaluate_rollout_with_real_llm(
             vlm=self.vlm,
             case=rollout.case,
@@ -82,7 +70,7 @@ class RealRubricTrajectoryAnalyzer:
         active_passed = len(_passed_criterion_names(evaluation_payload)) >= self.unlocked_count
         if active_passed and self.unlocked_count < len(rollout.case.rubric.criteria):
             self.unlocked_count += 1
-        evaluation = RubricEvaluation(
+        return RubricEvaluation(
             passed=bool(evaluation_payload["passed"]),
             score=float(evaluation_payload["score"]),
             criterion_results=[
@@ -99,6 +87,21 @@ class RealRubricTrajectoryAnalyzer:
             feedback=[str(value) for value in evaluation_payload.get("feedback", [])],
             metadata={"raw_payload": evaluation_payload},
         )
+
+    @tracer(
+        "train.test.real_llm_e2e.real_rubric_trajectory_analyzer",
+        ignore_result=True,
+        ignore_args=True,
+    )
+    async def analyze(self, rollout, context):
+        from openviking.session.train import (
+            RolloutAnalysis,
+            Trajectory,
+        )
+
+        self.calls.append((rollout, context))
+        evaluation = rollout.evaluation or await self.evaluate_rollout(rollout)
+        evaluation_payload = dict(evaluation.metadata.get("raw_payload") or {})
         assistant_text = "\n".join(
             message.content for message in rollout.messages if message.role == "assistant"
         )
@@ -153,6 +156,20 @@ class RealRubricTrajectoryAnalyzer:
                 "policy_snapshot_id": rollout.policy_snapshot_id,
             },
         )
+
+
+class EvaluatedSingleTurnLLMRolloutExecutor:
+    """Attach evaluator output before pipeline rollout reporting runs."""
+
+    def __init__(self, delegate, analyzer: RealRubricTrajectoryAnalyzer):
+        self.delegate = delegate
+        self.analyzer = analyzer
+
+    async def execute(self, cases, policy_set, context):
+        rollouts = await self.delegate.execute(cases, policy_set, context)
+        for rollout in rollouts:
+            rollout.evaluation = await self.analyzer.evaluate_rollout(rollout)
+        return rollouts
 
 
 def _case() -> Case:
@@ -534,10 +551,11 @@ def _print_iterative_real_llm_summary(
     tracer.info("\n".join(lines), console=True)
 
 
-def _patch_experience_prefetch(
-    monkeypatch, fs: InMemoryVikingFS, experience_uri: str
-) -> None:
+def _patch_experience_prefetch(monkeypatch, fs: InMemoryVikingFS, experience_uri: str) -> None:
+    """Patch experience prefetch so the test reads from the in-memory filesystem."""
+
     async def search_files(self, query, search_uris=None, limit=5):
+        del self, query, search_uris, limit
         return [experience_uri]
 
     async def read_file(self, uri):
@@ -603,8 +621,6 @@ async def _run_policy_optimization_pipeline_real_config_llm_e2e_writes_updated_e
             )
         }
     )
-    reset_lock_manager()
-    init_lock_manager(fs.agfs, redo_recovery_enabled=False)
     request_context = SimpleNamespace(
         user=SimpleNamespace(account_id="default", user_id="u"),
         account_id="default",
@@ -613,18 +629,22 @@ async def _run_policy_optimization_pipeline_real_config_llm_e2e_writes_updated_e
     vlm = get_openviking_config().vlm
     _patch_experience_prefetch(monkeypatch, fs, experience_uri)
 
+    analyzer = RealRubricTrajectoryAnalyzer(
+        trajectory_uri=trajectory_uri,
+        viking_fs=fs,
+        vlm=vlm,
+    )
     pipeline = OfflinePolicyOptimizationPipeline(
         snapshotter=ContentHashPolicySnapshotter(),
-        rollout_executor=SingleTurnLLMRolloutExecutor(
-            vlm=vlm,
-            prompt_builder=_strict_policy_prompt,
-            thinking=False,
+        rollout_executor=EvaluatedSingleTurnLLMRolloutExecutor(
+            SingleTurnLLMRolloutExecutor(
+                vlm=vlm,
+                prompt_builder=_strict_policy_prompt,
+                thinking=False,
+            ),
+            analyzer,
         ),
-        rollout_analyzer=RealRubricTrajectoryAnalyzer(
-            trajectory_uri=trajectory_uri,
-            viking_fs=fs,
-            vlm=vlm,
-        ),
+        rollout_analyzer=analyzer,
         gradient_estimator=ExperienceGradientEstimator(
             viking_fs=fs,
             vlm=vlm,
@@ -673,14 +693,10 @@ async def _run_policy_optimization_pipeline_real_config_llm_e2e_writes_updated_e
     assert trajectory_content.strip()
     assert gradient.after_file.plain_content().strip()
     assert all(epoch.apply_result.errors == [] for epoch in result.epochs)
-    written_uris = [
-        uri for epoch in result.epochs for uri in epoch.apply_result.written_uris
-    ]
+    written_uris = [uri for epoch in result.epochs for uri in epoch.apply_result.written_uris]
     assert experience_uri in written_uris
     assert result.plan.metadata["optimizer"] == "patch_merge"
-    assert any(
-        epoch.plan.metadata.get("optimizer") == "patch_merge" for epoch in result.epochs
-    )
+    assert any(epoch.plan.metadata.get("optimizer") == "patch_merge" for epoch in result.epochs)
     assert len(result.epochs) == 4
     assert result.evaluation_passes == []
     assert final_evaluation.metadata["score"] > result.metadata["first_score"]
@@ -725,8 +741,6 @@ async def test_experience_gradient_estimator_real_config_llm_generates_gradient(
             ),
         }
     )
-    reset_lock_manager()
-    init_lock_manager(fs.agfs, redo_recovery_enabled=False)
     request_context = SimpleNamespace(
         user=SimpleNamespace(account_id="default", user_id="u"),
         account_id="default",

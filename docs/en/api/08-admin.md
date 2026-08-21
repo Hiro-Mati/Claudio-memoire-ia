@@ -23,7 +23,7 @@ For `/api/v1/admin/*`, `trusted` mode permits requests with no explicit identity
 | Register/remove users | Y | Y (own account) | N |
 | List agents (deprecated, returns empty list) | Y | Y (own account) | N |
 | Regenerate user key | Y | Y (own account) | N |
-| Change user role | Y | N | N |
+| Promote user to ADMIN | Y | Y (own account) | N |
 
 ## CLI `--sudo` Option
 
@@ -56,6 +56,68 @@ Configure `root_api_key` in `~/.openviking/ovcli.conf`:
 - Must have `root_api_key` configured to use `--sudo`
 
 ## API Reference
+
+### get_agent_evolution_status
+
+Return the effective Agent Evolution switch for the caller's account. ROOT
+operates on the configured default account; ADMIN operates on its own account.
+
+**HTTP API**
+
+```
+GET /api/v1/admin/agent-evolution
+```
+
+```bash
+curl http://localhost:1933/api/v1/admin/agent-evolution \
+  -H "X-API-Key: <root-key>"
+```
+
+**Response Example**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "enabled": false,
+    "account_id": "default"
+  },
+  "time": 0.1
+}
+```
+
+`enabled` is the account override from
+`/local/{account_id}/_system/setting.json`, or
+`server.agent_evolution.enabled` when no override exists. Session commits read
+this effective value without restarting the server.
+
+The existing update endpoint name is unchanged:
+
+```http
+PUT /api/v1/admin/agent-evolution
+Content-Type: application/json
+
+{"enabled": true}
+```
+
+### account_settings
+
+ROOT can manage any account and ADMIN can manage only its own account. The
+generic settings endpoint accepts only explicitly allowlisted fields; currently
+only `agent_evolution.enabled` is writable.
+
+```http
+GET /api/v1/admin/accounts/{account_id}/settings
+PATCH /api/v1/admin/accounts/{account_id}/settings
+Content-Type: application/json
+
+{"agent_evolution": {"enabled": true}}
+```
+
+Before an existing setting is replaced, it is backed up to
+`/local/{account_id}/_system/setting.backup.json`.
+
+---
 
 ### create_account
 
@@ -125,13 +187,7 @@ curl -X POST http://localhost:1933/api/v1/admin/accounts \
     "admin_user_id": "gateway-admin"
   }'
 
-# Then promote it to root for cross-account admin operations
-curl -X PUT http://localhost:1933/api/v1/admin/accounts/platform/users/gateway-admin/role \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: <root-key>" \
-  -d '{"role": "root"}'
-
-# Then use in trusted mode
+# Then use it in trusted mode; admin authorization comes from root_api_key
 curl -X POST http://localhost:1933/api/v1/admin/accounts \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <root-key>" \
@@ -178,6 +234,12 @@ result = client.admin_create_account(
         }
     },
 )
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminCreateAccount("account-id", "admin-user-id"));
 ```
 
 **Go SDK**
@@ -276,6 +338,12 @@ for account in accounts:
     print(f"Account: {account['account_id']}, created: {account['created_at']}, users: {account['user_count']}")
 ```
 
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminListAccounts());
+```
+
 **Go SDK**
 
 ```go
@@ -362,6 +430,12 @@ result = client.admin_delete_account("acme")
 print(f"Account deleted: {result['deleted']}")
 ```
 
+**TypeScript SDK**
+
+```typescript
+await client.adminDeleteAccount("account-id");
+```
+
 **Go SDK**
 
 ```go
@@ -419,7 +493,7 @@ Register a new user in a workspace.
 |-----------|------|----------|---------|-------------|
 | account_id | str | Yes | - | Workspace ID |
 | user_id | str | Yes | - | User ID |
-| role | str | No | "user" | Role to assign. `ROOT` and same-account `ADMIN` may register `"user"` or `"admin"`. `"root"` must be assigned through the dedicated role-change endpoint. |
+| role | str | No | "user" | Role to assign. `ROOT` and same-account `ADMIN` may register `"user"` or `"admin"`. ROOT identity comes only from `server.root_api_key`. |
 | seed | str | No | `null` | Optional deterministic API key seed. When set, the key secret is `sha256(user_id + "\0" + seed)` |
 | user_config | object | No | `null` | Initial config for the new user. Currently supports `add_targets.resource_uri` and `add_targets.skill_uri` |
 
@@ -468,6 +542,12 @@ result = client.admin_register_user(
     role="user",
     user_config={"add_targets": {"resource_uri": "viking://user/resources/project-a"}},
 )
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminRegisterUser("account-id", "user-id", "user"));
 ```
 
 **Go SDK**
@@ -581,6 +661,12 @@ for user in users:
     print(f"User: {user['user_id']}, role: {user['role']}")
 ```
 
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminListUsers("account-id"));
+```
+
 **Go SDK**
 
 ```go
@@ -671,6 +757,12 @@ result = client.admin_remove_user("acme", "bob")
 print(f"User deleted: {result['deleted']}")
 ```
 
+**TypeScript SDK**
+
+```typescript
+await client.adminRemoveUser("account-id", "user-id");
+```
+
 **Go SDK**
 
 ```go
@@ -709,10 +801,10 @@ ov --sudo admin remove-user acme bob
 
 #### 1. API Implementation Overview
 
-Change a user's role (ROOT only).
+Promote an account user to ADMIN. ROOT may operate on any account; ADMIN is limited to its own account.
 
 **Processing Flow:**
-1. Verify requester has ROOT privileges
+1. Verify the requester has ROOT or ADMIN privileges and keep ADMIN within its own account
 2. Call API Key Manager to update user role
 3. Return updated user info
 
@@ -729,11 +821,11 @@ Change a user's role (ROOT only).
 |-----------|------|----------|---------|-------------|
 | account_id | str | Yes | - | Workspace ID |
 | user_id | str | Yes | - | User ID |
-| role | str | Yes | - | New role: "admin", "user", or "root" |
+| role | str | Yes | - | Must be "admin" |
 
 **Notes:**
-- Only ROOT can change user roles
-- Role can be set to "admin", "user", or "root"
+- ROOT and ADMIN can promote users to ADMIN; ADMIN is limited to its own account
+- This endpoint cannot set "user" or "root"; ROOT comes only from `server.root_api_key`
 
 #### 3. Usage Examples
 
@@ -760,6 +852,12 @@ client.initialize()
 
 result = client.admin_set_role("acme", "bob", "admin")
 print(f"User: {result['user_id']}, new role: {result['role']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+await client.adminSetRole("account-id", "user-id", "admin");
 ```
 
 **Go SDK**
@@ -852,6 +950,12 @@ client.initialize()
 
 result = client.admin_regenerate_key("acme", "bob", seed="bob-new-seed")
 print(f"New user key: {result['user_key']}")
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminRegenerateKey("account-id", "user-id"));
 ```
 
 **Go SDK**
@@ -947,22 +1051,32 @@ POST /api/v1/admin/migrate
 
 #### 3. Usage Examples
 
-**Run migration**
+**HTTP API**
 
 ```bash
+# Run migration
 curl -X POST http://localhost:1933/api/v1/admin/migrate \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <root-key>" \
   -d '{"action": "migrate"}'
-```
 
-**Clean old namespaces**
-
-```bash
+# Clean old namespaces
 curl -X POST http://localhost:1933/api/v1/admin/migrate \
   -H "Content-Type: application/json" \
   -H "X-API-Key: <root-key>" \
   -d '{"action": "cleanup"}'
+```
+
+**Python SDK**
+
+```python
+print(client.admin_migrate(cleanup=False))
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.adminMigrate(false));
 ```
 
 **Go SDK**
@@ -994,49 +1108,7 @@ ov --sudo admin migrate --cleanup --output json
 
 ---
 
-### user add-location settings
-
-Per-user add defaults are stored as user config under
-`viking://user/{user_id}/settings/user_config.json`. They affect add calls that
-omit explicit targets:
-
-1. `add_resource`: explicit `to` / `parent` wins, then user
-   `add_targets.resource_uri`, then
-   `server.user_config_defaults.add_targets.resource_uri`, then legacy behavior.
-2. `add_skill`: explicit `target_uri` wins, then user
-   `add_targets.skill_uri`, then
-   `server.user_config_defaults.add_targets.skill_uri`, then legacy behavior.
-
-#### HTTP API
-
-```
-GET /api/v1/user-settings/add-locations
-PATCH /api/v1/user-settings/add-locations
-DELETE /api/v1/user-settings/add-locations
-```
-
-`PATCH` accepts the add-target fields directly. Passing `null` clears one field;
-deleting the settings clears the whole per-user override.
-
-```bash
-curl -X PATCH http://localhost:1933/api/v1/user-settings/add-locations \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: <user-key>" \
-  -d '{"resource_uri": "viking://user/resources/project-a"}'
-```
-
-`resource_uri` must be a writable resource directory URI:
-`viking://resources` or `viking://resources/...`,
-`viking://user/resources` or `viking://user/resources/...`,
-`viking://user/{user_id}/resources` or
-`viking://user/{user_id}/resources/...`, or
-`viking://user/{user_id}/peers/{peer_id}/resources` or
-`viking://user/{user_id}/peers/{peer_id}/resources/...`. `skill_uri` must be
-`viking://user/skills` or `viking://agent/skills`; explicit
-`viking://user/{user_id}/skills` is not accepted in v1. Invalid configured
-values are rejected; OpenViking does not silently fall back to another target.
-
----
+<a id="user-add-location-settings"></a>
 
 ## Full Example
 
@@ -1088,10 +1160,10 @@ curl -X POST http://localhost:1933/api/v1/admin/accounts/acme/users \
 curl -X GET http://localhost:1933/api/v1/admin/accounts/acme/users \
   -H "X-API-Key: <alice-key>"
 
-# Step 4: Change role (requires ROOT key)
+# Step 4: Promote the user to admin
 curl -X PUT http://localhost:1933/api/v1/admin/accounts/acme/users/bob/role \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: <root-key>" \
+  -H "X-API-Key: <alice-key>" \
   -d '{"role": "admin"}'
 
 # Step 5: Regenerate key

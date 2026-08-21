@@ -9,11 +9,16 @@ Provides semantic search operations: search, find.
 import asyncio
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
-from openviking.core.uri_validation import validate_optional_viking_uris
 from openviking.server.identity import RequestContext
 from openviking.session.memory.case_aggregation import normalize_case_status
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.storage.viking_fs import VikingFS
+from openviking.utils.image_search import (
+    image_bytes_to_data_uri,
+    is_data_image_uri,
+    is_http_url,
+    is_viking_uri,
+)
 from openviking_cli.exceptions import InvalidArgumentError, NotInitializedError
 from openviking_cli.utils import get_logger
 
@@ -31,7 +36,6 @@ RetrievalPurpose = Literal[
 
 
 def _case_memory_file_uri(uri: str) -> Optional[str]:
-    """Return the source Case URI for a Case hit or chunk URI."""
     source_uri = str(uri or "").split("#", 1)[0].rstrip("/")
     if "/memories/cases/" not in source_uri or not source_uri.endswith(".md"):
         return None
@@ -41,7 +45,6 @@ def _case_memory_file_uri(uri: str) -> Optional[str]:
 
 
 def _is_case_directory_summary_uri(uri: str) -> bool:
-    """Return whether a hit is a Case directory summary mixing multiple statuses."""
     source_uri = str(uri or "").split("#", 1)[0].rstrip("/")
     return "/memories/cases/" in source_uri and source_uri.endswith(
         ("/.abstract.md", "/.overview.md")
@@ -54,7 +57,7 @@ async def _apply_agent_recall_policy(
     viking_fs: VikingFS,
     ctx: RequestContext,
 ) -> Any:
-    """Hide non-promoted Case memories from Agent-facing retrieval results."""
+    """Hide draft, degraded, and archived Cases from Agent-facing recall."""
     memories = getattr(result, "memories", None)
     if not isinstance(memories, list):
         return result
@@ -110,8 +113,7 @@ async def _apply_agent_recall_policy(
             if (
                 not _is_case_directory_summary_uri(getattr(relation, "uri", ""))
                 and (
-                    (case_uri := _case_memory_file_uri(getattr(relation, "uri", "")))
-                    is None
+                    (case_uri := _case_memory_file_uri(getattr(relation, "uri", ""))) is None
                     or promoted_by_uri.get(case_uri, False)
                 )
             )
@@ -120,7 +122,6 @@ async def _apply_agent_recall_policy(
     result.memories = [context for context in memories if _is_visible(context)]
     for context in result.memories:
         _filter_relations(context)
-
     for query_result in query_results:
         matched_contexts = getattr(query_result, "matched_contexts", None)
         if not isinstance(matched_contexts, list):
@@ -140,9 +141,9 @@ async def _apply_agent_recall_policy(
     return result
 
 
-def _ensure_non_empty_query(query: str) -> None:
-    if not query.strip():
-        raise InvalidArgumentError("Search query must not be empty.")
+def _ensure_non_empty_query(query: str, image_url: Optional[str] = None) -> None:
+    if not query.strip() and not image_url:
+        raise InvalidArgumentError("Search query or image_url must not be empty.")
 
 
 class SearchService:
@@ -161,6 +162,34 @@ class SearchService:
             raise NotInitializedError("VikingFS")
         return self._viking_fs
 
+    def is_intent_enabled(self) -> bool:
+        """Whether search uses session context for LLM intent analysis.
+
+        When false, callers should skip session.load / get_context_for_search:
+        VikingFS.search ignores session_info and searches with the raw query.
+        Default is True (matches RetrievalConfig) when config is unset.
+        """
+        if not self._viking_fs or self._viking_fs.retrieval_config is None:
+            return True
+        return bool(self._viking_fs.retrieval_config.enable_intent)
+
+    async def _resolve_image_url(
+        self,
+        image_url: Optional[str],
+        ctx: RequestContext,
+    ) -> Optional[str]:
+        if not image_url:
+            return None
+        if is_viking_uri(image_url):
+            viking_fs = self._ensure_initialized()
+            content = await viking_fs.read_file_bytes(image_url, ctx=ctx)
+            return image_bytes_to_data_uri(content, image_url)
+        if is_data_image_uri(image_url) or is_http_url(image_url):
+            return image_url
+        raise InvalidArgumentError(
+            "image_url must be a data:image base64 URI, http(s) URL, or viking:// URI."
+        )
+
     async def search(
         self,
         query: str,
@@ -171,6 +200,7 @@ class SearchService:
         score_threshold: Optional[float] = None,
         filter: Optional[Dict] = None,
         level: Optional[List[int]] = None,
+        image_url: Optional[str] = None,
         retrieval_purpose: RetrievalPurpose = "general",
     ) -> Any:
         """Complex search with session context.
@@ -183,17 +213,17 @@ class SearchService:
             score_threshold: Score threshold
             filter: Metadata filters
             level: Filter by level (0=abstract, 1=overview, 2=file)
-            retrieval_purpose: Retrieval policy. Agent recall only exposes promoted Cases.
 
         Returns:
             FindResult
         """
-        _ensure_non_empty_query(query)
-        target_uri = validate_optional_viking_uris(target_uri, field_name="target_uri")
+        resolved_image_url = await self._resolve_image_url(image_url, ctx)
+        _ensure_non_empty_query(query, resolved_image_url)
         viking_fs = self._ensure_initialized()
 
         session_info = None
-        if session:
+        # Intent off: session_info is unused by VikingFS — skip the archive/message scan.
+        if session is not None and self.is_intent_enabled() and not resolved_image_url:
             session_info = await session.get_context_for_search(query)
 
         result = await viking_fs.search(
@@ -205,6 +235,7 @@ class SearchService:
             score_threshold=score_threshold,
             filter=filter,
             level=level,
+            image_url=resolved_image_url,
         )
         if retrieval_purpose == "agent_recall":
             result = await _apply_agent_recall_policy(result, viking_fs=viking_fs, ctx=ctx)
@@ -219,6 +250,7 @@ class SearchService:
         score_threshold: Optional[float] = None,
         filter: Optional[Dict] = None,
         level: Optional[List[int]] = None,
+        image_url: Optional[str] = None,
         retrieval_purpose: RetrievalPurpose = "general",
     ) -> Any:
         """Semantic search without session context.
@@ -230,13 +262,12 @@ class SearchService:
             score_threshold: Score threshold
             filter: Metadata filters
             level: Filter by level (0=abstract, 1=overview, 2=file)
-            retrieval_purpose: Retrieval policy. Agent recall only exposes promoted Cases.
 
         Returns:
             FindResult
         """
-        _ensure_non_empty_query(query)
-        target_uri = validate_optional_viking_uris(target_uri, field_name="target_uri")
+        resolved_image_url = await self._resolve_image_url(image_url, ctx)
+        _ensure_non_empty_query(query, resolved_image_url)
         viking_fs = self._ensure_initialized()
         result = await viking_fs.find(
             query=query,
@@ -246,6 +277,7 @@ class SearchService:
             score_threshold=score_threshold,
             filter=filter,
             level=level,
+            image_url=resolved_image_url,
         )
         if retrieval_purpose == "agent_recall":
             result = await _apply_agent_recall_policy(result, viking_fs=viking_fs, ctx=ctx)

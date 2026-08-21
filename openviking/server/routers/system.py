@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from openviking.core.path_variables import resolve_path_variables
-from openviking.core.uri_validation import validate_viking_uri
+from openviking.core.uri_validation import validate_request_viking_uri
 from openviking.pyagfs.exceptions import AGFSInvalidOperationError, AGFSNotSupportedError
 from openviking.server.auth import get_request_context, require_role
 from openviking.server.dependencies import get_service
@@ -69,7 +69,7 @@ async def _embedding_probe(embedder) -> str:
 
 @router.get("/health", tags=["system"])
 async def health_check(request: Request):
-    """Health check endpoint (no authentication or identity resolution required)."""
+    """Health check endpoint (no authentication required)."""
     from openviking import __version__
 
     result = {"status": "ok", "healthy": True, "version": __version__}
@@ -80,6 +80,27 @@ async def health_check(request: Request):
         if config is not None and hasattr(config, "get_effective_auth_mode"):
             effective_auth_mode = config.get_effective_auth_mode()
         result["auth_mode"] = effective_auth_mode
+
+        # Resolve identity when API key is provided
+        x_api_key = request.headers.get("X-API-Key")
+        authorization = request.headers.get("Authorization")
+
+        if x_api_key or authorization:
+            try:
+                from openviking.server.auth import resolve_identity
+
+                identity = await resolve_identity(
+                    request,
+                    x_api_key=x_api_key,
+                    authorization=authorization,
+                    x_openviking_account=request.headers.get("X-OpenViking-Account"),
+                    x_openviking_user=request.headers.get("X-OpenViking-User"),
+                )
+                result["account_id"] = str(identity.account_id)
+                result["user_id"] = str(identity.user_id)
+                result["role"] = str(identity.role)
+            except Exception as e:
+                logger.warning(f"Failed to resolve identity: {e}")
     except Exception as e:
         logger.error(f"Failed to get health check: {e}")
 
@@ -235,7 +256,7 @@ async def check_consistency(
 ):
     """Check filesystem/vector-index consistency for a URI subtree."""
     service = get_service()
-    uri = validate_viking_uri(request.uri)
+    uri = validate_request_viking_uri(resolve_path_variables(request.uri), ctx)
     result = await service.check_consistency(
         uri=uri,
         ctx=ctx,
@@ -250,7 +271,7 @@ async def backend_sync_status(
 ):
     """Return multi-write backend sync status for a Viking URI subtree."""
     service = get_service()
-    uri = validate_viking_uri(resolve_path_variables(request.uri))
+    uri = validate_request_viking_uri(resolve_path_variables(request.uri), ctx)
     result = await service.fs.system_sync_status(uri, ctx=ctx)
     return Response(status="ok", result=result)
 
@@ -262,7 +283,7 @@ async def backend_sync_retry(
 ):
     """Retry pending multi-write backend sync work for a Viking URI subtree."""
     service = get_service()
-    uri = validate_viking_uri(resolve_path_variables(request.uri))
+    uri = validate_request_viking_uri(resolve_path_variables(request.uri), ctx)
     result = await service.fs.system_sync_retry(uri, ctx=ctx)
     return Response(status="ok", result=result)
 
@@ -274,7 +295,7 @@ async def admin_sync_status(
 ):
     """Return multi-write backend sync status for one URI subtree through the admin API."""
     service = get_service()
-    uri = validate_viking_uri(resolve_path_variables(sync_path))
+    uri = validate_request_viking_uri(resolve_path_variables(sync_path), ctx)
     result = await service.fs.system_sync_status(uri, ctx=ctx)
     return Response(status="ok", result=result)
 
@@ -286,6 +307,6 @@ async def admin_sync_retry(
 ):
     """Retry pending multi-write backend sync work for one URI subtree through the admin API."""
     service = get_service()
-    uri = validate_viking_uri(resolve_path_variables(sync_path))
+    uri = validate_request_viking_uri(resolve_path_variables(sync_path), ctx)
     result = await service.fs.system_sync_retry(uri, ctx=ctx)
     return Response(status="ok", result=result)

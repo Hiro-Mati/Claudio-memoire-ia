@@ -54,9 +54,11 @@ The `find()` method performs pure vector similarity search for simple query scen
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| query | str | Yes | - | Search query string |
+| query | str | No | "" | Search query string. Required unless `image_url` is provided |
+| image_url | str | No | None | Image query as a `data:image/...;base64,...`, `http(s)://`, or `viking://` URI. Requires a multimodal embedding model |
 | target_uri | str \| List[str] | No | "" | Limit search to specific URI prefix |
 | context_type | str \| List[str] | No | None | Limit results to one or more `ContextType` values: `memory`, `resource`, or `skill` |
+| tags | List[str] | No | None | Explicit retrieval tags in strict `k=v` form. Multiple tags are combined with AND; a result must contain every requested tag |
 | node_limit | int | No | None | Maximum number of results |
 | score_threshold | float | No | None | Minimum relevance score threshold |
 | filter | Dict | No | None | Metadata filter |
@@ -71,6 +73,11 @@ The `find()` method performs pure vector similarity search for simple query scen
 - With empty `target_uri`, non-ROOT retrieval searches the current user root (`viking://user/{user}`) and shared `viking://resources`.
 - To filter the current user's peer collection to one peer for filesystem and retrieval operations, send `X-OpenViking-Actor-Peer: <peer_id>` or construct the SDK/CLI client with `actor_peer_id`. See [Multi-Tenant: Peer Collection Filter](../concepts/11-multi-tenant.md#peer-restricted-view).
 - Current-user shorthand target URIs such as `viking://user/memories`, `viking://user/resources`, and `viking://user/skills` are canonicalized from the authenticated request identity.
+
+**Image search notes**:
+- Image queries use the image vector as the query and search L2 resource leaf nodes in the target scope by default. Results are not limited to image files; multimodal embedding decides similarity between the query image and text/image resources.
+- Text-only embedding models still index image summaries, but image query input is rejected.
+- Existing image resources keep their existing vectors; image-vector recall applies to images vectorized after this capability is enabled or after a later reindex.
 
 **FindResult Structure**
 
@@ -96,7 +103,6 @@ class MatchedContext:
     category: str                    # Category
     score: float                     # Relevance score (0-1)
     match_reason: str                # Why this matched
-    relations: List[RelatedContext]  # Related contexts
 ```
 
 #### 3. Usage Examples
@@ -140,8 +146,34 @@ curl -X POST http://localhost:1933/api/v1/search/find \
     -d '{
         "query": "authentication",
         "context_type": ["memory", "resource"]
+}'
+```
+
+**Image Search**
+
+```bash
+curl -X POST http://localhost:1933/api/v1/search/find \
+    -H "Content-Type: application/json" \
+    -H "X-API-Key: your-key" \
+    -d '{
+        "image_url": "viking://resources/images/cat.png",
+        "limit": 10
     }'
 ```
+
+**Search by Explicit Retrieval Tags**
+
+```bash
+curl -X POST http://localhost:1933/api/v1/search/find \
+    -H "Content-Type: application/json" \
+    -H "X-API-Key: your-key" \
+    -d '{
+        "query": "rollback runbook",
+        "tags": ["env=prod", "team=search"]
+    }'
+```
+
+Tags must use strict `k=v` strings. When multiple tags are provided, `find()` requires all of them; the example above only returns contexts whose explicit retrieval tags contain both `env=prod` and `team=search`.
 
 **Python SDK**
 
@@ -167,6 +199,15 @@ recent_emails = client.find(
 typed_results = client.find(
     "authentication",
     context_type=[ContextType.MEMORY, ContextType.RESOURCE],
+)
+
+# Search by local image, bytes, data URI, HTTP URL, or viking:// URI
+image_results = client.find(image="/path/to/photo.png")
+
+# Search by explicit retrieval tags. Multiple tags are AND-ed.
+tagged_results = client.find(
+    "rollback runbook",
+    tags=["env=prod", "team=search"],
 )
 
 # Iterate through results
@@ -220,6 +261,12 @@ results = client.find(
 )
 ```
 
+**TypeScript SDK**
+
+```typescript
+console.log(await client.find("authentication", { targetUri: "viking://resources/docs/" }));
+```
+
 **Go SDK**
 
 ```go
@@ -259,6 +306,18 @@ openviking find "how to authenticate users" --level 0
 
 # Limit to specific level(s) (L1 and L2) using short option
 openviking find "how to authenticate users" -L 1,2
+
+# Image queries use only --image; pass a local path, viking://, http(s)://, or data:image URI
+openviking find --image ./query.png --uri "viking://resources/images" --limit 5
+
+# Search by an image already stored in VikingFS
+openviking find --image "viking://resources/images/cat.png" --uri "viking://resources/images" --limit 5
+
+# Search by a public image URL
+openviking find --image "https://example.com/images/cat.png" --uri "viking://resources/images" --limit 5
+
+# Combine text and image
+openviking find "red poster style" --image ./poster.png --uri "viking://resources/images"
 ```
 
 **Response Example**
@@ -276,7 +335,6 @@ openviking find "how to authenticate users" -L 1,2
                 "score": 0.12808319406977778,
                 "category": "",
                 "match_reason": "",
-                "relations": [],
                 "abstract": "This document is an API documentation reading plan that outlines the structure of subsequent API reference materials organized by functional module. Main sections or topics covered include resource management API, search API, file system operations, ses...",
                 "overview": null
             },
@@ -287,7 +345,6 @@ openviking find "how to authenticate users" -L 1,2
                 "score": 0.12054087276495282,
                 "category": "",
                 "match_reason": "",
-                "relations": [],
                 "abstract": "This directory contains structured API reference documentation for the OpenViking platform, compiling detailed HTTP endpoint specifications for core and extended platform capabilities. It covers functional modules including system health checks, semanti...",
                 "overview": null
             }
@@ -327,11 +384,13 @@ The `search()` method adds session context understanding and intent analysis cap
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| query | str | Yes | - | Search query string |
+| query | str | No | "" | Search query string. Required unless `image_url` is provided |
+| image_url | str | No | None | Image query as a `data:image/...;base64,...`, `http(s)://`, or `viking://` URI. Requires a multimodal embedding model |
 | target_uri | str \| List[str] | No | "" | Limit search to specific URI prefix |
 | session | Session | No | None | Session for context-aware search (SDK) |
 | session_id | str | No | None | Session ID for context-aware search (HTTP) |
 | context_type | str \| List[str] | No | None | Limit results to one or more `ContextType` values: `memory`, `resource`, or `skill` |
+| tags | List[str] | No | None | Explicit retrieval tags in strict `k=v` form. Multiple tags are combined with AND; a result must contain every requested tag |
 | node_limit | int | No | None | Maximum number of results |
 | score_threshold | float | No | None | Minimum relevance score threshold |
 | filter | Dict | No | None | Metadata filter |
@@ -342,7 +401,7 @@ The `search()` method adds session context understanding and intent analysis cap
 | include_provenance | bool | No | False | Include provenance/query-plan details in serialized result |
 | telemetry | bool \| object | No | False | Attach telemetry data to response |
 
-`search()` uses the same target resolution rules as `find()`, including the peer collection filter selected by `X-OpenViking-Actor-Peer` or SDK `actor_peer_id`.
+`search()` uses the same target resolution and explicit tag filtering rules as `find()`, including the peer collection filter selected by `X-OpenViking-Actor-Peer` or SDK `actor_peer_id`. When `image_url` is provided, `search()` uses direct image retrieval and skips session query planning.
 
 #### 3. Usage Examples
 
@@ -374,6 +433,19 @@ curl -X POST http://localhost:1933/api/v1/search/search \
     -H "X-API-Key: your-key" \
     -d '{
         "query": "how to implement OAuth 2.0 authorization code flow"
+}'
+```
+
+**Image Search**
+
+```bash
+curl -X POST http://localhost:1933/api/v1/search/search \
+    -H "Content-Type: application/json" \
+    -H "X-API-Key: your-key" \
+    -d '{
+        "query": "similar poster",
+        "image_url": "data:image/png;base64,...",
+        "limit": 10
     }'
 ```
 
@@ -422,6 +494,18 @@ for ctx in results.resources:
     print(f"Found: {ctx.uri} (score: {ctx.score:.3f})")
 ```
 
+**Image Search**
+
+```python
+results = client.search("similar poster", image="/path/to/poster.png")
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.search("authentication", { targetUri: "viking://resources/docs/" }));
+```
+
 **Go SDK**
 
 ```go
@@ -456,6 +540,9 @@ openviking search "best practices" --level 0
 
 # Limit to specific level(s) (L1 and L2) using short option
 openviking search "how to implement OAuth" -L 1,2
+
+# Image queries also use --image; they use direct retrieval and skip session planning
+openviking search "similar poster" --image ./poster.png --uri "viking://resources/images"
 ```
 
 **Response Example**
@@ -473,7 +560,6 @@ openviking search "how to implement OAuth" -L 1,2
                 "score": 0.95,
                 "category": "",
                 "match_reason": "Context-aware match: OAuth login best practices",
-                "relations": [],
                 "abstract": "OAuth 2.0 best practices for login pages...",
                 "overview": "This guide covers OAuth 2.0 best practices including secure token handling, redirect URI validation, and state parameter usage..."
             }
@@ -500,6 +586,180 @@ openviking search "how to implement OAuth" -L 1,2
     }
 }
 ```
+
+---
+
+### search(mode="context")
+
+Assemble retrieval results into an injection-ready context block. `mode="list"` (the default) returns the ranked hit list and behaves exactly like the previous `search()`; `mode="context"` opens the assembly face: budgeting, tier degradation, cross-turn dedup and the optional LLM digest all happen server-side in one request.
+
+#### 1. Implementation Overview
+
+Injecting context every turn used to mean searching per type, reading each hit back, and stitching the block together client-side. With assembly on the server, a plugin sends one request and every harness shares one budgeting, degradation and dedup implementation.
+
+**Pipeline**:
+1. **L1 query understanding**: optional bounded intent expansion from the session's recent messages (at most 3 queries, timeout fuse, falls back to the original query)
+2. **L0 retrieval**: bucketed per `quotas`, or a single whole-scope search when quotas are off
+3. **L2 assembly**: tier filling inside the token budget (everyone at their category's default tier first, then leftover budget deepens in score order); an oversized tier falls back instead of being truncated
+4. **L3 rewrite**: optional digest with URI citations (timeout fuse; on failure the unrewritten `rendered` is still returned; an exact `NO_RELEVANT_MEMORY` result is reported as `stats.rewrite="no_relevant"` so Coding Agent clients inject nothing instead of falling back to `rendered`)
+
+**Code entry points**:
+- `openviking/server/routers/search.py:_search_context()` - HTTP route branch
+- `openviking/retrieve/context_assembler/pipeline.py:assemble_context()` - assembly orchestration
+- `openviking/retrieve/context_assembler/budget.py:plan_entries()` - budgeting and tier filling
+- `openviking/retrieve/context_assembler/tiers.py` - overview extraction per source type
+
+#### 2. Parameters
+
+**L0 retrieval domain**: `query`, `image_url`, `context_type`, `limit`, `score_threshold`, `filter`, `tags`, `since`/`until` behave as in list mode. `limit` applies only to quota-free retrieval. Once `purpose` or explicit `quotas` enables bucketed retrieval, the per-category quotas are the only candidate ceilings. `target_uri` is not supported in context mode yet (returns 400); `level` is ignored because `detail` governs tiers.
+
+**L1 query understanding**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `session_id` | str | None | Required to enable query expansion and server-side dedup |
+| `query_expansion` | `off` \| `auto` | `auto` | Bounded session-aware expansion; falls back to the original query without a session or on failure |
+
+**L2 assembly**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `limit` | int | 10 | Candidate ceiling for quota-free retrieval only; ignored when `purpose` or `quotas` enables bucketed retrieval |
+| `max_tokens` | int | 1600 | The single budget parameter, estimated with a CJK-aware heuristic (codepoint ≥ 0x3000 counts 1.5 tok/char, otherwise chars/4) |
+| `quotas` | object | None | Absolute per-bucket limits; keys are `events`/`entities`/`preferences`/`experiences`/`resources`/`skills`. Explicit quotas ignore `limit` |
+| `purpose` | `chat` \| `coding` | None | Enables six-domain bucket sampling with the absolute preset quotas below. Applies only when `quotas` is not given |
+| `detail` | `abstract` \| `overview` \| `full` \| object | None | Requests one starting/maximum tier for every entry. Entries whose requested tier is unavailable or does not fit step down instead of being truncated. Omitted, each category takes its default tier (below). Also accepts a per-category object such as `{"events":"overview","preferences":"abstract"}`; categories left out keep their default. `"auto"` is a deprecated spelling and behaves as if omitted |
+| `dedup_turns` | int | 0 | Cooldown window in turns; needs `session_id`. Ledger lives at `{session_uri}/.recall_log.json` |
+| `exclude_uris` | string[] | [] | Stateless dedup fallback, up to 200 entries, unioned with `dedup_turns` |
+| `peer_scope` | `actor` \| `all` | `all` | `actor` excludes other peers while keeping global, self-owned and current-actor content |
+| `other_peer_penalty` | number \| object | per-category defaults | Score penalty applied to other-peer hits |
+
+**L3 rewrite**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `rewrite` | bool \| `auto` | `false` | Server-side digest rewrite; `auto` engages only when a query_planner model is configured |
+| `rewrite_max_bullets` | int | 6 | Digest bullet ceiling (1–20) |
+
+**Tier rules**
+
+- **Purpose presets**: `chat` uses `events:3, entities:3, preferences:1, experiences:1, resources:1, skills:1`; `coding` uses `events:1, entities:2, preferences:1, experiences:1, resources:3, skills:2`. These are absolute per-category ceilings, not weights. Results are deduplicated and globally sorted after gathering, but are not truncated by a second global `limit`
+- **Default tier per category**: with `detail` omitted, each category lands on the tier below. Only `events` reads a file; every other category costs no read
+
+  | Category | Default tier | Leftover budget may reach | Why |
+  |----------|--------------|---------------------------|-----|
+  | `events` | overview | full | The one memory type whose body is long enough for `# Summary` extraction to be a real compression |
+  | `entities` / `preferences` / `experiences` | abstract | abstract | Short bodies, and the writer stores the whole body in the abstract scalar, so abstract already is the complete file |
+  | `resources` / `skills` | abstract | abstract | The 256-char abstract from semantic processing; bodies can be large or carry credentials, so deepening is opt-in |
+  | `memories` | abstract | abstract | Built-in memory types outside the four named ones — `cases`, `patterns`, `tools`, `trajectories`, skill-usage memories. Only quota-free retrieval reaches them; they own no bucket, so `quotas` cannot name them, but `detail` and `other_peer_penalty` can |
+  | Directory hits | overview | overview | A directory has no abstract, so it reads the `.overview.md` sidecar; a full tier is meaningless for a subtree |
+
+- **Floor**: every result carries at least its `uri`. When a memory abstract is unavailable or busts the per-entry cap, the entry falls back to overview: the memory writer stores the whole body in that scalar, so for memory categories overview sits *below* abstract on the content ladder and the substitute discloses less. A `resources` or `skills` abstract is the short generated summary instead, so the same substitution would read a body the caller never asked for — those two degrade to a bare `uri` rather than deepen
+- **Explicit `detail`**: sets that tier as both the requested start and ceiling; entries that do not fit still step down a tier rather than being truncated. The memory overview substitute above is the one case where the served `detail` can outrank the pin, and only because it carries less content than the pinned tier would
+- **Overview by source type**: memory files use the leading `# Summary` section, code files use class and function signatures (reusing `code_outline`), long documents use the heading tree plus first paragraph
+- **Per-entry cap**: `max_tokens ÷ candidate_count × 2`, applied to every tier except the bare `uri`; a tier exceeding it falls back to the previous tier rather than being truncated. If budget is still left over, one final deepening pass ignores the cap and is bounded only by `max_tokens`
+
+#### 3. Examples
+
+**HTTP API**
+
+```bash
+# Basic context assembly
+curl -X POST http://localhost:1933/api/v1/search/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENVIKING_API_KEY" \
+  -d '{"query":"what changed on this branch","mode":"context","max_tokens":1600}'
+
+# Session-aware: query expansion plus cross-turn dedup
+curl -X POST http://localhost:1933/api/v1/search/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENVIKING_API_KEY" \
+  -d '{
+    "query":"continue that refactor",
+    "mode":"context",
+    "session_id":"cc-1a2b3c",
+    "query_expansion":"auto",
+    "dedup_turns":5,
+    "purpose":"coding",
+    "max_tokens":3000
+  }'
+
+# With the server-side digest rewrite
+curl -X POST http://localhost:1933/api/v1/search/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENVIKING_API_KEY" \
+  -d '{"query":"tier design","mode":"context","max_tokens":3000,"rewrite":true}'
+```
+
+**Response**
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "entries": [
+      {
+        "uri": "viking://user/default/memories/events/2026/07/14/tier_design.md",
+        "category": "events",
+        "score": 0.45,
+        "detail": "full",
+        "text": "# Summary\nTiers now take a per-category default\n...",
+        "origin": "self"
+      },
+      {
+        "uri": "viking://user/default/memories/entities/software/openviking_fs.md",
+        "category": "entities",
+        "score": 0.43,
+        "detail": "abstract",
+        "text": "OpenViking FS storage layer...",
+        "origin": "self"
+      }
+    ],
+    "rendered": "<memory uri=\"viking://user/default/memories/events/2026/07/14/tier_design.md\" type=\"events\" score=\"0.45\" detail=\"full\">\n# Summary\n...\n</memory>",
+    "digest": "",
+    "stats": {
+      "candidates": 13,
+      "returned": 13,
+      "dropped": 0,
+      "deduped": 0,
+      "max_tokens": 3000,
+      "used_tokens": 2510,
+      "per_entry_cap": 462,
+      "detail": null,
+      "tier_counts": {"full": 4, "overview": 2, "abstract": 7},
+      "fill": {"floor_tokens": 1890, "overview_upgrades": 0, "full_upgrades": 4, "spare_upgrades": 0},
+      "query_expansion": "used",
+      "rewrite": "off",
+      "rewrite_usage": null,
+      "excluded": 0,
+      "dedup": {"turns": 5, "status": "ok", "cooled": 2, "turn": 34}
+    }
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `entries[].uri` | string | Entry URI, always present at every tier, expandable with the MCP `read` tool |
+| `entries[].category` | string | `events`/`entities`/`preferences`/`experiences`/`resources`/`skills`, or `memories` for a built-in memory type outside those four |
+| `entries[].detail` | string | Tier actually served: `full`, `overview`, `abstract` or `uri` |
+| `entries[].text` | string | Body for that tier; empty at the `uri` tier |
+| `rendered` | string | Flat XML context block, ready to inject; empty when rewrite reports `no_relevant` |
+| `digest` | string | Digest when the rewrite succeeded, empty string on failure or when the compressor reports no relevant memory |
+| `stats` | object | Budget usage, tier distribution, expansion and rewrite status (`off`, `ok`, `no_relevant`, `failed` or `timeout`), dedup ledger state; carries `retrieval_errors` when a retrieval scope failed, so a broken index is distinguishable from having no relevant memories |
+
+When `stats.rewrite` is `no_relevant`, the response keeps `entries` for
+inspection but returns both `digest` and `rendered` as empty strings. This makes
+the successful empty result safe for clients that predate the explicit status.
+Nothing was served that turn, so those URIs also stay out of the `dedup_turns`
+ledger and remain available to the later turn they are relevant to.
+
+**Validation rules**
+
+- Any context-only parameter sent explicitly under `mode="list"` → 400
+- `target_uri` under `mode="context"` → 400
+- Unknown `quotas` key → 400
+- Fields ignored in context mode (`level`, and `limit` when `purpose` or explicit quotas are active) are reported in `stats.ignored`
 
 ---
 
@@ -532,7 +792,7 @@ The `grep()` method performs regex pattern matching search in the file system, u
 | pattern | str | Yes | - | Search pattern (regex) |
 | case_insensitive | bool | No | False | Ignore case |
 | exclude_uri | str | No | None | URI prefix to exclude from search |
-| node_limit | int | No | None | Maximum number of results |
+| node_limit | int | No | 256 | Maximum number of results. Omitted requests default to 256; pass a larger integer when you need more results |
 | level_limit | int | No | Python SDK: 5; HTTP API / CLI / Go SDK: 10 | Maximum directory depth to traverse. The Go SDK currently uses the HTTP API default. |
 
 #### 3. Usage Examples
@@ -565,7 +825,8 @@ client.initialize()
 results = client.grep(
     "viking://resources",
     "authentication",
-    case_insensitive=True
+    case_insensitive=True,
+    node_limit=1024,
 )
 
 print(f"Found {results['count']} matches")
@@ -574,11 +835,19 @@ for match in results['matches']:
     print(f"    {match['content']}")
 ```
 
+**TypeScript SDK**
+
+```typescript
+console.log(await client.grep("viking://resources/docs/", "authentication"));
+```
+
 **Go SDK**
 
 ```go
+nodeLimit := 1024
 result, err := client.Grep(ctx, "viking://resources", "authentication", &openviking.GrepOptions{
     CaseInsensitive: true,
+    NodeLimit:       &nodeLimit,
 })
 if err != nil {
     return err
@@ -635,7 +904,7 @@ The `glob()` method uses file wildcard pattern matching URIs, similar to Unix sh
 - `[]` matches character range
 
 **Code Entry Points**:
-- `openviking_cli/client/sync_http.py:SyncHTTPClient.glob()` - Python SDK entry (HTTP)
+- `sdk/python/openviking_sdk/client.py:SyncHTTPClient.glob()` - Python SDK entry (HTTP)
 - `openviking/server/routers/search.py:glob()` - HTTP router
 - `crates/ov_cli/src/commands/search.rs:glob()` - Rust CLI command
 
@@ -647,7 +916,7 @@ The `glob()` method uses file wildcard pattern matching URIs, similar to Unix sh
 |-----------|------|----------|---------|-------------|
 | pattern | str | Yes | - | Glob pattern (e.g., `**/*.md`) |
 | uri | str | No | "viking://" | Starting URI |
-| node_limit | int | No | None | Maximum number of matches to return |
+| node_limit | int | No | 256 | Maximum number of matches to return. Omitted requests default to 256; pass a larger integer when you need more results |
 
 #### 3. Usage Examples
 
@@ -675,21 +944,29 @@ import openviking as ov
 client = ov.SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
 client.initialize()
 
-# Find all markdown files
+# Find all markdown files (defaults to returning at most 256 matches)
 results = client.glob("**/*.md", "viking://resources")
 print(f"Found {results['count']} markdown files:")
 for uri in results['matches']:
     print(f"  {uri}")
 
-# Find all Python files
-results = client.glob("**/*.py", "viking://resources")
+# Find all Python files with a higher explicit cap
+results = client.glob("**/*.py", "viking://resources", node_limit=1024)
 print(f"Found {results['count']} Python files")
+```
+
+**TypeScript SDK**
+
+```typescript
+console.log(await client.glob("**/*.md", "viking://resources/docs/"));
 ```
 
 **Go SDK**
 
 ```go
-result, err := client.Glob(ctx, "**/*.md", "viking://resources")
+result, err := client.Glob(ctx, "**/*.md", "viking://resources", &openviking.GlobOptions{
+    NodeLimit: openviking.Int(1024),
+})
 if err != nil {
     return err
 }
@@ -769,35 +1046,6 @@ curl -X GET "http://localhost:1933/api/v1/content/overview?uri=viking://resource
 
 # Step 3: Read full content for file result
 curl -X GET "http://localhost:1933/api/v1/content/read?uri=viking://resources/docs/auth.md" \
-    -H "X-API-Key: your-key"
-```
-
-### Get Related Resources
-
-**Python SDK**
-
-```python
-import openviking as ov
-
-client = ov.SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
-client.initialize()
-
-results = client.find("OAuth implementation")
-
-for ctx in results.resources:
-    print(f"Found: {ctx.uri}")
-
-    # Get related resources
-    relations = client.relations(ctx.uri)
-    for rel in relations:
-        print(f"  Related: {rel['uri']} - {rel['reason']}")
-```
-
-**HTTP API**
-
-```bash
-# Get relations for resource
-curl -X GET "http://localhost:1933/api/v1/relations?uri=viking://resources/docs/auth" \
     -H "X-API-Key: your-key"
 ```
 

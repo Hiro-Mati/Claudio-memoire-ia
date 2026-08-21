@@ -3,10 +3,11 @@
 import asyncio
 import itertools
 import json
+import tempfile
 import time
 from abc import ABC
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import httpx
 from loguru import logger
@@ -14,41 +15,53 @@ from loguru import logger
 from vikingbot.agent.tools.base import Tool, ToolContext
 from vikingbot.openviking_mount.ov_server import VikingClient
 
+if TYPE_CHECKING:
+    from vikingbot.config.schema import Config
+
 
 class OVFileTool(Tool, ABC):
     _memory_commit_counter = itertools.count(1)
 
-    def __init__(self):
+    def __init__(self, config: "Config | None" = None):
         super().__init__()
         self._clients = {}
+        self._config = config
 
     @staticmethod
     def _has_request_connection(tool_context: ToolContext) -> bool:
         return bool(getattr(tool_context, "openviking_connection", None))
 
+    @staticmethod
+    def _actor_peer_id(tool_context: ToolContext) -> str | None:
+        return getattr(tool_context, "actor_peer_id", None) or getattr(
+            tool_context, "sender_id", None
+        )
+
     async def _get_client(self, tool_context: ToolContext):
-        actor_peer_id = getattr(tool_context, "sender_id", None)
+        actor_peer_id = self._actor_peer_id(tool_context)
         if self._has_request_connection(tool_context):
             return await VikingClient.create(
                 tool_context.workspace_id,
                 connection=tool_context.openviking_connection,
                 actor_peer_id=actor_peer_id,
+                config=self._config,
             )
         if actor_peer_id:
             return await VikingClient.create(
                 tool_context.workspace_id,
                 actor_peer_id=actor_peer_id,
+                config=self._config,
             )
         cache_key = str(tool_context.workspace_id or "__default__")
         client = self._clients.get(cache_key)
         if client is None:
-            client = await VikingClient.create(tool_context.workspace_id)
+            client = await VikingClient.create(tool_context.workspace_id, config=self._config)
             self._clients[cache_key] = client
         return client
 
     async def _release_client(self, tool_context: ToolContext, client: VikingClient | None) -> None:
         if client is not None and (
-            self._has_request_connection(tool_context) or getattr(tool_context, "sender_id", None)
+            self._has_request_connection(tool_context) or self._actor_peer_id(tool_context)
         ):
             close = getattr(client, "close", None)
             if callable(close):
@@ -78,7 +91,7 @@ class OVFileTool(Tool, ABC):
     def _memory_peer_ids(self, tool_context: ToolContext) -> list[str]:
         return self._dedupe_strings(
             [
-                getattr(tool_context, "sender_id", None),
+                self._actor_peer_id(tool_context),
                 *(getattr(tool_context, "memory_peer_ids", None) or []),
             ]
         )
@@ -186,6 +199,7 @@ class VikingListTool(OVFileTool):
         tool_context: "ToolContext",
         uri: str = "viking://",
         recursive: bool = False,
+        node_limit: int = 1000,
         **kwargs: Any,
     ) -> str:
         client = None
@@ -196,7 +210,11 @@ class VikingListTool(OVFileTool):
             for target_uri in target_uris:
                 try:
                     entries.extend(
-                        await client.list_resources(path=target_uri, recursive=recursive)
+                        await client.list_resources(
+                            path=target_uri,
+                            recursive=recursive,
+                            node_limit=node_limit,
+                        )
                     )
                 except Exception as exc:
                     if len(target_uris) == 1:
@@ -497,28 +515,53 @@ class VikingAddResourceTool(OVFileTool):
             "properties": {
                 "path": {"type": "string", "description": "Url or local file path"},
                 "description": {"type": "string", "description": "Description of the resource"},
+                "to": {
+                    "type": "string",
+                    "description": "Optional exact target URI under viking://resources/. When omitted, OpenViking chooses the resource URI.",
+                },
             },
             "required": ["path", "description"],
         }
+
+    @property
+    def resource_inputs(self) -> dict[str, str]:
+        return {"path": "local_file"}
 
     async def execute(
         self,
         tool_context: "ToolContext",
         path: str,
         description: str,
+        to: Optional[str] = None,
         **kwargs: Any,
     ) -> str:
         client = None
+        temp_dir: tempfile.TemporaryDirectory[str] | None = None
         try:
+            upload_path = path
             if path and not path.startswith("http"):
-                local_path = Path(path).expanduser().resolve()
-                if not local_path.exists():
-                    return f"Error: File not found: {path}"
-                if not local_path.is_file():
-                    return f"Error: Not a file: {path}"
+                if tool_context.sandbox_manager is not None:
+                    sandbox = await tool_context.sandbox_manager.get_sandbox(
+                        tool_context.session_key
+                    )
+                    local_path = sandbox.local_file_path(path)
+                    if local_path is not None:
+                        upload_path = str(local_path)
+                    else:
+                        temp_dir = tempfile.TemporaryDirectory(prefix="vikingbot-add-resource-")
+                        local_path = Path(temp_dir.name) / (Path(path).name or "resource")
+                        await sandbox.export_file(path, local_path)
+                        upload_path = str(local_path)
+                else:
+                    local_path = Path(path).expanduser().resolve()
+                    if not local_path.exists():
+                        return f"Error: File not found: {path}"
+                    if not local_path.is_file():
+                        return f"Error: Not a file: {path}"
+                    upload_path = str(local_path)
 
             client = await self._get_client(tool_context)
-            result = await client.add_resource(path, description)
+            result = await client.add_resource(upload_path, description, to=to)
 
             if result:
                 root_uri = result.get("root_uri", "")
@@ -532,6 +575,8 @@ class VikingAddResourceTool(OVFileTool):
             return f"Error adding resource to Viking: {str(e)}"
         finally:
             await self._release_client(tool_context, client)
+            if temp_dir is not None:
+                temp_dir.cleanup()
 
 
 class VikingGrepTool(OVFileTool):
@@ -804,13 +849,14 @@ class VikingMemoryCommitTool(OVFileTool):
         client = None
         try:
             client = await self._get_client(tool_context)
-            if not tool_context.sender_id:
+            actor_peer_id = self._actor_peer_id(tool_context)
+            if not actor_peer_id:
                 return "Error: peer id is required for OpenViking memory commit."
             source_session_id = tool_context.session_key.safe_name()
             commit_seq = next(self._memory_commit_counter)
             timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
             session_id = f"{source_session_id}__memory_commit__{timestamp}__{commit_seq:04d}"
-            result = await client.commit(session_id, messages, peer_id=tool_context.sender_id)
+            result = await client.commit(session_id, messages, peer_id=actor_peer_id)
             session_id = (
                 result.get("session_id", session_id) if isinstance(result, dict) else session_id
             )
@@ -898,6 +944,11 @@ class VikingMultiReadTool(OVFileTool):
                 async with semaphore:
                     try:
                         content = await client.read_content(uri, level=level)
+                        skill_runtime = getattr(tool_context, "skill_runtime", None)
+                        if skill_runtime is not None:
+                            active_skill = await skill_runtime.activate_from_read(uri, content)
+                            if active_skill is not None:
+                                content = skill_runtime.render_skill_content(active_skill)
                         return {
                             "uri": uri,
                             "content": content,

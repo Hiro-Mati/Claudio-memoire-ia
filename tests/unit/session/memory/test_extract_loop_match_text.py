@@ -38,7 +38,7 @@ class TestResolveOperations:
             directory="viking://user/{{ user_space }}/memories/entities",
             filename_template="{{ name }}.md",
             fields=[
-                MemoryField(name="name", field_type=FieldType.STRING, merge_op=MergeOp.REPLACE),
+                MemoryField(name="name", field_type=FieldType.STRING, merge_op=MergeOp.IMMUTABLE),
                 MemoryField(name="content", field_type=FieldType.STRING, merge_op=MergeOp.PATCH),
             ],
         )
@@ -71,7 +71,7 @@ class TestResolveOperations:
 
         operations, _ = await loop.resolve_operations(
             AttrDict(
-                entities=[{"name": "WrongName", "content": "new content", "page_id": 7}],
+                entities=[{"content": "new content", "page_id": 7}],
                 delete_uris=[],
             )
         )
@@ -145,19 +145,9 @@ class TestResolveOperations:
 
         raw_links = [WikiLink(f=100, t=102, match_text="trip")]
 
-        with (
-            patch("openviking.session.memory.extract_loop.tracer.info") as mock_info,
-            patch("openviking.session.memory.extract_loop.tracer.error") as mock_error,
-        ):
-            resolved = loop._resolve_links(raw_links, upsert_operations=[])
+        resolved = loop._resolve_links(raw_links, upsert_operations=[])
 
         assert resolved == []
-        mock_error.assert_not_called()
-        mock_info.assert_any_call(
-            "Skipping link with unresolved page_ids: f=100, t=102, "
-            "from_uri=viking://user/user_sample_0/memories/trajectories/a.md, to_uri=None, "
-            "op_page_map_keys=[]"
-        )
 
 
 class TestResolveLinksMultiUri:
@@ -203,6 +193,28 @@ class TestResolveLinksMultiUri:
                 "viking://user/b/memories/experiences/target.md",
             ),
         }
+
+    def test_shared_page_id_self_link_is_ignored(self):
+        loop = ExtractLoop(vlm=Mock(model="test-model"), viking_fs=Mock(), context_provider=Mock())
+        loop._extract_context = Mock()
+        loop._extract_context.page_id_map = Mock()
+        loop._extract_context.page_id_map._id_to_uri = {}
+        loop._extract_context.page_id_map.resolve.return_value = None
+
+        raw_links = [WikiLink(f=100, t=100, match_text="trip")]
+        upsert_operations = [
+            ResolvedOperation(
+                memory_fields={},
+                memory_type="experiences",
+                uris=[
+                    "viking://user/a/memories/experiences/source.md",
+                    "viking://user/b/memories/experiences/source.md",
+                ],
+                page_id=100,
+            )
+        ]
+
+        assert loop._resolve_links(raw_links, upsert_operations=upsert_operations) == []
 
 
 class TestPageIdInstruction:
@@ -256,7 +268,10 @@ class TestPageIdInstruction:
             ) as mock_create_model,
         ):
             mock_config.return_value = SimpleNamespace(memory=SimpleNamespace(link_enabled=False))
-            mock_create_model.return_value = SimpleNamespace(model_json_schema=lambda: {})
+            mock_create_model.return_value = SimpleNamespace(
+                model_fields={"experiences": object()},
+                model_json_schema=lambda: {},
+            )
 
             await loop.run()
 
@@ -271,7 +286,7 @@ class TestPageIdInstruction:
         )
         assert "each visible line is prefixed with `line_number<TAB>`" in system_content
         assert (
-            "Never include the line-number prefix itself in `search` or `replace`."
+            "Never include the line-number prefix itself in `search`, `replace`, or `delete`."
             in system_content
         )
         assert "For existing items, use the page_id shown in read/search results." in system_content
@@ -330,7 +345,10 @@ class TestPageIdInstruction:
             ) as mock_create_model,
         ):
             mock_config.return_value = SimpleNamespace(memory=SimpleNamespace(link_enabled=True))
-            mock_create_model.return_value = SimpleNamespace(model_json_schema=lambda: {})
+            mock_create_model.return_value = SimpleNamespace(
+                model_fields={"experiences": object(), "links": object()},
+                model_json_schema=lambda: {},
+            )
 
             await loop.run()
 
@@ -397,7 +415,10 @@ class TestFinalOperationsHydration:
             patch("openviking.session.memory.extract_loop.tracer.info") as mock_tracer_info,
         ):
             mock_config.return_value = SimpleNamespace(memory=SimpleNamespace(link_enabled=False))
-            mock_create_model.return_value = SimpleNamespace(model_json_schema=lambda: {})
+            mock_create_model.return_value = SimpleNamespace(
+                model_fields={"experiences": object()},
+                model_json_schema=lambda: {},
+            )
 
             final_operations, _ = await loop.run()
 

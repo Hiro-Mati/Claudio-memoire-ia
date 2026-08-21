@@ -20,45 +20,17 @@
  *   - GET    /api/v1/sessions/{id}/context?token_budget=N
  */
 
-const OV_SESSION_PREFIX = "cc-";
-
-/**
- * Glob → RegExp. Minimal implementation: supports `*` (any chars except /),
- * `**` (any chars including /), and literal text. Sufficient for the few
- * bypass patterns users are likely to configure.
- */
-function globToRe(glob) {
-  let re = "^";
-  for (let i = 0; i < glob.length; i++) {
-    const c = glob[i];
-    if (c === "*") {
-      if (glob[i + 1] === "*") { re += ".*"; i++; }
-      else re += "[^/]*";
-    } else if (/[.+?^${}()|[\]\\]/.test(c)) {
-      re += "\\" + c;
-    } else {
-      re += c;
-    }
-  }
-  re += "$";
-  return new RegExp(re);
-}
+import {
+  deriveHarnessSessionId,
+  isBypassed,
+} from "../shared/session-model.mjs";
+import { isRetryableFailure as isSharedRetryableFailure } from "../shared/retryable.mjs";
 
 /**
  * Check whether a CC session_id or cwd matches any bypass pattern.
  * Also honours OPENVIKING_BYPASS_SESSION env var (via cfg.bypassSession).
  */
-export function isBypassed(cfg, { sessionId, cwd } = {}) {
-  if (cfg.bypassSession) return true;
-  const patterns = cfg.bypassSessionPatterns || [];
-  if (patterns.length === 0) return false;
-  const haystacks = [sessionId, cwd].filter(Boolean);
-  for (const pat of patterns) {
-    const re = globToRe(pat);
-    if (haystacks.some((h) => re.test(h))) return true;
-  }
-  return false;
-}
+export { isBypassed };
 
 /**
  * Derive a stable OV session ID from a CC session_id.
@@ -68,13 +40,11 @@ export function isBypassed(cfg, { sessionId, cwd } = {}) {
  * characters outside [A-Za-z0-9._-] become `-`. Result: `cc-<uuid>__<suffix>`.
  */
 export function deriveOvSessionId(ccSessionId, suffix = "") {
-  if (!ccSessionId || typeof ccSessionId !== "string") {
-    throw new Error("deriveOvSessionId requires a non-empty ccSessionId");
-  }
-  const base = `${OV_SESSION_PREFIX}${ccSessionId}`;
-  if (!suffix) return base;
-  const normalized = String(suffix).replace(/:/g, "-").replace(/[^A-Za-z0-9._-]/g, "-");
-  return `${base}__${normalized}`;
+  return deriveHarnessSessionId("cc-", ccSessionId, suffix);
+}
+
+function responseTraceId(body) {
+  return body?.result?.trace_id || body?.error?.trace_id || body?.trace_id || undefined;
 }
 
 /**
@@ -82,8 +52,9 @@ export function deriveOvSessionId(ccSessionId, suffix = "") {
  * (from scripts/config.mjs loadConfig()) so the timeout can vary per hook.
  */
 export function makeFetchJSON(cfg, timeoutKey = "timeoutMs") {
-  const timeoutMs = Math.max(1000, cfg[timeoutKey] || cfg.timeoutMs || 10000);
+  const defaultTimeoutMs = Math.max(1000, cfg[timeoutKey] || cfg.timeoutMs || 10000);
   return async function fetchJSON(path, init = {}, options = {}) {
+    const timeoutMs = Math.max(1000, Number(options.timeoutMs) || defaultTimeoutMs);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -93,12 +64,19 @@ export function makeFetchJSON(cfg, timeoutKey = "timeoutMs") {
       if (cfg.userId) headers["X-OpenViking-User"] = cfg.userId;
       const actorPeerId = options.actorPeerId ?? "";
       if (actorPeerId) headers["X-OpenViking-Actor-Peer"] = actorPeerId;
+      if (cfg.userAgent) headers["User-Agent"] = cfg.userAgent;
       const res = await fetch(`${cfg.baseUrl}${path}`, { ...init, headers, signal: controller.signal });
       const body = await res.json().catch(() => ({}));
+      const traceId = responseTraceId(body);
       if (!res.ok || body.status === "error") {
-        return { ok: false, status: res.status, error: body.error || { message: `HTTP ${res.status}` } };
+        return {
+          ok: false,
+          status: res.status,
+          error: body.error || { message: `HTTP ${res.status}` },
+          traceId,
+        };
       }
-      return { ok: true, result: body.result ?? body };
+      return { ok: true, result: body.result ?? body, traceId };
     } catch (err) {
       return { ok: false, error: { message: err?.message || String(err) } };
     } finally {
@@ -108,9 +86,7 @@ export function makeFetchJSON(cfg, timeoutKey = "timeoutMs") {
 }
 
 export function isRetryableFailure(res) {
-  if (!res || res.ok) return false;
-  const status = Number(res.status || 0);
-  return !status || status >= 500 || status === 408 || status === 429;
+  return isSharedRetryableFailure(res);
 }
 
 function warnNonRetryable(operation, res) {
@@ -161,14 +137,14 @@ export async function addMessage(fetchJSON, sessionId, payload) {
  * Commit the persistent OV session (archive + background extract). Safe to
  * call repeatedly: if there are no pending messages the server is a no-op.
  */
-export async function commitSession(fetchJSON, sessionId) {
+export async function commitSession(fetchJSON, sessionId, payload = {}) {
   const res = await fetchJSON(`/api/v1/sessions/${encodeURIComponent(sessionId)}/commit`, {
     method: "POST",
-    body: JSON.stringify({}),
+    body: JSON.stringify(payload || {}),
   });
   if (!res.ok) {
     if (isRetryableFailure(res)) {
-      const queued = await enqueuePendingDirectly("commitSession", sessionId, {});
+      const queued = await enqueuePendingDirectly("commitSession", sessionId, payload || {});
       if (queued.ok) res.pendingQueued = true;
       else res.pendingEnqueueFailed = true;
     } else {

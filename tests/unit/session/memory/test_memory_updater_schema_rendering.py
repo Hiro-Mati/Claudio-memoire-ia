@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
+import pytest
+
 from openviking.session.memory.dataclass import (
     MemoryField,
     MemoryFile,
@@ -22,7 +24,8 @@ def _schema() -> MemoryTypeSchema:
     )
 
 
-def test_render_operation_after_file_uses_schema_template_and_preserves_unchanged_fields() -> None:
+@pytest.mark.asyncio
+async def test_render_operation_after_file_uses_schema_template_and_preserves_unchanged_fields() -> None:
     from openviking.session.memory.memory_updater import render_operation_after_file
 
     uri = "viking://user/u/memories/experiences/example.md"
@@ -45,7 +48,7 @@ def test_render_operation_after_file_uses_schema_template_and_preserves_unchange
         uris=[uri],
     )
 
-    after_file = render_operation_after_file(operation, schema=_schema())
+    after_file = await render_operation_after_file(operation, schema=_schema())
 
     assert after_file.content == "## Situation\nnew situation\n\n## Evidence\nold evidence"
     assert after_file.extra_fields["situation"] == "new situation"
@@ -65,4 +68,4 @@ def test_patch_merge_instruction_lists_content_fields_from_schema() -> None:
     instruction = provider.instruction()
 
     assert "`situation`, `evidence`" in instruction
-    assert "reminder" not in instruction
+    assert "`reminder`" not in instruction

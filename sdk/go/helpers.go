@@ -1,9 +1,14 @@
 package openviking
 
 import (
+	"encoding/base64"
 	"fmt"
+	"mime"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 func setString(m map[string]any, key, value string) {
@@ -70,6 +75,11 @@ func Float64(v float64) *float64 {
 	return &v
 }
 
+// Map returns a map pointer for request fields that distinguish null from omitted.
+func Map(v map[string]any) *map[string]any {
+	return &v
+}
+
 func queryBool(values url.Values, key string, value bool) {
 	values.Set(key, strconv.FormatBool(value))
 }
@@ -104,4 +114,32 @@ func normalizeTarget(target any) any {
 	default:
 		return v
 	}
+}
+
+func normalizeImageInput(image string) (string, error) {
+	if image == "" || strings.HasPrefix(image, "data:image/") ||
+		strings.HasPrefix(image, "http://") ||
+		strings.HasPrefix(image, "https://") ||
+		strings.HasPrefix(image, "viking://") {
+		return image, nil
+	}
+	info, err := os.Stat(image)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return image, nil
+		}
+		return "", err
+	}
+	if info.IsDir() {
+		return image, nil
+	}
+	data, err := os.ReadFile(image)
+	if err != nil {
+		return "", err
+	}
+	mimeType := mime.TypeByExtension(strings.ToLower(filepath.Ext(image)))
+	if mimeType == "" || !strings.HasPrefix(mimeType, "image/") {
+		mimeType = "image/png"
+	}
+	return fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(data)), nil
 }

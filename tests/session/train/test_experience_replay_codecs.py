@@ -85,7 +85,6 @@ def test_request_context_codec_preserves_custom_role_and_identity() -> None:
         user=UserIdentifier(account_id="account", user_id="user"),
         role=Role("reviewer"),
         actor_peer_id="peer-1",
-        legacy_agent_id="legacy-1",
         from_oauth=True,
     )
 

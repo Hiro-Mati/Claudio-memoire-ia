@@ -49,7 +49,6 @@ class RequestContextReplayCodec:
             "user": encode(value.user.to_dict()),
             "role": encode(str(value.role)),
             "actor_peer_id": encode(value.actor_peer_id),
-            "legacy_agent_id": encode(value.legacy_agent_id),
             "from_oauth": encode(value.from_oauth),
         }
 
@@ -62,7 +61,6 @@ class RequestContextReplayCodec:
             user=UserIdentifier.from_dict(user),
             role=Role(decode(_encoded(payload, "role"))),
             actor_peer_id=decode(_encoded(payload, "actor_peer_id")),
-            legacy_agent_id=decode(_encoded(payload, "legacy_agent_id")),
             from_oauth=decode(_encoded(payload, "from_oauth")),
         )
 

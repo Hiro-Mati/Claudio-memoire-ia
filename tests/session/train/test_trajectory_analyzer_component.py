@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from openviking.message import Message, TextPart
+from openviking.message import Message, TextPart, ToolPart
 from openviking.session.memory.dataclass import ResolvedOperation, ResolvedOperations
 from openviking.session.train import (
     Case,
@@ -238,6 +238,31 @@ class FakeExtractLoop:
         )
 
 
+class FakeSkillOnlyExtractLoop(FakeExtractLoop):
+    async def run(self):
+        return (
+            ResolvedOperations(
+                upsert_operations=[
+                    ResolvedOperation(
+                        old_memory_file_content=None,
+                        memory_fields={
+                            "skill_name": "code-review",
+                            "description": "Review code carefully",
+                            "content": "## Workflow\n- Read the changed files first.",
+                        },
+                        memory_type="session_skills",
+                        uris=["viking://user/u/skills/code-review/SKILL.md"],
+                        page_id=100,
+                    )
+                ],
+                delete_file_contents=[],
+                errors=[],
+                resolved_links=[],
+            ),
+            [],
+        )
+
+
 class FakeVikingFS:
     agfs = None
 
@@ -253,7 +278,8 @@ class FakeVikingFS:
             raise FileNotFoundError(uri)
         return {"uri": uri}
 
-    async def write_file(self, uri, content, ctx=None):
+    async def write_file(self, uri, content, ctx=None, lock_handle=None, lease_ref=None):
+        del lock_handle, lease_ref
         self.files[uri] = content
         self.writes.append((uri, content, ctx))
 
@@ -315,10 +341,28 @@ async def test_trajectory_rollout_analyzer_extracts_and_persists_trajectory(monk
         request_context=SimpleNamespace(
             user=SimpleNamespace(account_id="default", user_id="u"),
             account_id="default",
+        ),
+        source_archive_uri="viking://user/u/sessions/s1/history/archive_001",
+    )
+
+    rollout = _rollout()
+    rollout.messages.append(
+        Message(
+            id="tool-result",
+            role="user",
+            parts=[
+                ToolPart(
+                    tool_id="read-1",
+                    tool_name="read",
+                    tool_input={"uri": "viking://user/u/memories/experiences/exchange.md"},
+                    tool_output="experience body",
+                    tool_status="completed",
+                )
+            ],
         )
     )
 
-    analysis = await analyzer.analyze(_rollout(), context)
+    analysis = await analyzer.analyze(rollout, context)
 
     assert FakeExtractLoop.created
     created_loop = FakeExtractLoop.created[0]
@@ -333,6 +377,14 @@ async def test_trajectory_rollout_analyzer_extracts_and_persists_trajectory(monk
     assert '"case_name": "case"' in fs.writes[0][1]
     assert '"evidence_sources"' not in fs.writes[0][1]
     assert '"advisory_signals"' not in fs.writes[0][1]
+    assert (
+        '"source_archive_uri": "viking://user/u/sessions/s1/history/archive_001"' in fs.writes[0][1]
+    )
+    assert '"source_experience_uris"' not in fs.writes[0][1]
+    assert '"source_session_id"' not in fs.writes[0][1]
+    assert '"source_messages_uri"' not in fs.writes[0][1]
+    assert '"source_task_id"' not in fs.writes[0][1]
+    assert '"source_trace_id"' not in fs.writes[0][1]
     assert len(analysis.trajectories) == 1
     traj = analysis.trajectories[0]
     assert traj.name == "task"
@@ -341,6 +393,41 @@ async def test_trajectory_rollout_analyzer_extracts_and_persists_trajectory(monk
     assert traj.metadata["case_name"] == "case"
     assert analysis.evaluation.passed is True
     assert analysis.metadata["policy_snapshot_id"] == "snapshot"
+
+
+@pytest.mark.asyncio
+async def test_trajectory_rollout_analyzer_extracts_skill_without_persisting_trajectory(
+    monkeypatch,
+):
+    from openviking.session.train.components import trajectory_analyzer as module
+
+    FakeExtractLoop.created.clear()
+    fs = FakeVikingFS()
+    monkeypatch.setattr(module, "ExtractLoop", FakeSkillOnlyExtractLoop)
+    monkeypatch.setattr(module, "get_viking_fs", lambda: fs)
+
+    analyzer = TrajectoryRolloutAnalyzer(viking_fs=fs, vlm=SimpleNamespace(model="fake"))
+    result = await analyzer.extract_trajectory_memories(
+        messages=_rollout().messages,
+        ctx=SimpleNamespace(
+            user=SimpleNamespace(account_id="default", user_id="u"),
+            account_id="default",
+        ),
+        include_trajectories=False,
+        include_session_skills=True,
+    )
+
+    provider = FakeExtractLoop.created[0].kwargs["context_provider"]
+    assert [
+        schema.memory_type
+        for schema in provider.get_memory_schemas(
+            SimpleNamespace(user=SimpleNamespace(account_id="default", user_id="u"))
+        )
+    ] == ["session_skills"]
+    assert result["contexts"] == []
+    assert len(result["skill_gradients"]) == 1
+    assert result["skill_gradients"][0].after_file.memory_type == "skills"
+    assert fs.writes == []
 
 
 @pytest.mark.asyncio

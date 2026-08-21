@@ -13,11 +13,15 @@ from openviking.server.identity import RequestContext, Role
 from openviking.session import create_session_compressor
 from openviking.session.compressor_v3 import (
     SessionCompressorV3,
+    _commit_experience_snapshot,
     _experience_root_uri,
+    _experience_snapshot_provenance,
+    _experience_trajectory_map,
     _memory_diff_has_changes,
     _merge_memory_diffs,
     _training_evaluation_from_messages,
     _trajectory_only_training_result,
+    _visible_experience_snapshot_uris,
 )
 from openviking.session.memory.dataclass import (
     MemoryFile,
@@ -93,6 +97,240 @@ def test_factory_ignores_deprecated_memory_version():
         create_session_compressor(vikingdb=None, memory_version="unsupported"),
         SessionCompressorV3,
     )
+
+
+@pytest.mark.asyncio
+async def test_v3_skips_agent_training_when_agent_evolution_is_disabled(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: SimpleNamespace(),
+    )
+    compressor = SessionCompressorV3(vikingdb=None)
+    compressor._extract_user_memories = AsyncMock(
+        return_value=SimpleNamespace(
+            contexts=[],
+            cases=[_training_case()],
+            memory_diff={"operations": {}},
+            case_uri_by_name={},
+        )
+    )
+    compressor.train_from_extracted_cases = AsyncMock()
+    compressor._write_final_memory_diff = AsyncMock()
+
+    await compressor.extract_long_term_memories(
+        messages=_messages(),
+        ctx=_ctx(),
+        allowed_memory_types={"cases", "profile"},
+        agent_evolution_enabled=False,
+    )
+
+    compressor.train_from_extracted_cases.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_v3_extracts_session_skills_when_agent_evolution_is_disabled(monkeypatch):
+    config = SimpleNamespace(
+        memory=SimpleNamespace(session_skill_extraction_enabled=True),
+    )
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_openviking_config",
+        lambda: config,
+    )
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: SimpleNamespace(),
+    )
+    compressor = SessionCompressorV3(
+        vikingdb=None,
+        skill_processor=SimpleNamespace(),
+    )
+    compressor._extract_user_memories = AsyncMock(
+        return_value=SimpleNamespace(
+            contexts=[],
+            cases=[],
+            memory_diff={"operations": {}},
+            case_uri_by_name={},
+        )
+    )
+    compressor.train_from_extracted_cases = AsyncMock()
+    compressor.extract_session_skills = AsyncMock(
+        return_value={
+            "case_count": 0,
+            "submitted": 0,
+            "skill_submitted": 1,
+            "skill_uris": ["viking://user/u/skills/code-review/SKILL.md"],
+        }
+    )
+    compressor._write_final_memory_diff = AsyncMock()
+
+    result = await compressor.extract_long_term_memories(
+        messages=_messages(),
+        ctx=_ctx(),
+        allowed_memory_types={"profile", "preferences"},
+        agent_evolution_enabled=False,
+    )
+
+    compressor.train_from_extracted_cases.assert_not_awaited()
+    compressor.extract_session_skills.assert_awaited_once()
+    assert result["session_skills"] == [
+        {
+            "uri": "viking://user/u/skills/code-review/SKILL.md",
+            "archive_uri": "",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_v3_skill_only_extraction_submits_gradients_without_agent_memories(monkeypatch):
+    from openviking.session.train import PatchSemanticGradient
+
+    skill_uri = "viking://user/u/skills/code-review/SKILL.md"
+    gradient = PatchSemanticGradient(
+        before_file=None,
+        after_file=MemoryFile(
+            uri=skill_uri,
+            content="## Workflow\n- Read changed files first.",
+            memory_type="skills",
+            extra_fields={"skill_name": "code-review"},
+        ),
+        base_version=None,
+        rationale="test",
+        links=[],
+        confidence=0.9,
+        metadata={},
+    )
+    analyzer = SimpleNamespace(
+        extract_trajectory_memories=AsyncMock(
+            return_value={"contexts": [], "skill_gradients": [gradient]}
+        )
+    )
+    trainer = SimpleNamespace(
+        submit_gradients=AsyncMock(
+            return_value=SimpleNamespace(apply_result=SimpleNamespace(written_uris=[skill_uri]))
+        )
+    )
+    compressor = SessionCompressorV3(
+        vikingdb=None,
+        rollout_analyzer=analyzer,
+        skill_processor=SimpleNamespace(),
+    )
+    compressor._session_skill_extraction_enabled = lambda: True
+    compressor._get_session_skill_trainer = AsyncMock(return_value=trainer)
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: SimpleNamespace(),
+    )
+
+    result = await compressor.extract_session_skills(
+        messages=_messages(),
+        ctx=_ctx(),
+        archive_uri="viking://user/u/sessions/s1/history/archive_001",
+    )
+
+    analyzer.extract_trajectory_memories.assert_awaited_once()
+    assert analyzer.extract_trajectory_memories.await_args.kwargs["include_trajectories"] is False
+    trainer.submit_gradients.assert_awaited_once_with([gradient])
+    assert result == {
+        "case_count": 0,
+        "submitted": 0,
+        "skill_submitted": 1,
+        "skill_uris": [skill_uri],
+    }
+
+
+@pytest.mark.asyncio
+async def test_v3_skips_agent_training_when_execution_memory_types_are_filtered(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: SimpleNamespace(),
+    )
+    compressor = SessionCompressorV3(vikingdb=None)
+    compressor._extract_user_memories = AsyncMock(
+        return_value=SimpleNamespace(
+            contexts=[],
+            cases=[_training_case()],
+            memory_diff={"operations": {}},
+            case_uri_by_name={},
+        )
+    )
+    compressor.train_from_extracted_cases = AsyncMock()
+    compressor._write_final_memory_diff = AsyncMock()
+
+    await compressor.extract_long_term_memories(
+        messages=_messages(),
+        ctx=_ctx(),
+        allowed_memory_types={"cases", "profile"},
+        agent_evolution_enabled=True,
+    )
+
+    compressor.train_from_extracted_cases.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_v3_passes_allowed_execution_types_to_agent_training(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: SimpleNamespace(),
+    )
+    compressor = SessionCompressorV3(vikingdb=None)
+    compressor._extract_user_memories = AsyncMock(
+        return_value=SimpleNamespace(
+            contexts=[],
+            cases=[_training_case()],
+            memory_diff={"operations": {}},
+            case_uri_by_name={},
+        )
+    )
+    compressor.train_from_extracted_cases = AsyncMock(
+        return_value={"case_count": 1, "submitted": 1}
+    )
+    compressor._write_final_memory_diff = AsyncMock()
+
+    await compressor.extract_long_term_memories(
+        messages=_messages(),
+        ctx=_ctx(),
+        allowed_memory_types={"cases", "trajectories"},
+        agent_evolution_enabled=True,
+    )
+
+    assert compressor.train_from_extracted_cases.await_args.kwargs["allowed_memory_types"] == {
+        "trajectories"
+    }
+
+
+@pytest.mark.asyncio
+async def test_v3_initializes_only_allowed_memory_files(monkeypatch):
+    initialized_with = []
+
+    class DummyRegistry:
+        async def initialize_memory_files(self, ctx, allowed_memory_types=None):
+            del ctx
+            initialized_with.append(allowed_memory_types)
+
+    class DummyOrchestrator:
+        async def run(self):
+            return None, []
+
+    compressor = SessionCompressorV3(vikingdb=None)
+    compressor._get_or_create_react = lambda **kwargs: DummyOrchestrator()
+    compressor._write_final_memory_diff = AsyncMock()
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.create_default_registry",
+        lambda: DummyRegistry(),
+    )
+
+    await compressor.extract_long_term_memories(
+        messages=_messages(),
+        ctx=_ctx(),
+        allowed_memory_types={"profile"},
+        agent_evolution_enabled=False,
+    )
+
+    assert initialized_with == [{"profile"}]
 
 
 def test_experience_root_uri_requires_request_user():
@@ -348,16 +586,58 @@ def test_case_experience_links_require_policy_root_uri():
         )
 
 
+def test_case_experience_links_exclude_experiences_that_failed_to_persist():
+    traj_uri = "viking://user/u/memories/trajectories/t.md"
+    exp_uri = "viking://user/u/memories/experiences/exp.md"
+    plan = PolicyUpdatePlan(
+        items=[
+            PolicyPlanItem(
+                kind="upsert",
+                memory_type="experiences",
+                target_name="exp",
+                target_uri=exp_uri,
+                before_content=None,
+                after_content="exp",
+                links=[
+                    StoredLink(
+                        from_uri=exp_uri,
+                        to_uri=traj_uri,
+                        link_type="derived_from",
+                        weight=1.0,
+                    )
+                ],
+            )
+        ]
+    )
+    apply_result = PolicyApplyResult(
+        updated_policy_set=ExperienceSet(
+            root_uri="viking://user/u/memories/experiences",
+            policies=[],
+        ),
+        written_uris=[],
+        errors=[f"{exp_uri}: failed to acquire encrypted write lock"],
+    )
+
+    from openviking.session.compressor_v3 import _case_experience_links_via_trajectories
+
+    assert (
+        _case_experience_links_via_trajectories(
+            case_uri="viking://user/u/memories/cases/case.md",
+            trajectory_uris={traj_uri},
+            plan=plan,
+            apply_result=apply_result,
+        )
+        == []
+    )
+
+
 @pytest.mark.asyncio
-async def test_train_from_extracted_case_memories_submits_streaming_rollout(monkeypatch):
+async def test_train_from_extracted_cases_submits_streaming_rollout(monkeypatch):
     submitted_gradients = []
     submitted_analyses = []
-    no_op_lease = SimpleNamespace(handle=object(), close=AsyncMock())
+    no_op_lease = object()
     acquire_lock = AsyncMock(return_value=no_op_lease)
-    monkeypatch.setattr(
-        "openviking.session.compressor_v3.OwnedLockLease.acquire_exact_paths",
-        acquire_lock,
-    )
+    release_lock = AsyncMock()
 
     class FakeTrainer:
         policy_set = ExperienceSet(
@@ -365,7 +645,15 @@ async def test_train_from_extracted_case_memories_submits_streaming_rollout(monk
             policies=[],
         )
 
-        async def submit_gradients(self, gradients, *, analysis=None, rollout=None):
+        async def submit_gradients(
+            self,
+            gradients,
+            *,
+            analysis=None,
+            rollout=None,
+            batch_finalizer=None,
+        ):
+            del batch_finalizer
             submitted_gradients.append(gradients)
             submitted_analyses.append(analysis)
             return RolloutTrainingResult(
@@ -428,6 +716,10 @@ async def test_train_from_extracted_case_memories_submits_streaming_rollout(monk
         lambda: SimpleNamespace(
             ls=AsyncMock(return_value=[]),
             _uri_to_path=lambda uri, ctx=None: uri.removeprefix("viking://"),
+            _async_agfs=SimpleNamespace(
+                pathlock_acquire_exact_batch=acquire_lock,
+                pathlock_release=release_lock,
+            ),
         ),
     )
     monkeypatch.setattr(
@@ -447,17 +739,7 @@ async def test_train_from_extracted_case_memories_submits_streaming_rollout(monk
             max_gradients_per_update=8,
         ),
     )
-    operations = ResolvedOperations(
-        upsert_operations=[_case_operation()],
-        delete_file_contents=[],
-        errors=[],
-    )
-
-    # The extracted case comes from the same memory operations as profile/preferences/etc.;
-    # no extra LLM/VLM case extractor is involved.
-    cases = __import__(
-        "openviking.session.compressor_v3", fromlist=["_operations_to_cases"]
-    )._operations_to_cases(operations)
+    cases = [_training_case()]
     result = await compressor.train_from_extracted_cases(
         cases=cases,
         messages=_messages(),
@@ -472,11 +754,69 @@ async def test_train_from_extracted_case_memories_submits_streaming_rollout(monk
     # Verify analysis was used
     assert submitted_analyses[0] is not None
     assert submitted_analyses[0].trajectories[0].name == "duplicate_booking"
-    # Verify case info carried through correctly
-    assert cases[0].name == "重复预订处理"
-    assert cases[0].input["summary"] == "用户要求处理重复预订"
-    assert cases[0].rubric.criteria[0].name == "先验证重复"
-    acquire_lock.assert_awaited()
+    # Verify case info carried through correctly.
+    assert cases[0].name == "duplicate_booking"
+
+
+@pytest.mark.asyncio
+async def test_train_from_extracted_cases_skips_experience_updates_when_not_allowed(monkeypatch):
+    analyzed = []
+
+    class FakeTrainer:
+        policy_set = ExperienceSet(
+            root_uri="viking://user/u/memories/experiences",
+            policies=[],
+        )
+
+    class FakeAnalyzer:
+        async def analyze(self, rollout, context):
+            del context
+            analyzed.append(rollout)
+            return RolloutAnalysis(
+                evaluation=RubricEvaluation(
+                    passed=True,
+                    score=1.0,
+                    criterion_results=[],
+                    feedback=[],
+                ),
+                trajectories=[
+                    Trajectory(
+                        name="duplicate_booking",
+                        uri="viking://user/u/memories/trajectories/t1.md",
+                        content="trajectory content",
+                        outcome="success",
+                        retrieval_anchor="",
+                    )
+                ],
+                gradients=[],
+            )
+
+    estimate = AsyncMock(side_effect=AssertionError("experience estimation must be skipped"))
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_viking_fs",
+        lambda: SimpleNamespace(ls=AsyncMock(return_value=[])),
+    )
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.get_streaming_policy_trainer",
+        AsyncMock(return_value=FakeTrainer()),
+    )
+    monkeypatch.setattr(
+        "openviking.session.train.components.gradient_estimator.ExperienceGradientEstimator.estimate",
+        estimate,
+    )
+
+    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=FakeAnalyzer())
+    result = await compressor.train_from_extracted_cases(
+        cases=[_training_case()],
+        messages=_messages(),
+        ctx=_ctx(),
+        session_id="s1",
+        allowed_memory_types={"trajectories"},
+    )
+
+    assert len(analyzed) == 1
+    assert result["submitted"] == 1
+    estimate.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -577,7 +917,8 @@ async def test_v3_extract_uses_patch_merge_without_directory_lock(monkeypatch):
     trained_cases = []
 
     class DummyRegistry:
-        async def initialize_memory_files(self, ctx):
+        async def initialize_memory_files(self, ctx, allowed_memory_types=None):
+            del ctx, allowed_memory_types
             return None
 
     class DummyOrchestrator:
@@ -623,7 +964,7 @@ async def test_v3_extract_uses_patch_merge_without_directory_lock(monkeypatch):
     contexts = await compressor.extract_long_term_memories(
         messages=_messages(),
         ctx=_ctx(),
-        allowed_memory_types={"cases", "profile"},
+        allowed_memory_types={"cases", "profile", "trajectories", "experiences"},
     )
 
     assert len(applied_operations) == 1
@@ -660,7 +1001,8 @@ async def test_v3_extract_trains_only_canonical_case_after_patch_merge(monkeypat
         )
 
     class DummyRegistry:
-        async def initialize_memory_files(self, ctx):
+        async def initialize_memory_files(self, ctx, allowed_memory_types=None):
+            del ctx, allowed_memory_types
             return None
 
     class DummyOrchestrator:
@@ -730,7 +1072,7 @@ async def test_v3_extract_trains_only_canonical_case_after_patch_merge(monkeypat
     contexts = await compressor.extract_long_term_memories(
         messages=_messages(),
         ctx=_ctx(),
-        allowed_memory_types={"cases", "profile"},
+        allowed_memory_types={"cases", "profile", "trajectories", "experiences"},
     )
 
     assert [context.uri for context in contexts] == [canonical_uri]
@@ -800,6 +1142,7 @@ async def test_v3_training_case_spec_fast_path_skips_user_memory_extraction_and_
     compressor._extract_user_memories = fail_extract_user_memories
     compressor._write_training_case_memory = fake_write_training_case_memory
     compressor.train_from_extracted_cases = fake_train_from_extracted_cases
+    compressor._write_final_memory_diff = AsyncMock()
 
     contexts = await compressor.extract_long_term_memories(
         messages=[case_spec, *rollout_messages],
@@ -857,6 +1200,36 @@ async def test_v3_case_spec_write_uses_shared_streaming_aggregator(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_v3_training_case_spec_does_not_write_case_when_evolution_disabled():
+    compressor = SessionCompressorV3(vikingdb=None, rollout_analyzer=SimpleNamespace())
+    compressor._extract_user_memories = AsyncMock(
+        return_value=SimpleNamespace(
+            contexts=[],
+            cases=[],
+            memory_diff=None,
+            case_uri_by_name={},
+        )
+    )
+    compressor._write_training_case_memory = AsyncMock()
+    compressor.train_from_extracted_cases = AsyncMock()
+    compressor._write_final_memory_diff = AsyncMock()
+
+    contexts = await compressor.extract_long_term_memories(
+        messages=[_case_spec_message(), *_messages()],
+        ctx=_ctx(),
+        session_id="s1",
+        archive_uri="viking://user/u/sessions/s1/history/archive_001",
+        allowed_memory_types={"cases", "trajectories", "experiences"},
+        agent_evolution_enabled=False,
+    )
+
+    assert contexts == []
+    compressor._write_training_case_memory.assert_not_awaited()
+    compressor.train_from_extracted_cases.assert_not_awaited()
+    assert compressor._extract_user_memories.await_args.kwargs["allowed_memory_types"] == set()
+
+
+@pytest.mark.asyncio
 async def test_v3_training_case_spec_fast_path_not_used_with_user_memory_policy():
     extracted = False
     trained = []
@@ -883,7 +1256,7 @@ async def test_v3_training_case_spec_fast_path_not_used_with_user_memory_policy(
 
     assert contexts == []
     assert extracted is True
-    assert trained and trained[0]["messages"][0].id == "case-spec"
+    assert trained == []
 
 
 @pytest.mark.asyncio
@@ -1239,20 +1612,206 @@ async def test_v3_training_memory_diff_filters_batch_items_by_current_analysis_t
     assert [op["uri"] for op in diff["operations"]["adds"]] == [traj_a, exp_a]
 
 
+def test_v3_maps_each_written_experience_to_its_source_trajectories():
+    traj_a = "viking://user/u/memories/trajectories/traj_a.md"
+    traj_b = "viking://user/u/memories/trajectories/traj_b.md"
+    exp_a = "viking://user/u/memories/experiences/exp_a.md"
+    exp_b = "viking://user/u/memories/experiences/exp_b.md"
+    plan = PolicyUpdatePlan(
+        items=[
+            PolicyPlanItem(
+                kind="upsert",
+                memory_type="experiences",
+                target_name="exp_a",
+                target_uri=exp_a,
+                before_content=None,
+                after_content="exp a",
+                links=[
+                    StoredLink(
+                        from_uri=exp_a,
+                        to_uri=traj_a,
+                        link_type="derived_from",
+                        weight=1.0,
+                    )
+                ],
+            ),
+            PolicyPlanItem(
+                kind="upsert",
+                memory_type="experiences",
+                target_name="exp_b",
+                target_uri=exp_b,
+                before_content=None,
+                after_content="exp b",
+                links=[
+                    StoredLink(
+                        from_uri=exp_b,
+                        to_uri=traj_b,
+                        link_type="derived_from",
+                        weight=1.0,
+                    )
+                ],
+            ),
+        ]
+    )
+    apply_result = PolicyApplyResult(
+        updated_policy_set=ExperienceSet(
+            root_uri="viking://user/u/memories/experiences",
+            policies=[],
+        ),
+        written_uris=[exp_a, exp_b],
+    )
+
+    assert _experience_trajectory_map(
+        plan=plan,
+        apply_result=apply_result,
+        trajectory_uris={traj_a, traj_b},
+    ) == {
+        exp_a: [traj_a],
+        exp_b: [traj_b],
+    }
+
+
+def test_v3_snapshot_provenance_uses_complete_shared_batch_result():
+    traj_a = "viking://user/u/memories/trajectories/traj_a.md"
+    traj_b = "viking://user/u/memories/trajectories/traj_b.md"
+    exp_a = "viking://user/u/memories/experiences/exp_a.md"
+    exp_b = "viking://user/u/memories/experiences/exp_b.md"
+
+    def plan_item(experience_uri: str, trajectory_uri: str) -> PolicyPlanItem:
+        return PolicyPlanItem(
+            kind="upsert",
+            memory_type="experiences",
+            target_name=experience_uri.rsplit("/", 1)[-1].removesuffix(".md"),
+            target_uri=experience_uri,
+            before_content=None,
+            after_content="updated",
+            links=[
+                StoredLink(
+                    from_uri=experience_uri,
+                    to_uri=trajectory_uri,
+                    link_type="derived_from",
+                    weight=1.0,
+                )
+            ],
+        )
+
+    root = "viking://user/u/memories/experiences"
+    batch_result = SimpleNamespace(
+        analyses=[
+            SimpleNamespace(trajectories=[SimpleNamespace(uri=traj_a)]),
+            SimpleNamespace(trajectories=[SimpleNamespace(uri=traj_b)]),
+        ],
+        plan=PolicyUpdatePlan(items=[plan_item(exp_a, traj_a), plan_item(exp_b, traj_b)]),
+        apply_result=PolicyApplyResult(
+            updated_policy_set=ExperienceSet(root_uri=root, policies=[]),
+            written_uris=[exp_a, exp_b],
+        ),
+    )
+    scoped_result = SimpleNamespace(
+        analyses=[batch_result.analyses[0]],
+        plan=PolicyUpdatePlan(items=[batch_result.plan.items[0]]),
+        apply_result=PolicyApplyResult(
+            updated_policy_set=ExperienceSet(root_uri=root, policies=[]),
+            written_uris=[exp_a],
+        ),
+        batch_result=batch_result,
+    )
+
+    apply_result, trajectory_map = _experience_snapshot_provenance(scoped_result)
+
+    assert apply_result is batch_result.apply_result
+    assert trajectory_map == {
+        exp_a: [traj_a],
+        exp_b: [traj_b],
+    }
+
+
+def test_visible_experience_snapshot_uris_only_returns_applied_body_changes():
+    root = "viking://user/u/memories/experiences"
+    changed_uri = f"{root}/changed.md"
+    metadata_only_uri = f"{root}/metadata_only.md"
+    failed_uri = f"{root}/failed.md"
+    deleted_uri = f"{root}/deleted.md"
+    content_write_uri = f"{root}/content_write.md"
+    plan = PolicyUpdatePlan(
+        items=[
+            PolicyPlanItem(
+                kind="upsert",
+                memory_type="experiences",
+                target_name="changed",
+                target_uri=changed_uri,
+                before_content="before",
+                after_content="after",
+            ),
+            PolicyPlanItem(
+                kind="upsert",
+                memory_type="experiences",
+                target_name="metadata_only",
+                target_uri=metadata_only_uri,
+                before_content="unchanged",
+                after_content="unchanged",
+            ),
+            PolicyPlanItem(
+                kind="upsert",
+                memory_type="experiences",
+                target_name="failed",
+                target_uri=failed_uri,
+                before_content="before",
+                after_content="after",
+            ),
+            PolicyPlanItem(
+                kind="delete",
+                memory_type="experiences",
+                target_name="deleted",
+                target_uri=deleted_uri,
+                before_content="old content",
+                after_content=None,
+            ),
+        ]
+    )
+    apply_result = PolicyApplyResult(
+        updated_policy_set=ExperienceSet(root_uri=root, policies=[]),
+        written_uris=[changed_uri, metadata_only_uri, content_write_uri],
+        deleted_uris=[deleted_uri],
+    )
+
+    assert _visible_experience_snapshot_uris(
+        plan=plan,
+        apply_result=apply_result,
+    ) == [changed_uri, deleted_uri]
+
+
+@pytest.mark.asyncio
+async def test_commit_experience_snapshot_skips_when_no_visible_content_changed():
+    viking_fs = SimpleNamespace(commit=AsyncMock())
+
+    await _commit_experience_snapshot(
+        viking_fs,
+        ctx=_ctx(),
+        experience_uris=[],
+        archive_uri="viking://user/u/sessions/session-1/history/archive_001",
+    )
+
+    viking_fs.commit.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_v3_training_links_case_to_trajectory_and_experience_via_trajectory(monkeypatch):
     case_uri = "viking://user/u/memories/cases/duplicate_booking.md"
     traj_uri = "viking://user/u/memories/trajectories/duplicate_booking.md"
     exp_uri = "viking://user/u/memories/experiences/booking_duplicate_handling.md"
-    no_op_lease = SimpleNamespace(handle=object(), close=AsyncMock())
+    deleted_exp_uri = "viking://user/u/memories/experiences/legacy_booking_handling.md"
+    no_op_lease = object()
     acquire_lock = AsyncMock(return_value=no_op_lease)
-    monkeypatch.setattr(
-        "openviking.session.compressor_v3.OwnedLockLease.acquire_exact_paths",
-        acquire_lock,
-    )
+    release_lock = AsyncMock()
 
     class FakeFS:
         def __init__(self):
+            self.commits = []
+            self._async_agfs = SimpleNamespace(
+                pathlock_acquire_exact_batch=acquire_lock,
+                pathlock_release=release_lock,
+            )
             self.files = {
                 case_uri: MemoryFileUtils.write(
                     MemoryFile(
@@ -1314,18 +1873,35 @@ async def test_v3_training_links_case_to_trajectory_and_experience_via_trajector
             del ctx
             return uri.removeprefix("viking://")
 
-        async def write_file(self, uri, content, ctx=None, lock_handle=None):
-            del ctx, lock_handle
+        async def write_file(
+            self,
+            uri,
+            content,
+            ctx=None,
+            lock_handle=None,
+            lease_ref=None,
+        ):
+            del ctx, lock_handle, lease_ref
             self.files[uri] = content
 
         async def ls(self, uri, output="original", ctx=None):
             del uri, output, ctx
             return []
 
+        async def commit(self, **kwargs):
+            self.commits.append(kwargs)
+
     class FakeTrainer:
         policy_set = ExperienceSet(root_uri="viking://user/u/memories/experiences", policies=[])
 
-        async def submit_gradients(self, gradients, *, analysis=None, rollout=None):
+        async def submit_gradients(
+            self,
+            gradients,
+            *,
+            analysis=None,
+            rollout=None,
+            batch_finalizer=None,
+        ):
             del gradients, analysis, rollout
             plan = PolicyUpdatePlan(
                 items=[
@@ -1346,10 +1922,18 @@ async def test_v3_training_links_case_to_trajectory_and_experience_via_trajector
                                 description="",
                             )
                         ],
-                    )
+                    ),
+                    PolicyPlanItem(
+                        kind="delete",
+                        memory_type="experiences",
+                        target_name="legacy_booking_handling",
+                        target_uri=deleted_exp_uri,
+                        before_content="legacy exp content",
+                        after_content=None,
+                    ),
                 ]
             )
-            return RolloutTrainingResult(
+            result = RolloutTrainingResult(
                 analyses=[],
                 gradients=[],
                 plan=plan,
@@ -1359,10 +1943,14 @@ async def test_v3_training_links_case_to_trajectory_and_experience_via_trajector
                         policies=[],
                     ),
                     written_uris=[exp_uri],
+                    deleted_uris=[deleted_exp_uri],
                     errors=[],
                 ),
                 metadata={},
             )
+            if batch_finalizer is not None:
+                await batch_finalizer(result)
+            return result
 
     class FakeAnalyzer:
         async def analyze(self, rollout, context):
@@ -1420,10 +2008,13 @@ async def test_v3_training_links_case_to_trajectory_and_experience_via_trajector
         case_uri_by_name={"duplicate_booking": case_uri},
         messages=_messages(),
         ctx=_ctx(),
+        session_id="session-1",
+        archive_uri="viking://user/u/sessions/session-1/history/archive_001",
     )
 
     assert result["submitted"] == 1
     acquire_lock.assert_awaited()
+    release_lock.assert_awaited_once_with(no_op_lease)
     case_file = MemoryFileUtils.read(fs.files[case_uri], uri=case_uri)
     assert any(
         link["to_uri"] == traj_uri
@@ -1451,6 +2042,19 @@ async def test_v3_training_links_case_to_trajectory_and_experience_via_trajector
     assert any(link["from_uri"] == case_uri for link in traj_file.backlinks)
     exp_file = MemoryFileUtils.read(fs.files[exp_uri], uri=exp_uri)
     assert any(link["from_uri"] == case_uri for link in exp_file.backlinks)
+    assert fs.commits == [
+        {
+            "message": (
+                "Update experience memories from session commit "
+                "viking://user/u/sessions/session-1/history/archive_001\n"
+                "OpenViking-Experience-Trajectory-Map: "
+                '{"viking://user/u/memories/experiences/booking_duplicate_handling.md":'
+                '["viking://user/u/memories/trajectories/duplicate_booking.md"]}'
+            ),
+            "paths": [exp_uri, deleted_exp_uri],
+            "ctx": _ctx(),
+        }
+    ]
 
 
 def test_training_messages_after_case_spec_preserves_all_remaining_messages_in_order():

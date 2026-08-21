@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import re
 import threading
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Hashable
 
@@ -289,6 +290,7 @@ class StreamingPolicyTrainer:
         *,
         analysis: RolloutAnalysis | None = None,
         rollout: Rollout | None = None,
+        batch_finalizer: Callable[[RolloutTrainingResult], Awaitable[None]] | None = None,
     ) -> RolloutTrainingResult | ScopedRolloutTrainingResult:
         """Submit pre-computed gradients directly to the streaming trainer.
 
@@ -332,6 +334,7 @@ class StreamingPolicyTrainer:
             analysis=analysis,
             rollout=rollout,
             gate_report=gate_report,
+            batch_finalizer=batch_finalizer,
         )
         result = await self._batcher.submit(buffered)
         self._last_apply_result = result.apply_result
@@ -471,6 +474,16 @@ class StreamingPolicyTrainer:
                 "gate_attempts": gate_attempts,
             },
         )
+        # Finalize the persisted batch before StreamingBatcher releases its
+        # flush lock and starts another batch. All submitters in this flush
+        # share the same complete result, so one finalizer is sufficient.
+        # This keeps snapshot creation ordered with the writes it describes.
+        batch_finalizer = next(
+            (item.batch_finalizer for item in items if item.batch_finalizer is not None),
+            None,
+        )
+        if batch_finalizer is not None:
+            await batch_finalizer(result)
         tracer.info(
             "StreamingPolicyTrainer flush finished "
             f"reason={reason} "
@@ -889,6 +902,7 @@ class _BufferedRolloutTraining:
     analysis: RolloutAnalysis | None = None
     rollout: Rollout | None = None
     gate_report: dict[str, Any] | None = None
+    batch_finalizer: Callable[[RolloutTrainingResult], Awaitable[None]] | None = None
 
 
 @dataclass(slots=True)

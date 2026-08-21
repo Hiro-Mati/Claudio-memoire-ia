@@ -30,7 +30,7 @@ Explain the purpose of this API, point to the corresponding code entry, and brie
 **Code Entry**:
 - `openviking/<module>/<file>.py:<ClassName>.<MethodName>` - Core implementation
 - `openviking/server/routers/<router-file>.py` - HTTP router
-- `openviking_cli/commands/<command-file>.py` - CLI command
+- `crates/ov_cli/src/commands/<command-file>.rs` - CLI command
 
 #### 2. Interface and Parameter Description
 
@@ -47,6 +47,24 @@ Explain the purpose of this API, point to the corresponding code entry, and brie
 
 #### 3. Usage Examples
 
+**Python SDK**
+
+```python
+<SDK call example>
+```
+
+**TypeScript SDK**
+
+```typescript
+<SDK call example>
+```
+
+**Go SDK**
+
+```go
+<SDK call example>
+```
+
 **HTTP API**
 
 ```
@@ -55,18 +73,6 @@ Explain the purpose of this API, point to the corresponding code entry, and brie
 
 ```bash
 <curl example>
-```
-
-**Python SDK**
-
-```python
-<SDK call example>
-```
-
-**Go SDK**
-
-```go
-<SDK call example>
 ```
 
 **CLI**
@@ -82,7 +88,9 @@ Explain the purpose of this API, point to the corresponding code entry, and brie
 ```
 
 
-#### 4. Response Example, Error Handling, and Exception Handling (Optional)
+#### 4. Response Contract (Required) and Error Handling (Optional)
+
+Every public operation must document its successful return value. JSON endpoints need at least one response-envelope example that matches the implementation. Non-JSON endpoints such as file downloads, SSE, and WebDAV must document the HTTP status, important response headers, body, or event format. A prose-only list of returned fields is not sufficient. Error and exception examples remain optional.
 
 ---
 
@@ -128,12 +136,26 @@ Each API is organized in the following three parts:
 
 #### 3. Usage Examples
 
-Provide in order:
-- HTTP API (method + path + curl example)
+When an operation presents all transports together, prefer this order:
 - Python SDK example
+- TypeScript SDK example
 - Go SDK example, when it adds endpoint-specific value and can stay concise
+- HTTP API (method + path + curl example)
 - CLI example
 - Response example
+
+Example tabs are generated from bold labels. Put each invocation label in its own
+paragraph and use one of these fixed base forms: `**Python SDK**`, `**TypeScript SDK**`,
+`**Go SDK**`, `**HTTP API**`, or `**CLI**`. When a transport qualifier is useful,
+put it inside the same bold label with ASCII parentheses, for example
+`**Python HTTP SDK**`. Do not put the qualifier after the bold label
+or use full-width parentheses. Show only surfaces that are actually
+implemented. If an SDK or CLI does not expose the capability, omit that tab and
+briefly identify the available alternative. Do not wrap a handwritten HTTP request
+and present it as a nonexistent SDK method.
+
+For an existing operation with a workflow-specific structure, keep the local
+structure stable and place TypeScript next to the other SDK examples.
 
 Keep API documentation organized around API modules and individual operations,
 not around client languages. SDK snippets should be short call examples inside
@@ -158,10 +180,11 @@ Add resources to the knowledge base, supporting various sources such as local fi
 5. Build vector index
 
 **Code Entry**:
-- `openviking/core/client.py:OpenViking.add_resource()` - SDK entry
-- `openviking/resource/importer.py:ResourceImporter.import_resource()` - Core implementation
-- `openviking/server/routers/resources.py` - HTTP router
-- `openviking_cli/commands/resources.py` - CLI command
+- `sdk/python/openviking_sdk/client.py:AsyncHTTPClient.add_resource()` - Async SDK entry
+- `sdk/python/openviking_sdk/client.py:SyncHTTPClient.add_resource()` - Sync SDK entry
+- `openviking/service/resource_service.py:ResourceService.add_resource()` - Core implementation
+- `openviking/server/routers/resources.py:add_resource()` - HTTP router
+- `crates/ov_cli/src/handlers.rs:handle_add_resource()` - CLI handler
 
 #### 2. Interface and Parameter Description
 
@@ -201,10 +224,9 @@ curl -X POST http://localhost:1933/api/v1/resources \
 **Python SDK**
 
 ```python
-import openviking as ov
+from openviking_sdk import SyncHTTPClient
 
-client = ov.OpenViking(path="./data")
-client.initialize()
+client = SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
 
 result = client.add_resource(
     "./documents/guide.md",
@@ -246,5 +268,6 @@ When adding or modifying API documentation, please check:
 - [ ] Implementation introduction is clear and code entry paths are correct
 - [ ] Parameter table is complete and accurate
 - [ ] Example code is concise and runnable
+- [ ] Invocation examples use fixed bold labels and every SDK/CLI tab maps to a real implementation
 - [ ] HTTP method and path are correct
-- [ ] Response example matches actual output
+- [ ] Every public operation has a successful response contract and its example matches actual output

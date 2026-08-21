@@ -1,8 +1,12 @@
 import { h } from 'vue'
 import DefaultTheme from 'vitepress/theme'
+import type { EnhanceAppContext } from 'vitepress'
 import CopyMarkdownButton from './CopyMarkdownButton.vue'
 import LlmsTxtLink from './LlmsTxtLink.vue'
 import OpenVikingSearch from './OpenVikingSearch.vue'
+import ApiExampleTabsEnhancer from './ApiExampleTabsEnhancer.vue'
+import { initVikingBotWidget, syncVikingBotLocale } from './vikingbot-widget'
+import { trackPageView } from './track'
 import './custom.css'
 
 type OpenVikingPreference = {
@@ -300,9 +304,27 @@ export default {
   extends: DefaultTheme,
   Layout() {
     return h(DefaultTheme.Layout, null, {
-      'doc-before': () => h(CopyMarkdownButton),
-      'doc-footer-before': () => h(LlmsTxtLink),
+      'doc-before': () => h('div', { class: 'doc-page-actions' }, [
+        h(LlmsTxtLink),
+        h(CopyMarkdownButton)
+      ]),
+      'doc-after': () => h(ApiExampleTabsEnhancer),
       'nav-bar-content-before': () => h(OpenVikingSearch)
     })
+  },
+  enhanceApp({ router }: EnhanceAppContext) {
+    if (import.meta.env.SSR || typeof window === 'undefined') return
+
+    trackPageView(window.location.pathname)
+    initVikingBotWidget()
+
+    const previousHook = router.onAfterRouteChanged
+    router.onAfterRouteChanged = (to: string) => {
+      previousHook?.(to)
+      trackPageView(to.split('?')[0].split('#')[0])
+      // <html lang> is rewritten by the router before this fires, so a locale
+      // switch re-mounts the widget in the language the reader just chose.
+      syncVikingBotLocale()
+    }
   }
 }

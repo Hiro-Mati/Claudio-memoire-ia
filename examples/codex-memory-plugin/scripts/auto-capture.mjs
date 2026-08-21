@@ -8,14 +8,14 @@
  *
  * Strategy:
  *   1. For this codex session_id, derive one long-lived OpenViking session
- *      id (`cx-<codex-session-id>`) and remember it in state. Do NOT commit
- *      per turn.
+ *      id (`cx-<codex-session-id>`) and remember it in state.
  *   2. Read transcript_path, parse JSONL rollout, append every new
  *      user/assistant turn since last capture via add_message.
+ *   3. If session pending_tokens crosses commitTokenThreshold, commit while
+ *      keeping a recent live tail for continuity.
  *
- * Commit happens in two other places, never here:
- *   - PreCompact hook (deterministic, before context compaction)
- *   - SessionStart hook (active-window heuristic + idle-TTL sweep at tail)
+ * PreCompact still commits deterministically before context compaction, and
+ * SessionStart still handles orphaned sessions / idle TTL sweep.
  *
  * Stop output schema accepts {} as a no-op.
  *
@@ -27,17 +27,18 @@
 
 import { readFile } from "node:fs/promises";
 import {
-  extractTextFromPayload,
-  isAssistantSideCaptureRole,
-  normalizeCaptureRole,
-  shouldCaptureText,
+  extractCaptureTurns,
 } from "./capture-utils.mjs";
 import { loadConfig } from "./config.mjs";
 import { createLogger } from "./debug-log.mjs";
 import { loadState, resolveOvSessionId, saveState } from "./session-state.mjs";
+import { maybeDetach, readHookStdin } from "./shared/async-writer.mjs";
+import { sendSessionMessages } from "./shared/batch-send.mjs";
+import { resolveEffectivePeerId } from "./shared/workspace-peer.mjs";
 
 const cfg = loadConfig();
 const { log, logError } = createLogger("auto-capture");
+let activePeerId = cfg.peerId || "";
 
 function output(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
@@ -47,28 +48,45 @@ function noop(message) {
   output(message ? { systemMessage: message } : {});
 }
 
-async function fetchJSON(path, init = {}) {
+function makeHeaders() {
+  const headers = { "Content-Type": "application/json" };
+  if (cfg.apiKey) {
+    headers["Authorization"] = `Bearer ${cfg.apiKey}`;
+    headers["X-API-Key"] = cfg.apiKey;
+  }
+  if (cfg.sendIdentityHeaders && cfg.account) headers["X-OpenViking-Account"] = cfg.account;
+  if (cfg.sendIdentityHeaders && cfg.user) headers["X-OpenViking-User"] = cfg.user;
+  if (activePeerId) headers["X-OpenViking-Actor-Peer"] = activePeerId;
+  if (cfg.userAgent) headers["User-Agent"] = cfg.userAgent;
+  return headers;
+}
+
+function responseTraceId(body) {
+  return body?.result?.trace_id || body?.error?.trace_id || body?.trace_id || undefined;
+}
+
+async function fetchJSONRes(path, init = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), cfg.captureTimeoutMs);
   try {
-    const headers = { "Content-Type": "application/json" };
-    if (cfg.apiKey) {
-      headers["Authorization"] = `Bearer ${cfg.apiKey}`;
-      headers["X-API-Key"] = cfg.apiKey;
-    }
-    if (cfg.sendIdentityHeaders && cfg.account) headers["X-OpenViking-Account"] = cfg.account;
-    if (cfg.sendIdentityHeaders && cfg.user) headers["X-OpenViking-User"] = cfg.user;
-    if (cfg.peerId) headers["X-OpenViking-Actor-Peer"] = cfg.peerId;
-    const res = await fetch(`${cfg.baseUrl}${path}`, { ...init, headers, signal: controller.signal });
+    const res = await fetch(`${cfg.baseUrl}${path}`, { ...init, headers: makeHeaders(), signal: controller.signal });
     const body = await res.json().catch(() => null);
-    if (!body) return null;
-    if (!res.ok || body.status === "error") return null;
-    return body.result ?? body;
-  } catch {
-    return null;
+    if (!body) return { ok: false, status: res.status, error: { message: "empty or invalid JSON response" } };
+    const traceId = responseTraceId(body);
+    if (!res.ok || body.status === "error") {
+      return { ok: false, status: res.status, error: body.error || body, traceId };
+    }
+    return { ok: true, status: res.status, result: body.result ?? body, traceId };
+  } catch (err) {
+    return { ok: false, status: 0, error: { message: err?.message || String(err) } };
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function fetchJSON(path, init = {}) {
+  const r = await fetchJSONRes(path, init);
+  return r.ok ? (r.result ?? null) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -89,22 +107,7 @@ function parseTranscript(content) {
 }
 
 function extractTurns(rolloutEntries) {
-  const turns = [];
-  for (const entry of rolloutEntries) {
-    if (!entry || typeof entry !== "object") continue;
-    const payload = entry.payload && typeof entry.payload === "object" ? entry.payload : entry;
-    const message = payload.message && typeof payload.message === "object" ? payload.message : null;
-    const rawRole = message?.role || payload.role || payload.type || payload.kind;
-    const role = normalizeCaptureRole(rawRole);
-    if (!role) continue;
-    if (isAssistantSideCaptureRole(rawRole) && !cfg.captureAssistantTurns) continue;
-
-    const rawText = extractTextFromPayload(payload, { toolMaxChars: cfg.captureToolMaxChars });
-    const decision = shouldCaptureText(rawText, role, cfg);
-    if (!decision.shouldCapture) continue;
-    turns.push({ role, text: decision.text });
-  }
-  return turns;
+  return extractCaptureTurns(rolloutEntries, cfg);
 }
 
 async function readTranscriptTurns(transcriptPath) {
@@ -119,30 +122,67 @@ async function readTranscriptTurns(transcriptPath) {
   }
 }
 
-function selectStopTurns(state, turns) {
-  const limit = cfg.captureMaxTurnsPerStop;
-  if (turns.length <= limit) return turns;
-  const skipped = turns.length - limit;
-  state.capturedTurnCount += skipped;
-  log("backlog_trimmed", { newTurns: turns.length, skipped, selected: limit });
-  return turns.slice(-limit);
+async function appendTurns(ovSessionId, turns, state) {
+  const payloads = turns.map((turn) => {
+    const body = turn.parts?.length
+      ? { role: turn.role, parts: turn.parts }
+      : { role: turn.role, content: turn.text };
+    if (activePeerId) body.peer_id = activePeerId;
+    return body;
+  });
+  const r = await sendSessionMessages(fetchJSONRes, ovSessionId, payloads, {
+    onSent: async (n) => {
+      state.capturedTurnCount += n;
+      await saveState(state);
+    },
+  });
+  return r.sent;
 }
 
-async function appendTurns(ovSessionId, turns, state) {
-  let appended = 0;
-  for (const turn of turns) {
-    const body = { role: turn.role, content: turn.text };
-    if (cfg.peerId) body.peer_id = cfg.peerId;
-    const result = await fetchJSON(`/api/v1/sessions/${encodeURIComponent(ovSessionId)}/messages`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
-    if (!result) break;
-    appended += 1;
-    state.capturedTurnCount += 1;
-    await saveState(state);
+async function maybeCommitByThreshold(ovSessionId, added) {
+  if (added <= 0) {
+    return {
+      committed: false,
+      pendingTokens: 0,
+      commitCount: 0,
+      totalMessageCount: 0,
+      traceId: "",
+    };
   }
-  return appended;
+  const meta = await fetchJSON(`/api/v1/sessions/${encodeURIComponent(ovSessionId)}`);
+  const pendingTokens = Number(meta?.pending_tokens || 0);
+  const commitCount = Number(meta?.commit_count || 0);
+  const totalMessageCount = Number(meta?.total_message_count || 0);
+  log("pending_tokens", {
+    ovSessionId,
+    pending: pendingTokens,
+    threshold: cfg.commitTokenThreshold,
+    keepRecentCount: cfg.commitKeepRecentCount,
+  });
+  if (pendingTokens < cfg.commitTokenThreshold) {
+    return { committed: false, pendingTokens, commitCount, totalMessageCount, traceId: "" };
+  }
+  const commit = await fetchJSONRes(`/api/v1/sessions/${encodeURIComponent(ovSessionId)}/commit`, {
+    method: "POST",
+    body: JSON.stringify({ keep_recent_count: cfg.commitKeepRecentCount }),
+  });
+  const committed = commit.ok;
+  const traceId = commit.traceId || commit.result?.trace_id || "";
+  log("commit", {
+    ovSessionId,
+    ok: committed,
+    status: commit.status,
+    trace_id: traceId || undefined,
+    pending: pendingTokens,
+    error: committed ? undefined : commit.error?.message || commit.error?.code,
+  });
+  return {
+    committed,
+    pendingTokens,
+    commitCount: committed ? commitCount + 1 : commitCount,
+    totalMessageCount,
+    traceId,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -156,11 +196,13 @@ async function main() {
     return;
   }
 
+  // Async write mode returns a no-op response immediately; worker stdout is
+  // intentionally discarded, so appended-count systemMessage is sync-only.
+  if (await maybeDetach(cfg, { approve: () => output({}) })) return;
+
   let input;
   try {
-    const chunks = [];
-    for await (const chunk of process.stdin) chunks.push(chunk);
-    input = JSON.parse(Buffer.concat(chunks).toString());
+    input = JSON.parse(await readHookStdin());
   } catch {
     log("skip", { stage: "stdin_parse", reason: "invalid input" });
     noop();
@@ -169,7 +211,9 @@ async function main() {
 
   const sessionId = input.session_id || "unknown";
   const transcriptPath = input.transcript_path || null;
-  log("start", { sessionId, transcriptPath });
+  const state = await loadState(sessionId);
+  activePeerId = cfg.peerId || state.workspacePeerId || resolveEffectivePeerId({ cfg, cwd: process.cwd() }).peerId;
+  log("start", { sessionId, transcriptPath, hasPeer: Boolean(activePeerId) });
 
   const health = await fetchJSON("/health");
   if (!health) {
@@ -178,7 +222,6 @@ async function main() {
     return;
   }
 
-  const state = await loadState(sessionId);
   const allTurns = await readTranscriptTurns(transcriptPath);
 
   // Post-compact transcript-shrink defense: codex's /compact may rewrite or
@@ -210,15 +253,22 @@ async function main() {
   }
 
   let added = 0;
+  let ovSessionId = "";
+  let commitInfo = {
+    committed: false,
+    pendingTokens: 0,
+    commitCount: 0,
+    totalMessageCount: 0,
+    traceId: "",
+  };
   if (newTurns.length > 0) {
-    const ovSessionId = resolveOvSessionId(state);
+    ovSessionId = resolveOvSessionId(state);
     if (!ovSessionId) {
       logError("resolve_ov_session", "failed to derive OV session id");
     } else {
-      const turnsToAppend = selectStopTurns(state, newTurns);
-      await saveState(state);
-      added = await appendTurns(ovSessionId, turnsToAppend, state);
+      added = await appendTurns(ovSessionId, newTurns, state);
       log("appended", { ovSessionId, added });
+      commitInfo = await maybeCommitByThreshold(ovSessionId, added);
     }
   }
 
@@ -227,7 +277,12 @@ async function main() {
   // could also sweep here, deliberately not — see header comment + DESIGN.md §5.
 
   if (added > 0) {
-    noop(`appended ${added} turn(s) to OpenViking session ${state.ovSessionId}`);
+    noop(
+      `appended ${added} turn(s) to OpenViking session ${state.ovSessionId}` +
+      (commitInfo.committed
+        ? ` (committed${commitInfo.traceId ? `; trace_id=${commitInfo.traceId}` : ""})`
+        : ""),
+    );
   } else {
     noop();
   }

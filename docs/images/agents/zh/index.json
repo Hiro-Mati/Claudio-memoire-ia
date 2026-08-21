@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-05",
+  "updatedAt": "2026-08-18",
   "cdnBaseUrl": "https://docs.openviking.net/",
   "accessMethods": [
     {
@@ -53,7 +53,7 @@
       "name": "Hermes Agent",
       "tags": ["Provider"],
       "logo": "https://lf3-static.bytednsdoc.com/obj/eden-cn/lm_sth/ljhwZthlaukjlkulzlp/agent_logo/Hermes-Agent.png",
-      "summary": "Hermes 官方内置 OpenViking 作为记忆提供方。无需安装插件——直接把 Hermes 指向你的 OpenViking 服务即可，记忆存储、召回和抽取均原生支持",
+      "summary": "Hermes 官方内置 OpenViking。跑 hermes memory setup openviking，默认选火山云，再贴上本页 API Key 即可",
       "detailPath": "https://docs.openviking.net/agents/zh/hermes.md"
     },
     {
@@ -75,17 +75,17 @@
     {
       "id": "cursor",
       "name": "Cursor",
-      "tags": ["MCP"],
+      "tags": ["Plugin", "Memory"],
       "logo": "https://lf3-static.bytednsdoc.com/obj/eden-cn/lm_sth/ljhwZthlaukjlkulzlp/agent_logo/Cursor.png",
-      "summary": "通过 MCP 标准协议接入，为 Cursor 提供支撑日常编码和 Agent 开发场景的上下文管理",
+      "summary": "一条命令安装 Cursor 生命周期 Hook、MCP 工具、Rules 与 Skills，实现自动记忆召回和会话捕获",
       "detailPath": "https://docs.openviking.net/agents/zh/cursor.md"
     },
     {
       "id": "trae",
       "name": "TRAE",
-      "tags": ["MCP"],
+      "tags": ["Hook", "MCP"],
       "logo": "https://lf3-static.bytednsdoc.com/obj/eden-cn/lm_sth/ljhwZthlaukjlkulzlp/agent_logo/Trae.png",
-      "summary": "通过 MCP 标准协议接入，为 TRAE 提供支撑日常编码 和 Agent 开发场景的上下文管理，可以修改规则和命令来保证更稳定的 MCP 工具使用",
+      "summary": "通过原生 Hook 与 MCP 工具，为 TRAE 和 TRAE CN 提供 prompt 自动召回与回合捕获",
       "detailPath": "https://docs.openviking.net/agents/zh/trae.md"
     },
     {
@@ -95,6 +95,26 @@
       "logo": "https://lf3-static.bytednsdoc.com/obj/eden-cn/lm_sth/ljhwZthlaukjlkulzlp/agent_logo/OpenCode.png",
       "summary": "提供一个统一 OpenCode 插件，支持仓库上下文、记忆工具、session 同步与自动 recall",
       "detailPath": "https://docs.openviking.net/agents/zh/opencode.md"
+    },
+    {
+      "id": "deerflow",
+      "name": "DeerFlow",
+      "tags": ["MemoryManager", "MCP"],
+      "logo": "https://lf3-static.bytednsdoc.com/obj/eden-cn/lm_sth/ljhwZthlaukjlkulzlp/agent_logo/deer.png",
+      "summary": "DeerFlow 支持通过 MemoryManager 和 MCP 接入，实现记忆的自动写入、召回、注入及管理。建议同时启用两种方式，以获得完整的记忆体验。",
+      "detailPath": "https://docs.openviking.net/agents/zh/deerflow-memory-manager.md",
+      "tabs": [
+        {
+          "id": "memory-manager",
+          "label": "MemoryManager 接入",
+          "detailPath": "https://docs.openviking.net/agents/zh/deerflow-memory-manager.md"
+        },
+        {
+          "id": "mcp",
+          "label": "MCP 接入",
+          "detailPath": "https://docs.openviking.net/agents/zh/deerflow-mcp.md"
+        }
+      ]
     }
   ]
 }

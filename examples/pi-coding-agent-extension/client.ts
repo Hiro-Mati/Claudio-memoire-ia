@@ -61,12 +61,33 @@ export interface OVSessionContext {
   };
 }
 
+export interface OVCommitResult {
+  task_id?: string;
+  archive_uri?: string;
+  trace_id?: string;
+}
+
+export interface OVCommitResponse {
+  result: OVCommitResult | null;
+  traceId?: string;
+  error?: any;
+  status?: number;
+}
+
+export interface OVResponse<T> {
+  ok: boolean;
+  result: T | null;
+  error?: any;
+  status?: number;
+  traceId?: string;
+}
+
 export class OVClient {
   private baseUrl: string;
   private apiKey: string;
   private account: string;
   private user: string;
-  private agent: string;
+  private peerId: string;
   connected: boolean = false;
 
   private resolvedSpaces: Map<string, string> = new Map();
@@ -83,7 +104,7 @@ export class OVClient {
     this.apiKey = config.apiKey;
     this.account = config.account;
     this.user = config.user;
-    this.agent = config.agentId;
+    this.peerId = config.peerId;
   }
 
   private headers(): Record<string, string> {
@@ -91,12 +112,13 @@ export class OVClient {
     if (this.apiKey) h["Authorization"] = `Bearer ${this.apiKey}`;
     if (this.account) h["X-OpenViking-Account"] = this.account;
     if (this.user) h["X-OpenViking-User"] = this.user;
-    if (this.agent) h["X-OpenViking-Agent"] = this.agent;
+    if (this.peerId) h["X-OpenViking-Actor-Peer"] = this.peerId;
+    if (this.cfg.userAgent) h["User-Agent"] = this.cfg.userAgent;
     return h;
   }
 
   /** Core fetch wrapper. Returns { ok, result } after parsing OV's { status, result } envelope. */
-  private async fetchJSON<T>(path: string, init?: RequestInit, timeoutMs = 10000): Promise<{ ok: boolean; result: T | null; error?: any }> {
+  async fetchJSON<T>(path: string, init?: RequestInit, timeoutMs = 10000): Promise<OVResponse<T>> {
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -107,12 +129,19 @@ export class OVClient {
       });
       clearTimeout(timer);
       const body = await resp.json().catch(() => ({}));
+      const traceId = body?.result?.trace_id || body?.error?.trace_id || body?.trace_id || undefined;
       if (!resp.ok || body.status === "error") {
-        return { ok: false, result: null, error: body.error || { message: `HTTP ${resp.status}` } };
+        return {
+          ok: false,
+          result: null,
+          status: resp.status,
+          error: body.error || { message: `HTTP ${resp.status}` },
+          traceId,
+        };
       }
-      return { ok: true, result: (body.result ?? body) as T };
+      return { ok: true, result: (body.result ?? body) as T, traceId };
     } catch (err: any) {
-      return { ok: false, result: null, error: { message: err?.message || String(err) } };
+      return { ok: false, result: null, status: 0, error: { message: err?.message || String(err) } };
     }
   }
 
@@ -174,14 +203,41 @@ export class OVClient {
     return res.ok;
   }
 
+  async addMessagePayload(sessionId: string, payload: any): Promise<boolean> {
+    const res = await this.fetchJSON<any>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
+      { method: "POST", body: JSON.stringify(payload) },
+      10000,
+    );
+    return res.ok;
+  }
+
   /** POST /api/v1/sessions/{id}/commit — commit session for archiving + extraction */
-  async commitSession(sessionId: string): Promise<{ task_id: string; archive_uri: string } | null> {
-    const res = await this.fetchJSON<{ task_id: string; archive_uri: string }>(
+  async commitSessionResponse(
+    sessionId: string,
+    keepRecentCount = this.cfg.commitKeepRecentCount,
+  ): Promise<OVCommitResponse> {
+    const res = await this.fetchJSON<OVCommitResult>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/commit`,
-      { method: "POST", body: JSON.stringify({}) },
+      { method: "POST", body: JSON.stringify({ keep_recent_count: keepRecentCount }) },
       30000,
     );
-    return res.ok ? res.result : null;
+    if (res.ok && res.result && !res.result.trace_id && res.traceId) {
+      res.result.trace_id = res.traceId;
+    }
+    return {
+      result: res.ok ? res.result : null,
+      traceId: res.traceId,
+      error: res.error,
+      status: res.status,
+    };
+  }
+
+  async commitSession(
+    sessionId: string,
+    keepRecentCount = this.cfg.commitKeepRecentCount,
+  ): Promise<OVCommitResult | null> {
+    return (await this.commitSessionResponse(sessionId, keepRecentCount)).result;
   }
 
   /** DELETE /api/v1/sessions/{id} */
@@ -219,7 +275,7 @@ export class OVClient {
         for (const m of items) {
           all.push({
             uri: m.uri ?? "",
-            context_type: m.context_type ?? bucket === "memories" ? "memory" : bucket === "skills" ? "skill" : "resource",
+            context_type: m.context_type ?? (bucket === "memories" ? "memory" : bucket === "skills" ? "skill" : "resource"),
             score: m.score ?? 0,
             abstract: m.abstract ?? "",
             overview: m.overview ?? null,

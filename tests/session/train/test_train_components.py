@@ -206,6 +206,7 @@ class FakeVikingFS:
     def __init__(self, files: dict[str, str]):
         self.files = files
         self.rm_lock_handles = []
+        self.write_lock_handles = []
 
     async def ls(self, uri: str, output: str = "original", ctx=None, **kwargs):
         del kwargs
@@ -224,12 +225,29 @@ class FakeVikingFS:
     async def read_file(self, uri: str, ctx=None):
         return self.files[uri]
 
-    async def write_file(self, uri: str, content: str, ctx=None):
+    async def write_file(
+        self,
+        uri: str,
+        content: str,
+        ctx=None,
+        lock_handle=None,
+        lease_ref=None,
+    ):
+        self.write_lock_handles.append(
+            (uri, lease_ref if lease_ref is not None else lock_handle)
+        )
         self.files[uri] = content
 
-    async def rm(self, uri: str, recursive: bool = False, ctx=None, lock_handle=None):
+    async def rm(
+        self,
+        uri: str,
+        recursive: bool = False,
+        ctx=None,
+        lock_handle=None,
+        lease_ref=None,
+    ):
         del recursive, ctx
-        self.rm_lock_handles.append(lock_handle)
+        self.rm_lock_handles.append(lease_ref if lease_ref is not None else lock_handle)
         self.files.pop(uri, None)
         return {"estimated_deleted_count": 1}
 
@@ -401,7 +419,8 @@ def test_plan_quality_review_checks_existing_update_and_multi_source_merge():
     assert merged["plan_quality_review_reason"] == "multiple_sources_merged"
 
 
-def test_split_experiences_keep_single_trajectory_provenance():
+@pytest.mark.asyncio
+async def test_split_experiences_keep_single_trajectory_provenance():
     from openviking.session.memory.dataclass import ResolvedOperation, ResolvedOperations
 
     policy_set = _experience_set()
@@ -439,7 +458,7 @@ def test_split_experiences_keep_single_trajectory_provenance():
         errors=[],
     )
 
-    items = _operations_to_plan_items(
+    items = await _operations_to_plan_items(
         operations=operations,
         gradients=[gradient],
         policy_set=policy_set,
@@ -627,6 +646,30 @@ async def test_memory_file_policy_updater_writes_experience_files():
     assert '"memory_type": "experiences"' in written
     assert '"experience_name": "booking_duplicate_handling"' in written
     assert '"version": 2' in written
+
+
+@pytest.mark.asyncio
+async def test_memory_file_policy_updater_reuses_transaction_lock_for_experience_writes():
+    policy_set = _experience_set()
+    fs = FakeVikingFS({})
+    lock_handle = object()
+    gradient = _patch_gradient(
+        uri=policy_set.policies[0].uri,
+        before="content",
+        after="new content",
+    )
+    plan = _plan_from_gradient(gradient)
+
+    result = await MemoryFilePolicyUpdater(viking_fs=fs).apply(
+        plan,
+        policy_set,
+        fake_request_context(),
+        transaction_handle=lock_handle,
+    )
+
+    assert result.errors == []
+    assert result.written_uris == [policy_set.policies[0].uri]
+    assert (policy_set.policies[0].uri, lock_handle) in fs.write_lock_handles
 
 
 @pytest.mark.asyncio
@@ -1327,8 +1370,11 @@ async def test_patch_merge_instruction_requires_skill_experience_sections(monkey
         PatchMergePolicyOptimizerContext(request_context=fake_request_context()),
     )
 
-    assert "`situation`, `reminder`, `procedure`, `anti_pattern`" in captured["instruction"]
-    assert "storage template adds the\nMarkdown structure" in captured["instruction"]
+    assert (
+        "`situation`, `reminder`, `procedure`, `verification`, `fallback`, "
+        "`anti_pattern`"
+    ) in captured["instruction"]
+    assert "storage template adds the Markdown structure" in captured["instruction"]
     assert "canonical value/source-field" in captured["instruction"]
 
 

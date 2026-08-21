@@ -94,7 +94,7 @@
 
 修改配置后，重启 OpenViking 服务（或重新初始化 SDK 客户端）使其生效。
 
-> 仓库中提供了可直接参考的完整示例：[ov.conf.git-local.example](file:///cloudide/workspace/OpenViking/examples/snapshot/ov.conf.git-local.example) 与 [ov.conf.git-s3-tos.example](file:///cloudide/workspace/OpenViking/examples/snapshot/ov.conf.git-s3-tos.example)。
+> 仓库中提供了可直接参考的完整示例：[ov.conf.git-local.example](https://github.com/volcengine/OpenViking/blob/main/examples/snapshot/ov.conf.git-local.example) 与 [ov.conf.git-s3-tos.example](https://github.com/volcengine/OpenViking/blob/main/examples/snapshot/ov.conf.git-s3-tos.example)。
 
 ## 目录结构变化：`.ovgit` 目录
 
@@ -129,9 +129,9 @@ data/                      # storage.workspace
 快照方法挂在 `client.snapshot.*` 命名空间下。
 
 ```python
-import openviking as ov
+from openviking_sdk import SyncHTTPClient
 
-client = ov.OpenViking()
+client = SyncHTTPClient(url="http://localhost:1933", api_key="your-key")
 client.initialize()
 
 root = "viking://resources/my_project"

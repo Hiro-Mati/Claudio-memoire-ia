@@ -24,6 +24,7 @@ class ToolContext:
             and session_key. This determines the sandbox directory for the session.
         sender_id: Optional identifier for the message sender, used for tracking
             and permission checks.
+        actor_peer_id: Authenticated OpenViking peer identity for memory and file tools.
         memory_peer_ids: Optional list of peer IDs for memory retrieval inside
             the current OpenViking user scope.
         memory_owner_user_ids: Optional list of explicit OpenViking user IDs
@@ -44,13 +45,15 @@ class ToolContext:
 
     session_key: SessionKey = None
     sandbox_manager: SandboxManager | None = None
-    workspace_id: str = sandbox_manager.to_workspace_id(session_key) if sandbox_manager else None
+    workspace_id: str | None = None
     sender_id: str | None = None
+    actor_peer_id: str | None = None
     memory_peer_ids: list[str] | None = None
     memory_owner_user_ids: list[str] | None = None
     memory_user_ids: list[str] | None = None  # Deprecated alias for memory_owner_user_ids.
     openviking_connection: dict[str, Any] | None = None
     channel_metadata: dict[str, Any] | None = None
+    skill_runtime: Any | None = None
 
     def __post_init__(self) -> None:
         if self.memory_owner_user_ids is None and self.memory_user_ids is not None:
@@ -59,6 +62,13 @@ class ToolContext:
             self.memory_user_ids = self.memory_owner_user_ids
         if self.channel_metadata is None:
             self.channel_metadata = {}
+        if (
+            self.workspace_id is None
+            and self.sandbox_manager is not None
+            and self.session_key
+            and hasattr(self.sandbox_manager, "to_workspace_id")
+        ):
+            self.workspace_id = self.sandbox_manager.to_workspace_id(self.session_key)
 
 
 class Tool(ABC):
@@ -130,6 +140,16 @@ class Tool(ABC):
     def parameters(self) -> dict[str, Any]:
         """JSON Schema for tool parameters."""
         pass
+
+    @property
+    def resource_inputs(self) -> dict[str, str]:
+        """Parameters that consume a local file or directory.
+
+        The remote Skill runtime only rewrites explicitly declared parameters;
+        it never guesses from parameter names. Keys may be top-level parameter
+        names or JSON-Pointer-like paths with ``*`` list/dict wildcards.
+        """
+        return {}
 
     @abstractmethod
     async def execute(self, tool_context: ToolContext, **kwargs: Any) -> str:

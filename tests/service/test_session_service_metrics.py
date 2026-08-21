@@ -82,26 +82,26 @@ async def test_sessions_returns_empty_and_logs_when_storage_listing_fails(
     result = await service.sessions(ctx)
 
     assert result == []
-    assert debug.call_count == 2
+    assert debug.call_count == 1
 
 
 @pytest.mark.asyncio
-async def test_sessions_merges_canonical_and_legacy_session_scope():
+async def test_sessions_uses_canonical_scope_and_relies_on_storage_compatibility():
     service = SessionService(viking_fs=Mock())
     ctx = _make_ctx()
 
-    async def _ls(uri, ctx):
-        if uri == "viking://user/alice/sessions":
-            return [
-                {"name": "duplicate", "isDir": True},
-                {"name": "new-session", "isDir": True},
-            ]
-        if uri == "viking://session":
-            return [
-                {"name": "duplicate", "uri": "viking://session/duplicate", "isDir": True},
-                {"name": "legacy-session", "uri": "viking://session/legacy-session", "isDir": True},
-            ]
-        raise AssertionError(uri)
+    async def _ls(uri, ctx, **kwargs):
+        assert uri == "viking://user/alice/sessions"
+        assert kwargs == {"sort_by": "mtime", "sort_order": "desc"}
+        return [
+            {"name": "duplicate", "isDir": True, "modTime": "2026-07-13T01:00:00Z"},
+            {"name": "new-session", "isDir": True, "modTime": "2026-07-13T02:00:00Z"},
+            {
+                "name": "legacy-session",
+                "isDir": True,
+                "modTime": "2026-07-12T01:00:00Z",
+            },
+        ]
 
     service._viking_fs.ls = AsyncMock(side_effect=_ls)
 
@@ -112,15 +112,19 @@ async def test_sessions_merges_canonical_and_legacy_session_scope():
             "session_id": "duplicate",
             "uri": "viking://user/alice/sessions/duplicate",
             "is_dir": True,
+            "mod_time": "2026-07-13T01:00:00Z",
         },
         {
             "session_id": "new-session",
             "uri": "viking://user/alice/sessions/new-session",
             "is_dir": True,
+            "mod_time": "2026-07-13T02:00:00Z",
         },
         {
             "session_id": "legacy-session",
-            "uri": "viking://session/legacy-session",
+            "uri": "viking://user/alice/sessions/legacy-session",
             "is_dir": True,
+            "mod_time": "2026-07-12T01:00:00Z",
         },
     ]
+    service._viking_fs.ls.assert_awaited_once()

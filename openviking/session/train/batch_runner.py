@@ -60,7 +60,7 @@ class BatchTrainEvalConfig:
     dataset: str
     epochs: int = 1
     batch_size: int | None = None
-    concurrency: int = 150
+    concurrency: int = 200
     config_path: str | None = None
     output_path: str | None = None
     keep_default_tools: bool = True
@@ -77,7 +77,7 @@ class BatchTrainEvalConfig:
     commit_keep_recent_count: int = 0
     commit_poll_interval_seconds: float = 2.0
     commit_timeout_seconds: float | None = None
-    commit_concurrency: int = 150
+    commit_concurrency: int = 200
     commit_case_spec_enabled: bool | None = None
     train_split: str = "train"
     train_index: int | str | list[int] | tuple[int, ...] | None = None
@@ -327,7 +327,7 @@ async def run_batch_train_eval(config: BatchTrainEvalConfig) -> BatchTrainEvalRe
         _clean_result_dir(config)
         client = _build_http_client(config)
         await client.initialize()
-        policy_root_uri = "viking://user/memories/experiences"
+        policy_root_uri = f"viking://user/{config.user_id}/memories/experiences"
         policy_set = ExperienceSet(
             root_uri=policy_root_uri,
             policies=[],

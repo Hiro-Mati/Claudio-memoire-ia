@@ -120,7 +120,7 @@ curl -X POST http://localhost:1933/api/v1/resources/temp_upload \
 ```
 
 This endpoint currently accepts the boolean form only.
-`upload_mode` is also a form field for this endpoint; it defaults to `local` and should only be set to `shared` when you explicitly need distributed shared temporary uploads. Python HTTP client / CLI users can alternatively drive the same behavior with `ovcli.conf` -> `upload.mode = "shared"`.
+`upload_mode` is also a form field for this endpoint; it defaults to `local` and should only be set to `shared` when you explicitly need distributed shared temporary uploads. Python HTTP clients can alternatively set `upload.mode = "shared"` in `ovcli.conf`; the Rust `ov` CLI uses `OPENVIKING_UPLOAD_MODE=shared` instead.
 
 ## Common summary groups
 
@@ -176,6 +176,51 @@ Only fields that are actually produced by an operation are returned. Missing gro
 | `summary.vector.scanned` | Number of vectors scanned by the backend |
 | `summary.vector.scan_reason` | Text description of the scan strategy or reason |
 
+When cuVS is configured, `summary.vector.cuvs` aggregates routing and timing
+information across every dense search in the operation. The aggregation is
+independent of concurrent-query completion order. It never includes the query
+vector, filter values, or URI contents, and unknown dimension values are
+coalesced into the bounded `other` bucket.
+
+| Field | Meaning |
+| --- | --- |
+| `summary.vector.cuvs.searches` | Number of dense searches represented by this aggregate |
+| `summary.vector.cuvs.algorithms.<algorithm>` | Search count by cuVS algorithm, such as `brute_force` or `cagra` |
+| `summary.vector.cuvs.dtypes.<dtype>` | Search count by GPU dataset/query dtype, `float32` or `float16` |
+| `summary.vector.cuvs.max_concurrent_gpu_searches` | Maximum configured per-index in-flight GPU search limit observed |
+| `summary.vector.cuvs.auto_mode_searches` | Number of searches with automatic CPU/GPU routing enabled |
+| `summary.vector.cuvs.micro_batching_searches` | Number of searches that used the opt-in OpenViking micro-batch scheduler |
+| `summary.vector.cuvs.micro_batched_searches` | Number of those searches dispatched with more than one query row |
+| `summary.vector.cuvs.micro_batching_warm_fast_path_searches` | Number of micro-batching-scheduler searches enqueued from a clean current snapshot without caller-side device-gate admission |
+| `summary.vector.cuvs.batch_size_max` | Maximum query-row count observed in one shared cuVS call |
+| `summary.vector.cuvs.searches_by_batch_size.<size>` | Search count by bounded batch size from 1 through 8 |
+| `summary.vector.cuvs.routes.<reason>` | Search count by route, such as `cuvs`, `native_filter_threshold`, `native_rebuild_pending`, or `native_memory_budget` |
+| `summary.vector.cuvs.filter_kinds.<kind>` | Search count by low-cardinality filter class: `none`, `scalar`, or `path` |
+| `summary.vector.cuvs.filter_cache_hits` | Number of searches that reused a prepared or preflight filter |
+| `summary.vector.cuvs.native_filter_reuses` | Number of native recalls that reused the preflight bitmap |
+| `summary.vector.cuvs.builds` | Number of searches that performed a GPU index build |
+| `summary.vector.cuvs.eligible_count_max` | Maximum candidate count observed after native filtering |
+| `summary.vector.cuvs.records_generation_max` | Maximum record generation observed |
+| `summary.vector.cuvs.index_size_max` | Maximum cuVS host-snapshot size observed |
+| `summary.vector.cuvs.memory.estimated_peak_bytes_max` | Maximum estimated peak bytes used for auto-build admission |
+| `summary.vector.cuvs.memory.free_bytes_min` | Minimum free device bytes observed inside the per-GPU admission coordinator |
+| `summary.vector.cuvs.memory.usable_bytes_min` | Minimum free bytes observed after applying the configured reserve |
+| `summary.vector.cuvs.timings_ms.<stage>.sum` | Sum across searches for `total`, `preflight`, `queue`, `gpu_gate_queue`, `build`, `filter_prepare`, `batch_wait`, `gpu_search`, or `native_search` |
+| `summary.vector.cuvs.timings_ms.<stage>.max` | Maximum single-search time for the same stage |
+
+For a shared micro-batch, `gpu_search` is the cuVS call's service latency from
+each member request's perspective. Its duration is therefore recorded once per
+request: `gpu_search.sum` is useful as aggregate request latency, but it is not
+GPU busy time and can be approximately batch-size times the physical call
+duration. `batch_wait` is the request's time from scheduler enqueue to GPU
+dispatch, including worker scheduling and any wait behind current device work.
+`gpu_gate_queue` is caller-side time waiting to enter the serialized device
+gate before gated rebuild/filter preparation, enqueue, or a non-batched GPU
+search. A warm-fast-path request bypasses that caller admission, so its
+`gpu_gate_queue` is zero; its worker-side wait remains part of `batch_wait`.
+The broader `queue` stage includes both forms of request-visible queueing when
+they apply.
+
 ### `summary.resource`
 
 This group appears on resource ingestion operations such as `resources.add_resource`.
@@ -225,7 +270,6 @@ This group appears on memory-extraction flows such as `session.commit`.
 | `summary.memory.extract.duration_ms` | Total duration of the memory-extraction flow |
 | `summary.memory.extract.candidates.total` | Total extracted candidates before final actions |
 | `summary.memory.extract.candidates.standard` | Standard memory candidates |
-| `summary.memory.extract.candidates.tool_skill` | Tool or skill candidates |
 | `summary.memory.extract.actions.created` | Number of newly created memories |
 | `summary.memory.extract.actions.merged` | Number of merges into existing memories |
 | `summary.memory.extract.actions.deleted` | Number of deleted old memories |
@@ -233,14 +277,11 @@ This group appears on memory-extraction flows such as `session.commit`.
 | `summary.memory.extract.stages.prepare_inputs_ms` | Time spent preparing extraction inputs |
 | `summary.memory.extract.stages.llm_extract_ms` | Time spent in the LLM extraction call |
 | `summary.memory.extract.stages.normalize_candidates_ms` | Time spent parsing and normalizing candidates |
-| `summary.memory.extract.stages.tool_skill_stats_ms` | Time spent aggregating tool or skill stats |
 | `summary.memory.extract.stages.profile_create_ms` | Time spent creating or updating profile memory |
-| `summary.memory.extract.stages.tool_skill_merge_ms` | Time spent merging tool or skill memories |
 | `summary.memory.extract.stages.dedup_ms` | Time spent deduplicating candidates |
 | `summary.memory.extract.stages.create_memory_ms` | Time spent creating new memories |
 | `summary.memory.extract.stages.merge_existing_ms` | Time spent merging into existing memories |
 | `summary.memory.extract.stages.delete_existing_ms` | Time spent deleting older memories |
-| `summary.memory.extract.stages.create_relations_ms` | Time spent creating used-URI relations |
 | `summary.memory.extract.stages.flush_semantic_ms` | Time spent flushing semantic queue work |
 
 ### `summary.search`
@@ -293,9 +334,9 @@ curl -X POST http://localhost:1933/api/v1/resources \
 ### Python SDK
 
 ```python
-from openviking import AsyncOpenVikingClient
+from openviking_sdk import AsyncHTTPClient
 
-client = AsyncOpenVikingClient(config_path="/path/to/config.yaml")
+client = AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
 await client.initialize()
 
 result = await client.find("memory dedup", telemetry=True)

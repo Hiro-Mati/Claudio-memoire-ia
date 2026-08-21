@@ -28,7 +28,7 @@ from openviking.session.train.domain import (
     RubricEvaluation,
 )
 
-DEFAULT_REMOTE_CASE_PAGE_SIZE = 1000
+DEFAULT_REMOTE_CASE_PAGE_SIZE = 100
 
 
 @dataclass(slots=True)

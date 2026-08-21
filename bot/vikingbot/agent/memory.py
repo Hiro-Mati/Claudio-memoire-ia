@@ -5,7 +5,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -13,6 +13,9 @@ from vikingbot.agent.experience_constraints import ConstraintExperience
 from vikingbot.config.loader import load_config
 from vikingbot.openviking_mount.ov_server import VikingClient
 from vikingbot.utils.helpers import ensure_dir
+
+if TYPE_CHECKING:
+    from vikingbot.config.schema import Config
 
 _LEGACY_MEMORY_RECALL_LIMIT = 30
 _TYPE_QUOTA_MEMORY_TYPES = ("events", "entities", "preferences")
@@ -46,10 +49,16 @@ _MEMORY_TYPE_DESCRIPTIONS = {
 class MemoryStore:
     """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, config: "Config | None" = None):
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
+        self._config = config
+
+    def _get_config(self) -> "Config":
+        if self._config is None:
+            self._config = load_config()
+        return self._config
 
     @staticmethod
     def _get_score(memory: Any) -> float:
@@ -88,18 +97,6 @@ class MemoryStore:
             if isinstance(memory, dict)
             else getattr(memory, "_recall_type", "")
         )
-
-    @staticmethod
-    def _get_recall_rank(memory: Any) -> int:
-        raw_rank = (
-            memory.get("_recall_rank", 0)
-            if isinstance(memory, dict)
-            else getattr(memory, "_recall_rank", 0)
-        )
-        try:
-            return int(raw_rank)
-        except (TypeError, ValueError):
-            return 0
 
     @classmethod
     def _infer_memory_type(cls, memory: Any) -> str:
@@ -502,6 +499,7 @@ class MemoryStore:
                     agent_id=workspace_id,
                     connection=openviking_connection,
                     actor_peer_id=normalized_peer_id,
+                    config=self._get_config(),
                 )
                 should_close = True
 
@@ -544,7 +542,8 @@ class MemoryStore:
         client = None
         read_clients: dict[str, VikingClient] = {}
         try:
-            ov_cfg = load_config().ov_server
+            config = self._get_config()
+            ov_cfg = config.ov_server
             admin_user_id = (
                 str(openviking_connection.get("user_id"))
                 if isinstance(openviking_connection, dict) and openviking_connection.get("user_id")
@@ -560,6 +559,7 @@ class MemoryStore:
                 agent_id=workspace_id,
                 connection=openviking_connection,
                 actor_peer_id=sender_id,
+                config=config,
             )
             if sender_id:
                 search_peer_ids = [sender_id, *(peer_ids or [])]
@@ -618,6 +618,7 @@ class MemoryStore:
                             agent_id=workspace_id,
                             connection=openviking_connection,
                             actor_peer_id=memory_peer_id,
+                            config=config,
                         )
                         read_clients[memory_peer_id] = peer_client
                     return await peer_client.read_content(uri, level=level)
@@ -769,10 +770,12 @@ class MemoryStore:
             )
         client = None
         try:
-            ov_cfg = load_config().ov_server
+            config = self._get_config()
+            ov_cfg = config.ov_server
             client = await VikingClient.create(
                 agent_id=workspace_id,
                 connection=openviking_connection,
+                config=config,
             )
             case_limit = max(0, int(getattr(ov_cfg, "case_recall_limit", 0) or 0))
             if case_lookup:
@@ -865,10 +868,12 @@ class MemoryStore:
     ) -> tuple[str, list[str]]:
         client = None
         try:
-            ov_cfg = load_config().ov_server
+            config = self._get_config()
+            ov_cfg = config.ov_server
             client = await VikingClient.create(
                 agent_id=workspace_id,
                 connection=openviking_connection,
+                config=config,
             )
             case_limit = max(1, int(getattr(ov_cfg, "case_recall_limit", 0) or 1))
             cases = await self._find_cases_by_lookup(
@@ -1333,6 +1338,7 @@ class MemoryStore:
                 agent_id=workspace_id,
                 connection=openviking_connection,
                 actor_peer_id=actor_peer_id or peer_id,
+                config=self._get_config(),
             )
             result = await client.read_peer_profile(peer_id)
             return result or ""
@@ -1362,6 +1368,7 @@ class MemoryStore:
                 client = await VikingClient.create(
                     agent_id=workspace_id,
                     connection=openviking_connection,
+                    config=self._get_config(),
                 )
 
             async def fetch_profile(peer_id: str) -> tuple[str, str]:
@@ -1373,6 +1380,7 @@ class MemoryStore:
                             agent_id=workspace_id,
                             connection=openviking_connection,
                             actor_peer_id=peer_id,
+                            config=self._get_config(),
                         )
                         should_close = True
                     start_time = time.time()

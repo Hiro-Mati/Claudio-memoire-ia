@@ -167,7 +167,7 @@ def test_case_schema_exposes_identity_but_hides_system_fields_from_extractor():
 async def test_missing_case_comparison_repair_uses_only_compact_identity_context():
     operation = prepare_case_operation(_case_operation(session_id="new-source"))
     schema = create_default_registry().get("cases")
-    required = build_memory_merge_proposals(
+    required = await build_memory_merge_proposals(
         operations=[operation],
         delete_files=[],
         schema=schema,
@@ -219,7 +219,7 @@ async def test_missing_case_comparison_repair_uses_only_compact_identity_context
 async def test_missing_case_comparison_repair_retries_only_unresolved_pairs():
     operation = prepare_case_operation(_case_operation(session_id="new-source"))
     schema = create_default_registry().get("cases")
-    required = build_memory_merge_proposals(
+    required = await build_memory_merge_proposals(
         operations=[operation], delete_files=[], schema=schema, extract_context=ExtractContext([])
     )
     required[0].proposal_id = "new:0"
@@ -478,10 +478,11 @@ def test_case_compaction_policy_uses_second_source_and_later_delta():
     )
 
 
-def test_case_plan_requires_code_selected_primary():
+@pytest.mark.asyncio
+async def test_case_plan_requires_code_selected_primary():
     schema = create_default_registry().get("cases")
     operation = prepare_case_operation(_case_operation(session_id="new"))
-    required = build_memory_merge_proposals(
+    required = await build_memory_merge_proposals(
         operations=[operation],
         delete_files=[],
         schema=schema,
@@ -544,10 +545,11 @@ def test_case_plan_requires_code_selected_primary():
         )
 
 
-def test_case_plan_ignores_extra_read_only_candidate_comparisons():
+@pytest.mark.asyncio
+async def test_case_plan_ignores_extra_read_only_candidate_comparisons():
     schema = create_default_registry().get("cases")
     operation = prepare_case_operation(_case_operation(session_id="new"))
-    required = build_memory_merge_proposals(
+    required = await build_memory_merge_proposals(
         operations=[operation],
         delete_files=[],
         schema=schema,
@@ -599,10 +601,11 @@ def test_case_plan_ignores_extra_read_only_candidate_comparisons():
     )
 
 
-def test_case_plan_ignores_irrelevant_extra_comparisons():
+@pytest.mark.asyncio
+async def test_case_plan_ignores_irrelevant_extra_comparisons():
     schema = create_default_registry().get("cases")
     operation = prepare_case_operation(_case_operation(session_id="new"))
-    required = build_memory_merge_proposals(
+    required = await build_memory_merge_proposals(
         operations=[operation],
         delete_files=[],
         schema=schema,
@@ -646,10 +649,11 @@ def test_case_plan_ignores_irrelevant_extra_comparisons():
     )
 
 
-def test_case_plan_still_rejects_missing_required_comparisons():
+@pytest.mark.asyncio
+async def test_case_plan_still_rejects_missing_required_comparisons():
     schema = create_default_registry().get("cases")
     operation = prepare_case_operation(_case_operation(session_id="new"))
-    required = build_memory_merge_proposals(
+    required = await build_memory_merge_proposals(
         operations=[operation],
         delete_files=[],
         schema=schema,
@@ -689,13 +693,14 @@ def test_case_plan_still_rejects_missing_required_comparisons():
         )
 
 
-def test_case_plan_accepts_reversed_comparison_orientation():
+@pytest.mark.asyncio
+async def test_case_plan_accepts_reversed_comparison_orientation():
     schema = create_default_registry().get("cases")
     operations = [
         prepare_case_operation(_case_operation(session_id="first")),
         prepare_case_operation(_case_operation(session_id="second")),
     ]
-    required = build_memory_merge_proposals(
+    required = await build_memory_merge_proposals(
         operations=operations,
         delete_files=[],
         schema=schema,
@@ -740,7 +745,7 @@ def test_case_plan_accepts_reversed_comparison_orientation():
         required_proposals=required,
         all_proposals=all_proposals,
     )
-    merged = reconstruct_memory_operations_from_plan(
+    merged = await reconstruct_memory_operations_from_plan(
         plan,
         required_proposals=required,
         all_proposals=all_proposals,
@@ -759,10 +764,11 @@ def test_case_plan_accepts_reversed_comparison_orientation():
     assert fields["case_identity"] == _generalized_identity().compact_json()
 
 
-def test_case_plan_drops_read_only_candidate_groups():
+@pytest.mark.asyncio
+async def test_case_plan_drops_read_only_candidate_groups():
     schema = create_default_registry().get("cases")
     operation = prepare_case_operation(_case_operation(session_id="new"))
-    required = build_memory_merge_proposals(
+    required = await build_memory_merge_proposals(
         operations=[operation],
         delete_files=[],
         schema=schema,
@@ -814,10 +820,11 @@ def test_case_plan_drops_read_only_candidate_groups():
     )
 
 
-def test_case_plan_normalizes_existing_case_as_canonical():
+@pytest.mark.asyncio
+async def test_case_plan_normalizes_existing_case_as_canonical():
     schema = create_default_registry().get("cases")
     operation = prepare_case_operation(_case_operation(session_id="new"))
-    required = build_memory_merge_proposals(
+    required = await build_memory_merge_proposals(
         operations=[operation],
         delete_files=[],
         schema=schema,
@@ -869,7 +876,8 @@ def test_case_plan_normalizes_existing_case_as_canonical():
     )
 
 
-def test_case_ordinary_update_only_advances_sources_not_body():
+@pytest.mark.asyncio
+async def test_case_ordinary_update_only_advances_sources_not_body():
     schema = create_default_registry().get("cases")
     old_file = _case_file(source_count=2, last_compacted_source_count=2)
     operation = prepare_case_operation(_case_operation(session_id="new-3", old_file=old_file))
@@ -909,7 +917,7 @@ def test_case_ordinary_update_only_advances_sources_not_body():
             ],
         }
     )
-    merged = reconstruct_memory_operations_from_plan(
+    merged = await reconstruct_memory_operations_from_plan(
         plan,
         required_proposals=required,
         all_proposals=all_proposals,
@@ -930,7 +938,8 @@ def test_case_ordinary_update_only_advances_sources_not_body():
     assert not set({"task_signature", "input", "situation", "rubric", "evidence"}) & set(fields)
 
 
-def test_case_ordinary_update_ignores_unscheduled_body_rewrite():
+@pytest.mark.asyncio
+async def test_case_ordinary_update_ignores_unscheduled_body_rewrite():
     schema = create_default_registry().get("cases")
     old_file = _case_file(source_count=2, last_compacted_source_count=2)
     operation = prepare_case_operation(_case_operation(session_id="new-3", old_file=old_file))
@@ -975,7 +984,7 @@ def test_case_ordinary_update_ignores_unscheduled_body_rewrite():
             ],
         }
     )
-    merged = reconstruct_memory_operations_from_plan(
+    merged = await reconstruct_memory_operations_from_plan(
         plan,
         required_proposals=required,
         all_proposals=all_proposals,
@@ -995,7 +1004,8 @@ def test_case_ordinary_update_ignores_unscheduled_body_rewrite():
     assert not set({"task_signature", "input", "situation", "rubric", "evidence"}) & set(fields)
 
 
-def test_compatible_identity_waits_for_scheduled_compaction():
+@pytest.mark.asyncio
+async def test_compatible_identity_waits_for_scheduled_compaction():
     schema = create_default_registry().get("cases")
     old_file = _case_file(source_count=2, last_compacted_source_count=2)
     operation = prepare_case_operation(_case_operation(session_id="new-3", old_file=old_file))
@@ -1033,7 +1043,7 @@ def test_compatible_identity_waits_for_scheduled_compaction():
             ],
         }
     )
-    merged = reconstruct_memory_operations_from_plan(
+    merged = await reconstruct_memory_operations_from_plan(
         plan,
         required_proposals=required,
         all_proposals=all_proposals,
@@ -1053,7 +1063,8 @@ def test_compatible_identity_waits_for_scheduled_compaction():
     assert [item["source_id"] for item in fields[CASE_PENDING_SOURCES_FIELD]] == ["session:new-3"]
 
 
-def test_second_source_compaction_rejects_partial_body():
+@pytest.mark.asyncio
+async def test_second_source_compaction_rejects_partial_body():
     schema = create_default_registry().get("cases")
     old_file = _case_file(source_count=1, last_compacted_source_count=0)
     operation = prepare_case_operation(_case_operation(session_id="new-2", old_file=old_file))
@@ -1087,7 +1098,7 @@ def test_second_source_compaction_rejects_partial_body():
             ],
         }
     )
-    merged = reconstruct_memory_operations_from_plan(
+    merged = await reconstruct_memory_operations_from_plan(
         plan,
         required_proposals=required,
         all_proposals=all_proposals,
@@ -1103,7 +1114,8 @@ def test_second_source_compaction_rejects_partial_body():
         )
 
 
-def test_second_source_compaction_rewrites_body_and_clears_pending_sources():
+@pytest.mark.asyncio
+async def test_second_source_compaction_rewrites_body_and_clears_pending_sources():
     schema = create_default_registry().get("cases")
     old_file = _case_file(source_count=1, last_compacted_source_count=0)
     operation = prepare_case_operation(_case_operation(session_id="new-2", old_file=old_file))
@@ -1147,7 +1159,7 @@ def test_second_source_compaction_rewrites_body_and_clears_pending_sources():
             ],
         }
     )
-    merged = reconstruct_memory_operations_from_plan(
+    merged = await reconstruct_memory_operations_from_plan(
         plan,
         required_proposals=required,
         all_proposals=all_proposals,
@@ -1169,7 +1181,8 @@ def test_second_source_compaction_rewrites_body_and_clears_pending_sources():
     assert fields[CASE_PENDING_SOURCES_FIELD] == []
 
 
-def test_second_source_compaction_requires_generalized_identity():
+@pytest.mark.asyncio
+async def test_second_source_compaction_requires_generalized_identity():
     schema = create_default_registry().get("cases")
     old_file = _case_file(source_count=1, last_compacted_source_count=0)
     operation = prepare_case_operation(_case_operation(session_id="new-2", old_file=old_file))
@@ -1215,7 +1228,7 @@ def test_second_source_compaction_requires_generalized_identity():
             ],
         }
     )
-    merged = reconstruct_memory_operations_from_plan(
+    merged = await reconstruct_memory_operations_from_plan(
         plan,
         required_proposals=required,
         all_proposals=all_proposals,
@@ -1234,7 +1247,8 @@ def test_second_source_compaction_requires_generalized_identity():
         )
 
 
-def test_conflicting_target_is_split_into_new_draft_without_deleting_original():
+@pytest.mark.asyncio
+async def test_conflicting_target_is_split_into_new_draft_without_deleting_original():
     schema = create_default_registry().get("cases")
     old_file = _case_file(source_count=2, last_compacted_source_count=2)
     operation = prepare_case_operation(_case_operation(session_id="conflict", old_file=old_file))
@@ -1277,7 +1291,7 @@ def test_conflicting_target_is_split_into_new_draft_without_deleting_original():
         required_proposals=required,
         all_proposals=all_proposals,
     )
-    merged = reconstruct_memory_operations_from_plan(
+    merged = await reconstruct_memory_operations_from_plan(
         plan,
         required_proposals=required,
         all_proposals=all_proposals,

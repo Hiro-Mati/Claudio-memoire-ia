@@ -264,6 +264,38 @@ describe("OpenVikingClient resource and skill import", () => {
     );
   });
 
+  it("includes a response error trace_id in the thrown request error", async () => {
+    const transport = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({
+        status: "error",
+        error: {
+          code: "INTERNAL",
+          message: "commit failed",
+          trace_id: "trace-client-error",
+        },
+      }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const client = new OpenVikingClient(
+      "http://127.0.0.1:1933",
+      "",
+      "agent",
+      5_000,
+      "",
+      "",
+      undefined,
+      false,
+      true,
+      { transport },
+    );
+
+    await expect(client.commitSession("trace-error")).rejects.toThrow(
+      "trace_id=trace-client-error",
+    );
+  });
+
   it("uses an extended request timeout for wait=true imports", async () => {
     vi.useFakeTimers();
     const transport = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
@@ -346,6 +378,34 @@ describe("OpenVikingClient resource and skill import", () => {
       memories_extracted: { core: 1 },
     });
   });
+
+  it("returns session commit trace_id from the response result", async () => {
+    const transport = vi.fn().mockResolvedValue(
+      okResponse({
+        session_id: "trace-session",
+        status: "accepted",
+        task_id: "task-trace",
+        archived: true,
+        trace_id: "trace-client-commit",
+      }),
+    );
+    const client = new OpenVikingClient(
+      "http://127.0.0.1:1933",
+      "",
+      "agent",
+      5_000,
+      "",
+      "",
+      undefined,
+      false,
+      true,
+      { transport },
+    );
+
+    await expect(client.commitSession("trace-session")).resolves.toMatchObject({
+      trace_id: "trace-client-commit",
+    });
+  });
 });
 
 describe("OpenVikingClient tenant headers (advanced accountId / userId overrides)", () => {
@@ -408,6 +468,50 @@ describe("OpenVikingClient tenant headers (advanced accountId / userId overrides
     expect(headers.get("X-API-Key")).toBe("sk-root");
     expect(headers.get("X-OpenViking-Account")).toBe("acct-123");
     expect(headers.get("X-OpenViking-User")).toBe("user-456");
+  });
+
+  it("applies configured headers after explicit API and tenant headers", async () => {
+    const transport = vi.fn().mockResolvedValue(okResponse({ status: "ok" }));
+
+    const client = new OpenVikingClient(
+      "http://127.0.0.1:1933", "sk-explicit", "agent", 5000,
+      "acct-explicit", "user-explicit", undefined, false, true,
+      {
+        transport,
+        headers: {
+          "X-API-Key": "sk-from-config",
+          "X-OpenViking-Account": "acct-from-config",
+          "X-OpenViking-User": "user-from-config",
+          openviking: "i18n-instance",
+          token: "root-token",
+        },
+      },
+    );
+    await client.healthCheck();
+
+    const [, init] = transport.mock.calls[0] as [string, RequestInit];
+    const headers = new Headers(init.headers);
+    expect(headers.get("X-API-Key")).toBe("sk-from-config");
+    expect(headers.get("X-OpenViking-Account")).toBe("acct-from-config");
+    expect(headers.get("X-OpenViking-User")).toBe("user-from-config");
+    expect(headers.get("openviking")).toBe("i18n-instance");
+    expect(headers.get("token")).toBe("root-token");
+  });
+
+  it("can use explicit configured headers as the only API key source", async () => {
+    const transport = vi.fn().mockResolvedValue(okResponse({ status: "ok" }));
+
+    const client = new OpenVikingClient(
+      "http://127.0.0.1:1933", "", "agent", 5000,
+      "", "", undefined, false, true,
+      { transport, headers: { "X-API-Key": "sk-from-config", token: "root-token" } },
+    );
+    await client.healthCheck();
+
+    const [, init] = transport.mock.calls[0] as [string, RequestInit];
+    const headers = new Headers(init.headers);
+    expect(headers.get("X-API-Key")).toBe("sk-from-config");
+    expect(headers.get("token")).toBe("root-token");
   });
 
   it("does not synthesize tenant headers when apiKey is missing", async () => {
@@ -554,7 +658,7 @@ describe("OpenVikingClient canonical namespace policy", () => {
     expect(body.target_uri).toBe("viking://user/skills");
   });
 
-  it("includes role_id when addSessionMessage receives one", async () => {
+  it("includes peer_id when addSessionMessage receives one", async () => {
     const transport = vi.fn().mockResolvedValue(okResponse({ session_id: "s1" }));
 
     const client = new OpenVikingClient("http://127.0.0.1:1933", "", "agent", 5000, "", "", undefined, false, true, { transport });
@@ -569,6 +673,7 @@ describe("OpenVikingClient canonical namespace policy", () => {
 
     const [, init] = transport.mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(String(init.body));
-    expect(body.role_id).toBe("telegram_12345");
+    expect(body.peer_id).toBe("telegram_12345");
+    expect(body).not.toHaveProperty("role_id");
   });
 });

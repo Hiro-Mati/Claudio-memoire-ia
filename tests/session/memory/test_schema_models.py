@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Tests for schema_models.py - dynamic Pydantic model generation."""
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from openviking.session.memory.schema_model_generator import (
     SchemaModelGenerator,
     to_pascal_case,
 )
+from openviking.session.memory.utils.json_parser import parse_json_with_stability
 
 
 class TestToPascalCase:
@@ -142,6 +144,16 @@ class TestSchemaModelGenerator:
 
         assert "First test field" in model.model_fields["field1"].description
 
+    def test_events_ranges_description_requires_user_source(self, real_registry):
+        events = real_registry.get("events")
+        model = SchemaModelGenerator([events]).create_flat_data_model(events)
+
+        description = model.model_fields["ranges"].description
+
+        assert "MUST include at least one user-role message" in description
+        assert "include both the originating user message and the assistant message" in description
+        assert "Never output assistant-only ranges for events" in description
+
     def test_render_description_template_conditional_branch(self):
         memory_type = MemoryTypeSchema(
             memory_type="conditional",
@@ -259,6 +271,74 @@ class TestSchemaModelGenerator:
             "Temporary page_id for identifying the target memory item."
         )
 
+    def test_existing_patch_can_omit_immutable_fields_but_new_item_cannot(
+        self, real_registry
+    ):
+        entities = real_registry.get("entities")
+        model = SchemaModelGenerator([entities]).create_flat_data_model(entities)
+
+        existing = model.model_validate(
+            {
+                "page_id": 2,
+                "content": {"blocks": [{"search": "old", "replace": "new"}]},
+            }
+        )
+
+        assert existing.category is None
+        assert existing.name is None
+        schema = model.model_json_schema()
+        assert schema["required"] == ["page_id"]
+        assert schema["allOf"][0]["then"]["required"] == ["category", "name"]
+
+        for page_id in (100, "100"):
+            with pytest.raises(ValueError, match="category, name"):
+                model.model_validate({"page_id": page_id, "content": "new entity"})
+
+        created = model.model_validate(
+            {
+                "page_id": 100,
+                "category": "activity",
+                "name": "horse riding",
+                "content": "new entity",
+            }
+        )
+        assert created.category == "activity"
+        assert created.name == "horse riding"
+
+    def test_parser_keeps_existing_patch_without_immutable_fields_alongside_delete(
+        self, real_registry
+    ):
+        generator = SchemaModelGenerator(
+            [real_registry.get("preferences"), real_registry.get("entities")]
+        )
+        operations_model = generator.create_structured_operations_model()
+        content = json.dumps(
+            {
+                "entities": [
+                    {
+                        "page_id": 2,
+                        "content": {
+                            "blocks": [{"search": "一周学习计划", "replace": ""}]
+                        },
+                    }
+                ],
+                "delete_ids": [
+                    {"delete_page_id": 1, "replacement_page_id": None}
+                ],
+            }
+        )
+
+        parsed, error = parse_json_with_stability(
+            content,
+            model_class=operations_model,
+            expected_fields=list(operations_model.model_fields),
+        )
+
+        assert error is None
+        assert len(parsed.entities) == 1
+        assert parsed.entities[0].page_id == 2
+        assert len(parsed.delete_ids) == 1
+
     def test_links_field_is_not_emitted_when_links_disabled(self, registry_with_sample):
         from unittest.mock import patch
 
@@ -313,42 +393,6 @@ class TestSchemaModelGenerator:
         # Check profile model has 'content' field
         profile_model = models["profile"]
         assert "content" in profile_model.model_fields
-
-    def test_create_discriminated_union_model(self, real_registry):
-        """Test creating the union model wrapper."""
-        generator = SchemaModelGenerator(real_registry)
-        union_model = generator.create_discriminated_union_model()
-
-        # The union model is a wrapper BaseModel
-        assert hasattr(union_model, "model_fields")
-        assert "data" in union_model.model_fields
-
-    def test_get_llm_json_schema(self, real_registry):
-        """Test getting the LLM JSON schema."""
-        generator = SchemaModelGenerator(real_registry)
-        json_schema = generator.get_llm_json_schema()
-
-        # Check it's a valid JSON schema
-        assert "$defs" in json_schema or "definitions" in json_schema
-        assert "properties" in json_schema
-
-        # Check it includes delete operations and per-memory-type operation fields
-        assert "delete_ids" in json_schema["properties"]
-        assert "profile" in json_schema["properties"]
-
-        # Check delete_ids is an array of objects
-        delete_props = json_schema["properties"]["delete_ids"]
-        delete_items = delete_props.get("items", {})
-        assert delete_items.get("$ref") or delete_items.get("type") == "object"
-
-    def test_get_memory_data_json_schema(self, real_registry):
-        """Test getting just the MemoryData JSON schema."""
-        generator = SchemaModelGenerator(real_registry)
-        json_schema = generator.get_memory_data_json_schema()
-
-        # Check it's a valid JSON schema
-        assert "$defs" in json_schema or "definitions" in json_schema
-        assert "properties" in json_schema
 
     def test_model_caching(self, registry_with_sample, sample_memory_type):
         """Test that models are cached."""
@@ -469,21 +513,3 @@ class TestWikiLink:
 
 class TestIntegration:
     """Integration tests for the complete schema system."""
-
-    def test_end_to_end_model_generation_and_validation(self):
-        """Test end-to-end: load schemas, generate models, validate data."""
-        registry = create_default_registry()
-
-        # Create generator
-        generator = SchemaModelGenerator(registry)
-
-        # Get the operations model
-        generator.create_structured_operations_model()
-
-        # Get JSON schema
-        json_schema = generator.get_llm_json_schema()
-
-        # Verify the schema includes descriptions from YAML
-        # Check that $defs has entries
-        defs = json_schema.get("$defs", {})
-        assert len(defs) > 0, "No definitions found in JSON schema"

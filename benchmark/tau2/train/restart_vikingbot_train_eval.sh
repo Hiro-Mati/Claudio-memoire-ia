@@ -5,7 +5,7 @@ set -euo pipefail
 # are healthy, then start tau2 vikingbot batch train/eval.
 #
 # Default training args match the common vikingbot run:
-#   --commit-concurrency 150 --epochs 2 --trials 8 --train-trials 1 --skip-final-eval
+#   --commit-concurrency 200 --epochs 2 --trials 8 --train-trials 1 --skip-final-eval
 # Pass any non-launcher arguments to override/extend the batch train/eval invocation.
 #
 # Launcher-only options:
@@ -461,7 +461,7 @@ run_train_eval() {
   local -a train_args=("$@")
   if [[ ${#train_args[@]} -eq 0 ]]; then
     train_args=(
-      --commit-concurrency 150
+      --commit-concurrency 200
       --epochs 2
       --trials 8
       --train-trials 1

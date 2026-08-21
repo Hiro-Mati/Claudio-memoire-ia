@@ -58,7 +58,7 @@ class DryRunPolicyUpdater:
         del transaction_handle
         del context
         updated_policy_set = (
-            _apply_items_to_snapshot(
+            await _apply_items_to_snapshot(
                 plan.items,
                 policy_set,
                 registry=self.registry or create_default_registry(),
@@ -106,7 +106,7 @@ class MemoryFilePolicyUpdater:
             raise RuntimeError("VikingFS is required to apply policy update plans")
 
         registry = self.registry or create_default_registry()
-        updated_policy_set = _apply_items_to_snapshot(
+        updated_policy_set = await _apply_items_to_snapshot(
             plan.items,
             policy_set,
             registry=registry,
@@ -160,7 +160,7 @@ def _policy_body_metadata(
     return {"content": policy.content}
 
 
-def _apply_items_to_snapshot(
+async def _apply_items_to_snapshot(
     items: list[PolicyPlanItem],
     policy_set: PolicySet,
     *,
@@ -212,7 +212,7 @@ def _apply_items_to_snapshot(
         memory_type = item.memory_type or "experiences"
         schema = registry.get(memory_type)
         if schema is not None:
-            metadata = resolve_memory_fields(
+            metadata = await resolve_memory_fields(
                 patch_fields,
                 schema=schema,
                 old_file=MemoryFile(

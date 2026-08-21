@@ -182,7 +182,7 @@ def build_memory_extraction_post_validation(
 ) -> Callable[..., Any]:
     """Build one hook that validates both Case generalization and Experience quality."""
 
-    def validate(
+    async def validate(
         operations: ResolvedOperations,
         retry_count: int,
         **_: Any,
@@ -200,11 +200,11 @@ def build_memory_extraction_post_validation(
                 issues = case_generalization_violations(operation)
             elif operation.memory_type == "experiences" and experience_schema is not None:
                 try:
-                    content = render_operation_after_file(
+                    content = (await render_operation_after_file(
                         operation,
                         schema=experience_schema,
                         extract_context=extract_context,
-                    ).plain_content()
+                    )).plain_content()
                     issues = experience_structure_issues(content)
                 except Exception as exc:
                     issues = [

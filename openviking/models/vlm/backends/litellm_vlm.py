@@ -16,7 +16,8 @@ import litellm
 from litellm import acompletion, completion
 
 from openviking.telemetry import tracer
-from openviking.utils.model_retry import retry_model_call_async, retry_model_call_sync
+from openviking.utils.model_retry import retry_async, retry_sync
+from openviking.utils.multimodal import redact_image_data_urls
 from openviking_cli.utils import get_logger
 
 from ..base import ToolCall, VLMBase, VLMResponse
@@ -98,6 +99,17 @@ PROVIDER_CONFIGS: Dict[str, Dict[str, Any]] = {
 }
 
 
+# Ollama defaults to a 4096-token context window and silently truncates any
+# longer prompt to fit. OV prompts (memory extraction is ~5k+ tokens) overflow
+# it, so the model never sees the real input and returns empty/garbage with no
+# error. Default to a larger window for Ollama models; callers can override via
+# ``extra_request_body["num_ctx"]``.
+OLLAMA_DEFAULT_NUM_CTX = 16384
+
+# LiteLLM routes that address a local Ollama server.
+OLLAMA_LITELLM_PREFIXES: tuple[str, ...] = ("ollama/", "ollama_chat/")
+
+
 # Prefixes that are already complete LiteLLM routes. Keep them authoritative
 # so keyword-based auto-detection does not rewrite cross-provider model names.
 EXPLICIT_LITELLM_PREFIXES: tuple[str, ...] = (
@@ -109,6 +121,7 @@ EXPLICIT_LITELLM_PREFIXES: tuple[str, ...] = (
     "sagemaker_chat/",
     "sagemaker_nova/",
     "vertex_ai/",
+    "github_copilot/",
 )
 
 # These explicit routes normally authenticate through cloud-native credential
@@ -270,7 +283,6 @@ class LiteLLMVLMProvider(VLMBase):
             "messages": messages,
             "temperature": self.temperature,
             "timeout": self.timeout,
-            "num_retries": 0,
         }
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
@@ -288,6 +300,16 @@ class LiteLLMVLMProvider(VLMBase):
             kwargs["tool_choice"] = tool_choice or "auto"
         if self.extra_request_body:
             kwargs["extra_body"] = dict(self.extra_request_body)
+
+        # Ollama-specific request options. Without an explicit num_ctx the server
+        # truncates long prompts to its 4096-token default; thinking models left
+        # in thinking mode emit only reasoning and stall on CPU. Set safe
+        # defaults, but let extra_request_body override either.
+        if _has_litellm_prefix(model, OLLAMA_LITELLM_PREFIXES):
+            extra = kwargs.get("extra_body", {})
+            extra.setdefault("num_ctx", OLLAMA_DEFAULT_NUM_CTX)
+            extra.setdefault("think", self._effective_thinking(thinking))
+            kwargs["extra_body"] = extra
 
         # Only send enable_thinking to DashScope-compatible providers
         provider = self._detected_provider or detect_provider_by_model(model)
@@ -331,6 +353,9 @@ class LiteLLMVLMProvider(VLMBase):
 
     def _build_vlm_response(self, response, has_tools: bool) -> Union[str, VLMResponse]:
         """Build response from LiteLLM response. Returns str or VLMResponse based on has_tools."""
+        if isinstance(response, str):
+            return VLMResponse(content=response) if has_tools else response
+
         choice = response.choices[0]
         message = choice.message
 
@@ -406,7 +431,7 @@ class LiteLLMVLMProvider(VLMBase):
                 return self._build_vlm_response(response, has_tools=True)
             return self._clean_response(self._extract_content_from_response(response))
 
-        return retry_model_call_sync(
+        return retry_sync(
             _call,
             max_retries=self.max_retries,
             logger=logger,
@@ -425,7 +450,9 @@ class LiteLLMVLMProvider(VLMBase):
         """Get text completion asynchronously."""
         kwargs = self._build_text_kwargs(prompt, thinking, tools, tool_choice, messages)
         # 用 tracer.info 打印请求
-        tracer.info(f"request: {json.dumps(kwargs, ensure_ascii=False, indent=2)}")
+        tracer.info(
+            f"request: {json.dumps(redact_image_data_urls(kwargs), ensure_ascii=False, indent=2)}"
+        )
 
         async def _call() -> Union[str, VLMResponse]:
             t0 = time.perf_counter()
@@ -437,7 +464,7 @@ class LiteLLMVLMProvider(VLMBase):
                 return self._build_vlm_response(response, has_tools=True)
             return self._clean_response(self._extract_content_from_response(response))
 
-        return await retry_model_call_async(
+        return await retry_async(
             _call,
             max_retries=self.max_retries,
             logger=logger,
@@ -465,7 +492,7 @@ class LiteLLMVLMProvider(VLMBase):
                 return self._build_vlm_response(response, has_tools=True)
             return self._clean_response(self._extract_content_from_response(response))
 
-        return retry_model_call_sync(
+        return retry_sync(
             _call,
             max_retries=self.max_retries,
             logger=logger,
@@ -493,7 +520,7 @@ class LiteLLMVLMProvider(VLMBase):
                 return self._build_vlm_response(response, has_tools=True)
             return self._clean_response(self._extract_content_from_response(response))
 
-        return await retry_model_call_async(
+        return await retry_async(
             _call,
             max_retries=self.max_retries,
             logger=logger,
