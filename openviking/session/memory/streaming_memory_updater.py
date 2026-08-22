@@ -782,10 +782,40 @@ class StreamingMemoryUpdater:
             operations = _combine_resolved_operations(
                 request.operations for request in kind_requests
             )
-            if not _requests_span_sessions(kind_requests):
+            spans_sessions = _requests_span_sessions(kind_requests)
+            if spans_sessions:
+                return await merge_memory_operations(
+                    operations=operations,
+                    messages=_combined_request_messages(kind_requests),
+                    ctx=kind_requests[0].ctx,
+                    registry=self.registry or create_default_registry(),
+                    strict_extract_errors=any(
+                        request.strict_extract_errors for request in kind_requests
+                    ),
+                    trace_console=self.config.trace_console,
+                    force_merge=True,
+                )
+
+            case_upserts = [
+                operation
+                for operation in operations.upsert_operations
+                if operation.memory_type == CASE_MEMORY_TYPE
+            ]
+            if not case_upserts:
                 return operations
-            return await merge_memory_operations(
-                operations=operations,
+
+            # Case upserts require system-managed identity, lifecycle, and source
+            # fields even for a single session. Keep other memory types on the
+            # existing same-session passthrough path.
+            case_result = await merge_memory_operations(
+                operations=ResolvedOperations(
+                    upsert_operations=case_upserts,
+                    delete_file_contents=[],
+                    errors=[],
+                    resolved_links=[],
+                    delete_replacements={},
+                    link_replacements={},
+                ),
                 messages=_combined_request_messages(kind_requests),
                 ctx=kind_requests[0].ctx,
                 registry=self.registry or create_default_registry(),
@@ -793,8 +823,18 @@ class StreamingMemoryUpdater:
                     request.strict_extract_errors for request in kind_requests
                 ),
                 trace_console=self.config.trace_console,
-                force_merge=True,
+                force_merge=False,
             )
+            passthrough = operations.model_copy(
+                update={
+                    "upsert_operations": [
+                        operation
+                        for operation in operations.upsert_operations
+                        if operation.memory_type != CASE_MEMORY_TYPE
+                    ]
+                }
+            )
+            return _combine_resolved_operations([passthrough, case_result])
 
         kind_batches = [
             (kind, kind_requests)
@@ -1702,9 +1742,8 @@ def _compact_case_proposal_context(proposal: MemoryMergeProposal) -> dict[str, A
         fields = dict(memory_file.extra_fields or {})
         # Stored candidates only have a canonical identity. Ignore legacy
         # operation-scoped proposals that may have leaked into older files.
-        identity = (
-            parse_case_identity(fields.get(CASE_IDENTITY_FIELD))
-            or fallback_case_identity(fields)
+        identity = parse_case_identity(fields.get(CASE_IDENTITY_FIELD)) or fallback_case_identity(
+            fields
         )
     return {
         "case_name": str(fields.get("case_name") or ""),
@@ -3332,9 +3371,7 @@ def _combine_resolved_operations(
         combined.delete_replacements.update(
             dict(getattr(operations, "delete_replacements", {}) or {})
         )
-        combined.link_replacements.update(
-            dict(getattr(operations, "link_replacements", {}) or {})
-        )
+        combined.link_replacements.update(dict(getattr(operations, "link_replacements", {}) or {}))
     return combined
 
 

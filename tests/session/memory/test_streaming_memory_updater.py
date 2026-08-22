@@ -1007,6 +1007,41 @@ async def test_merge_requests_skips_patch_merge_for_same_session(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_merge_requests_prepares_same_session_case_without_merging_notes():
+    updater = StreamingMemoryUpdater(registry=_registry())
+    request = MemoryUpdateRequest(
+        operations=ResolvedOperations(
+            upsert_operations=[_case_op("prepared_case"), _note_op("direct_note")],
+            delete_file_contents=[],
+            errors=[],
+        ),
+        messages=[],
+        ctx=_ctx(),
+        metadata={
+            "session_id": "same-session",
+            "source_extraction_id": "extract-case",
+        },
+    )
+    request.operations.upsert_operations[0].source = MemoryOperationSource(
+        session_id="same-session",
+        extraction_id="extract-case",
+    )
+
+    merged = await updater._merge_requests([request])
+
+    operations_by_type = {
+        operation.memory_type: operation for operation in merged.upsert_operations
+    }
+    case_fields = operations_by_type["cases"].memory_fields
+    assert case_fields["case_status"] == "draft"
+    assert case_fields["source_count"] == 1
+    assert case_fields["last_compacted_source_count"] == 0
+    assert case_fields["last_compacted_version"] == 0
+    assert "case_identity" in case_fields
+    assert operations_by_type["notes"].memory_fields == _note_op("direct_note").memory_fields
+
+
+@pytest.mark.asyncio
 async def test_merge_requests_merges_cross_session_operation_kinds_in_parallel(monkeypatch):
     entered: set[str] = set()
     all_entered = asyncio.Event()
@@ -1022,8 +1057,7 @@ async def test_merge_requests_merges_cross_session_operation_kinds_in_parallel(m
         else:
             kind = "update"
             assert all(
-                op.old_memory_file_content is not None
-                for op in operations.upsert_operations
+                op.old_memory_file_content is not None for op in operations.upsert_operations
             )
         assert kwargs["force_merge"] is True
         entered.add(kind)
