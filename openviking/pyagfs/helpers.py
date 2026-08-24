@@ -30,24 +30,6 @@ def _call_with_optional_ctx(
         return method(*args, **kwargs)
 
 
-def _try_copy_within_mount_fast_path(
-    client: AGFSSyncClientProtocol,
-    src: str,
-    dst: str,
-    *,
-    fs_ctx: dict[str, str] | None = None,
-) -> bool:
-    """Attempt a same-mount verbatim copy and return whether the fast-path was used."""
-    copy_within_mount = getattr(client, "copy_within_mount", None)
-    if not callable(copy_within_mount):
-        return False
-
-    result = _call_with_optional_ctx(copy_within_mount, src, dst, ctx=fs_ctx)
-    if isinstance(result, dict):
-        return bool(result.get("performed", False))
-    return bool(result)
-
-
 def cp(
     client: AGFSSyncClientProtocol,
     src: str,
@@ -63,7 +45,7 @@ def cp(
         src: Source path in AGFS
         dst: Destination path in AGFS
         recursive: If True, copy directories recursively
-        stream: If True, use streaming for large files (memory efficient)
+        stream: Deprecated compatibility argument; native RAGFS always copies in bounded chunks
 
     Raises:
         AGFSClientError: If source doesn't exist or operation fails
@@ -74,16 +56,8 @@ def cp(
     """
     ensure_same_encryption_account(src, dst)
 
-    # Check if source exists and get its type
-    src_info = _call_with_optional_ctx(client.stat, src, ctx=fs_ctx)
-    is_dir = src_info.get("isDir", False)
-
-    if is_dir:
-        if not recursive:
-            raise ValueError(f"Cannot copy directory '{src}' without recursive=True")
-        _copy_directory(client, src, dst, stream, fs_ctx=fs_ctx)
-    else:
-        _copy_file(client, src, dst, stream, fs_ctx=fs_ctx)
+    del stream  # Native RAGFS owns bounded chunking; retained for call compatibility.
+    _call_with_optional_ctx(client.cp, src, dst, recursive, ctx=fs_ctx)
 
 
 def upload(
@@ -159,72 +133,6 @@ def download(
 
 
 # Internal helper functions
-
-
-def _copy_file(
-    client: AGFSSyncClientProtocol,
-    src: str,
-    dst: str,
-    stream: bool,
-    *,
-    fs_ctx: dict[str, str] | None = None,
-) -> None:
-    """Copy a single file within AGFS.
-
-    Copy is always expressed in logical AGFS operations so encryption remains
-    transparent to the business layer.
-    """
-    # Ensure parent directory exists
-    _ensure_remote_parent_dir(client, dst, fs_ctx=fs_ctx)
-
-    if _try_copy_within_mount_fast_path(client, src, dst, fs_ctx=fs_ctx):
-        return
-
-    if stream:
-        # The binding client returns bytes or an iterator of bytes, not an
-        # HTTP response object with iter_content().
-        _call_with_optional_ctx(
-            client.write,
-            dst,
-            _iter_file_bytes(_call_with_optional_ctx(client.cat, src, stream=True, ctx=fs_ctx)),
-            ctx=fs_ctx,
-        )
-    else:
-        # Read entire file and write
-        data = _call_with_optional_ctx(client.cat, src, ctx=fs_ctx)
-        _call_with_optional_ctx(client.write, dst, data, ctx=fs_ctx)
-
-
-def _copy_directory(
-    client: AGFSSyncClientProtocol,
-    src: str,
-    dst: str,
-    stream: bool,
-    *,
-    fs_ctx: dict[str, str] | None = None,
-) -> None:
-    """Recursively copy a directory within AGFS."""
-    # Create destination directory
-    try:
-        _call_with_optional_ctx(client.mkdir, dst, ctx=fs_ctx)
-    except Exception:
-        # Directory might already exist, continue
-        pass
-
-    # List source directory contents
-    items = _call_with_optional_ctx(client.ls, src, ctx=fs_ctx)
-
-    for item in items:
-        item_name = item["name"]
-        src_path = f"{src.rstrip('/')}/{item_name}"
-        dst_path = f"{dst.rstrip('/')}/{item_name}"
-
-        if item.get("isDir", False):
-            # Recursively copy subdirectory
-            _copy_directory(client, src_path, dst_path, stream, fs_ctx=fs_ctx)
-        else:
-            # Copy file
-            _copy_file(client, src_path, dst_path, stream, fs_ctx=fs_ctx)
 
 
 def _upload_file(

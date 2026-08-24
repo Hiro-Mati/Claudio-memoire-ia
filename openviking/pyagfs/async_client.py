@@ -189,18 +189,15 @@ class AsyncAGFSClient:
         recursive: bool = False,
         *,
         fs_ctx: Dict[str, str] | None = None,
-    ) -> Any:
-        """Copy a path within AGFS while preserving the caller's FsContext."""
-        from .helpers import cp
-
-        return await asyncio.to_thread(
-            cp,
-            self._client,
+    ) -> Dict[str, Any]:
+        """Copy a path through native RAGFS while preserving the caller's FsContext."""
+        ensure_same_encryption_account(src_path, dst_path)
+        return await self.run(
+            "cp",
             src_path,
             dst_path,
-            recursive=recursive,
-            stream=True,
-            fs_ctx=_fs_ctx_or_default(src_path, fs_ctx),
+            recursive,
+            ctx=_fs_ctx_or_default(src_path, fs_ctx),
         )
 
     async def grep(self, **kwargs: Any) -> Dict[str, Any]:

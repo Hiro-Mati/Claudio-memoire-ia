@@ -1911,6 +1911,18 @@ mod tests {
                 busy_remove_count: AtomicUsize::new(0),
             }
         }
+
+        /// Build a memory provider whose next owned-token removal fails.
+        fn with_remove_failure() -> Self {
+            Self {
+                inner: crate::lock::provider::MemoryPathLockProvider::new(),
+                fail_next_read: AtomicBool::new(false),
+                fail_next_remove: AtomicBool::new(true),
+                return_false_next_remove: AtomicBool::new(false),
+                busy_next_remove: AtomicBool::new(false),
+                busy_remove_count: AtomicUsize::new(0),
+            }
+        }
     }
 
     #[async_trait]
@@ -2519,6 +2531,30 @@ mod tests {
                 .await,
             Err(PathLockError::Io(message)) if message == "injected read failure"
         ));
+    }
+
+    #[tokio::test]
+    async fn release_failure_restores_owned_lease_for_retry() {
+        let fs = Arc::new(MemFileSystem::new());
+        fs.mkdir("/data", 0o755).await.unwrap();
+        let provider = Arc::new(FailNextRemoveProvider::with_remove_failure());
+        let mgr = PathLockManager::new(fs, provider, PathLockConfig::default());
+        let lease = mgr
+            .acquire_exact("/data/file.txt", Duration::ZERO, None)
+            .await
+            .unwrap();
+
+        assert!(matches!(mgr.release(&lease).await, Err(PathLockError::Io(_))));
+        assert!(mgr
+            .get_owned_lease_by_ref(&lease.lease.lease_ref)
+            .await
+            .is_some());
+
+        mgr.release(&lease).await.unwrap();
+        assert!(mgr
+            .get_owned_lease_by_ref(&lease.lease.lease_ref)
+            .await
+            .is_none());
     }
 
     #[tokio::test]

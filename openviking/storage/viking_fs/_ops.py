@@ -296,7 +296,6 @@ class _OpsMixin:
                     old_path,
                     new_path,
                     old_uri=old_uri,
-                    new_uri=new_uri,
                     is_dir=is_dir,
                     ctx=ctx,
                     lease_ref=lease,
@@ -424,27 +423,28 @@ class _OpsMixin:
         new_path: str,
         *,
         old_uri: str,
-        new_uri: str,
         is_dir: bool,
         ctx: Optional[RequestContext],
         lease_ref: Dict[str, Any],
     ) -> int:
         if is_dir:
-            return await self._copy_directory_with_exact_locks(
+            await self._validate_copy_subtree(
                 old_path,
-                new_path,
                 old_uri=old_uri,
-                new_uri=new_uri,
                 ctx=ctx,
                 lease_ref=lease_ref,
             )
 
-        await self._async_agfs.cp(
+        result = await self._async_agfs.cp(
             old_path,
             new_path,
-            recursive=False,
+            recursive=is_dir,
             fs_ctx=self._pathlock_fs_ctx(ctx, lease_ref),
         )
+        if isinstance(result, dict):
+            entries_copied = result.get("entries_copied")
+            if isinstance(entries_copied, int):
+                return entries_copied
         return 1
 
     async def _cleanup_transfer_target(
@@ -653,7 +653,6 @@ class _OpsMixin:
                         new_path,
                         old_path,
                         old_uri=new_uri,
-                        new_uri=old_uri,
                         is_dir=is_dir,
                         ctx=ctx,
                         lease_ref=lease,
@@ -726,76 +725,41 @@ class _OpsMixin:
             old_path,
             new_path,
             old_uri=old_uri,
-            new_uri=new_uri,
             is_dir=is_dir,
             ctx=ctx,
             lease_ref=lease_ref,
         )
 
-    async def _copy_directory_with_exact_locks(
+    async def _validate_copy_subtree(
         self,
         old_path: str,
-        new_path: str,
+        *,
         old_uri: str,
-        new_uri: str,
         ctx: Optional[RequestContext],
-        lease_ref: Dict[str, Any] | None,
-    ) -> int:
-        """Copy a directory through AGFS while locking every destination entry.
-
-        Args:
-            old_path: Source backend directory path.
-            new_path: Destination backend directory path.
-            ctx: Request context used for filesystem operations.
-            lease_ref: Exact lease covering the current destination directory.
-
-        Returns:
-            Number of created directories and files.
-        """
-        if lease_ref is None:
-            raise ValueError("directory copy requires a pathlock lease")
+        lease_ref: Dict[str, Any],
+    ) -> None:
+        """Validate every source entry before one native recursive RAGFS copy."""
         fs_ctx = self._pathlock_fs_ctx(ctx, lease_ref)
-        await self._async_agfs.mkdir(new_path, fs_ctx=fs_ctx)
-        copied = 1
         entries = await self._async_agfs.ls(old_path, fs_ctx=fs_ctx)
         for entry in entries:
             name = entry.get("name", "")
             if not name or name in (".", ".."):
                 continue
             old_child = f"{old_path.rstrip('/')}/{name}"
-            new_child = f"{new_path.rstrip('/')}/{name}"
             old_child_uri = f"{old_uri.rstrip('/')}/{name}"
-            new_child_uri = f"{new_uri.rstrip('/')}/{name}"
+            child_is_dir = bool(entry.get("isDir", False))
             self._ensure_copy_source_access(
                 old_child_uri,
-                recursive=bool(entry.get("isDir", False)),
+                recursive=child_is_dir,
                 ctx=ctx,
             )
-            child_lease = await self._async_agfs.pathlock_acquire_exact(
-                new_child,
-                owner_lease_ref=lease_ref,
-            )
-            try:
-                if entry.get("isDir", False):
-                    copied += await self._copy_directory_with_exact_locks(
-                        old_child,
-                        new_child,
-                        old_uri=old_child_uri,
-                        new_uri=new_child_uri,
-                        ctx=ctx,
-                        lease_ref=child_lease,
-                    )
-                else:
-                    await self._async_agfs.cp(
-                        old_child,
-                        new_child,
-                        recursive=False,
-                        fs_ctx=self._pathlock_fs_ctx(ctx, child_lease),
-                    )
-                    copied += 1
-            finally:
-                await self._async_agfs.pathlock_release(child_lease)
-        return copied
+            if child_is_dir:
+                await self._validate_copy_subtree(
+                    old_child,
+                    old_uri=old_child_uri,
+                    ctx=ctx,
+                    lease_ref=lease_ref,
+                )
 
     async def _copy_dir_through_vikingfs(
         self,

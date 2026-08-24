@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use radix_trie::{Trie, TrieCommon};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -20,7 +21,10 @@ use crate::multibackend::factory::build_multi_write_fs;
 use crate::multibackend::types::MultiBackendBuildContext;
 use crate::shape::validate::ensure_backend_shape;
 
-use super::internal_names::is_hidden_internal_name;
+use super::context::{FsContextInner, FsContextView, PathLockContext, FS_CTX};
+use super::internal_names::{
+    is_hidden_copy_stage_name, is_hidden_internal_name, COPY_STAGE_FILE_PREFIX,
+};
 
 use super::encryption_wrapper::EncryptionWrappedFS;
 use super::errors::{Error, Result};
@@ -661,6 +665,236 @@ impl MountableFS {
         }
     }
 
+    /// Copy one file or directory tree and publish it at the destination in one rename.
+    ///
+    /// Files are copied into a hidden sibling staging path first. Local backends therefore never
+    /// expose a partially copied final destination; object-store backends retain their native
+    /// best-effort rename semantics.
+    pub async fn copy(&self, src_path: &str, dst_path: &str, recursive: bool) -> Result<u64> {
+        let src_path = normalize_path(src_path);
+        let dst_path = normalize_path(dst_path);
+        if contains_hidden_copy_stage_component(&src_path)
+            || contains_hidden_copy_stage_component(&dst_path)
+        {
+            return Err(Error::InvalidOperation(
+                "copy staging paths are reserved".to_string(),
+            ));
+        }
+        if src_path == dst_path {
+            return Err(Error::InvalidOperation(
+                "source and destination must be different".to_string(),
+            ));
+        }
+        if dst_path.starts_with(&(src_path.clone() + "/")) {
+            return Err(Error::InvalidOperation(
+                "destination cannot be inside the source tree".to_string(),
+            ));
+        }
+
+        let source_info = self.stat(&src_path).await?;
+        if source_info.is_dir && !recursive {
+            return Err(Error::InvalidOperation(format!(
+                "recursive copy is required for directory: {src_path}"
+            )));
+        }
+        match self.stat(&dst_path).await {
+            Ok(_) => return Err(Error::already_exists(&dst_path)),
+            Err(Error::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+
+        let (src_mount, _) = self.find_mount(&src_path).await?;
+        let (dst_mount, _) = self.find_mount(&dst_path).await?;
+        if src_mount.path != dst_mount.path {
+            return Err(Error::InvalidOperation(
+                "cannot copy across different mount points".to_string(),
+            ));
+        }
+
+        let (dst_parent, _) = dst_path
+            .rsplit_once('/')
+            .ok_or_else(|| Error::invalid_path(&dst_path))?;
+        let dst_parent = if dst_parent.is_empty() { "/" } else { dst_parent };
+        let digest = Sha256::digest(dst_path.as_bytes());
+        let digest_prefix = digest[..12]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let stage_path = format!(
+            "{}/{}{}",
+            dst_parent.trim_end_matches('/'),
+            COPY_STAGE_FILE_PREFIX,
+            digest_prefix
+        );
+
+        let manager = self
+            .pathlock_manager
+            .get()
+            .cloned()
+            .ok_or_else(|| Error::config("pathlock manager must be initialized before copy"))?;
+        let outer_requests = vec![
+            PathLockRequest {
+                path: src_path.clone(),
+                kind: if source_info.is_dir {
+                    PathLockKind::Tree
+                } else {
+                    PathLockKind::Exact
+                },
+            },
+            PathLockRequest {
+                path: dst_path.clone(),
+                kind: PathLockKind::Exact,
+            },
+        ];
+        let stage_request = PathLockRequest {
+            path: stage_path.clone(),
+            kind: if source_info.is_dir {
+                PathLockKind::Tree
+            } else {
+                PathLockKind::Exact
+            },
+        };
+
+        let mut auto_outer_lease = None;
+        let mut stage_lease = None;
+        match manager.resolve_auto_pathlock_action(&outer_requests).await {
+            Ok(AutoPathLockAction::Disabled) => {}
+            Ok(AutoPathLockAction::Acquire) => {
+                let mut requests = outer_requests.clone();
+                requests.push(stage_request.clone());
+                auto_outer_lease = Some(
+                    manager
+                        .acquire_batch(&requests, Duration::ZERO, None)
+                        .await
+                        .map_err(|error| Error::internal(format!("copy lock error: {error}")))?,
+                );
+            }
+            Ok(AutoPathLockAction::Covered(_)) => {
+                let lease_ref = FsContextView::current()
+                    .pathlock_lease_ref()
+                    .map(str::to_string)
+                    .ok_or_else(|| Error::internal("covered copy lease reference is missing"))?;
+                let owner = manager
+                    .get_owned_lease_by_ref(&lease_ref)
+                    .await
+                    .ok_or_else(|| Error::internal("covered copy lease is not locally owned"))?;
+                stage_lease = Some(
+                    manager
+                        .acquire_batch(
+                            &[stage_request],
+                            Duration::ZERO,
+                            Some((&owner.lease.lease_ref, &owner.ownership_ref)),
+                        )
+                        .await
+                        .map_err(|error| {
+                            Error::internal(format!("copy staging lock error: {error}"))
+                        })?,
+                );
+            }
+            Err(error) => {
+                return Err(Error::internal(format!("copy lock lease error: {error}")));
+            }
+        }
+
+        let account_id = FsContextView::current()
+            .account_id()
+            .unwrap_or_default()
+            .to_string();
+        let internal_ctx = Arc::new(FsContextInner::with_pathlock(
+            account_id,
+            PathLockContext {
+                lease_ref: None,
+                disable_auto_pathlock: true,
+            },
+        ));
+        let operation = FS_CTX
+            .scope(internal_ctx, async {
+                let locked_source_info = self.stat(&src_path).await?;
+                if locked_source_info.is_dir != source_info.is_dir {
+                    return Err(Error::InvalidOperation(format!(
+                        "copy source type changed while acquiring locks: {src_path}"
+                    )));
+                }
+                match self.remove_all(&stage_path).await {
+                    Ok(()) | Err(Error::NotFound(_)) => {}
+                    Err(error) => return Err(error),
+                }
+
+                let copied = if source_info.is_dir {
+                    self.mkdir(&stage_path, source_info.mode).await?;
+                    let mut copied = 1_u64;
+                    let mut pending = vec![(src_path.clone(), stage_path.clone())];
+                    while let Some((source_dir, target_dir)) = pending.pop() {
+                        for entry in self.read_dir(&source_dir).await? {
+                            let source_child = format!("{}/{}", source_dir, entry.name);
+                            let target_child = format!("{}/{}", target_dir, entry.name);
+                            if entry.is_dir {
+                                self.mkdir(&target_child, entry.mode).await?;
+                                pending.push((source_child, target_child));
+                            } else if !self
+                                .copy_within_mount(&source_child, &target_child)
+                                .await?
+                            {
+                                return Err(Error::InvalidOperation(
+                                    "copy source and destination must share one mount".to_string(),
+                                ));
+                            }
+                            copied += 1;
+                        }
+                    }
+                    copied
+                } else {
+                    if !self.copy_within_mount(&src_path, &stage_path).await? {
+                        return Err(Error::InvalidOperation(
+                            "copy source and destination must share one mount".to_string(),
+                        ));
+                    }
+                    1
+                };
+
+                match self.stat(&dst_path).await {
+                    Ok(_) => return Err(Error::already_exists(&dst_path)),
+                    Err(Error::NotFound(_)) => {}
+                    Err(error) => return Err(error),
+                }
+                self.rename(&stage_path, &dst_path).await?;
+                Ok(copied)
+            })
+            .await;
+
+        let cleanup = if operation.is_err() {
+            match self.remove_all(&stage_path).await {
+                Ok(()) | Err(Error::NotFound(_)) => Ok(()),
+                Err(error) => Err(error),
+            }
+        } else {
+            Ok(())
+        };
+        let stage_release = match stage_lease {
+            Some(lease) => manager.release(&lease).await,
+            None => Ok(()),
+        };
+        let outer_release = match auto_outer_lease {
+            Some(lease) => manager.release(&lease).await,
+            None => Ok(()),
+        };
+
+        match (operation, cleanup, stage_release, outer_release) {
+            (Ok(copied), Ok(()), Ok(()), Ok(())) => Ok(copied),
+            (Err(error), Err(cleanup_error), _, _) => Err(Error::internal(format!(
+                "copy failed: {error}; staging cleanup failed: {cleanup_error}"
+            ))),
+            (Err(error), _, _, _) => Err(error),
+            (Ok(_), _, Err(error), _) => Err(Error::internal(format!(
+                "copy staging lock release error: {error}"
+            ))),
+            (Ok(_), _, _, Err(error)) => Err(Error::internal(format!(
+                "copy lock release error: {error}"
+            ))),
+            (Ok(copied), _, _, _) => Ok(copied),
+        }
+    }
+
     /// Copy one file within one raw backend in bounded-size chunks.
     async fn copy_raw_within_mount(
         raw_backend: Arc<dyn FileSystem>,
@@ -835,6 +1069,10 @@ fn normalize_path(path: &str) -> String {
     normalized
 }
 
+fn contains_hidden_copy_stage_component(path: &str) -> bool {
+    path.split('/').any(is_hidden_copy_stage_name)
+}
+
 // Implement FileSystem trait for MountableFS by delegating to mounted filesystems
 #[async_trait]
 impl FileSystem for MountableFS {
@@ -937,7 +1175,9 @@ impl FileSystem for MountableFS {
 
     async fn read_dir(&self, path: &str) -> Result<Vec<FileInfo>> {
         let mut entries = self.read_internal_dir(path).await?;
-        entries.retain(|entry| !is_hidden_internal_name(&entry.name));
+        entries.retain(|entry| {
+            !is_hidden_internal_name(&entry.name) && !is_hidden_copy_stage_name(&entry.name)
+        });
         sort_directory_entries(&mut entries);
         Ok(entries)
     }
@@ -1046,6 +1286,7 @@ impl FileSystem for MountableFS {
                 .rsplit('/')
                 .next()
                 .map_or(true, |name| !is_hidden_internal_name(name))
+                && !contains_hidden_copy_stage_component(&m.file)
         });
         result.count = result.matches.len();
         Ok(result)
@@ -1087,6 +1328,7 @@ impl FileSystem for MountableFS {
                 .rsplit('/')
                 .next()
                 .map_or(true, |name| !is_hidden_internal_name(name))
+                && !contains_hidden_copy_stage_component(&e.path)
         });
 
         Ok(entries)
@@ -1137,6 +1379,7 @@ impl FileSystem for MountableFS {
                 .rsplit('/')
                 .next()
                 .map_or(true, |name| !is_hidden_internal_name(name))
+                && !contains_hidden_copy_stage_component(&entry.path)
         });
 
         Ok(page)
@@ -1305,12 +1548,24 @@ mod tests {
         tree_entries: Option<Vec<TreeEntry>>,
     }
 
+    struct NamedMemPlugin {
+        name: String,
+    }
+
     struct CountingPlugin {
         reads: Arc<AtomicU64>,
     }
 
     struct CountingFs {
         reads: Arc<AtomicU64>,
+    }
+
+    struct ChangingSourceTypePlugin {
+        source_stats: Arc<AtomicU64>,
+    }
+
+    struct ChangingSourceTypeFs {
+        source_stats: Arc<AtomicU64>,
     }
 
     impl MockPlugin {
@@ -1326,6 +1581,29 @@ mod tests {
                 name: name.to_string(),
                 tree_entries: Some(entries),
             }
+        }
+    }
+
+    #[async_trait]
+    impl ServicePlugin for NamedMemPlugin {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn readme(&self) -> &str {
+            "Named in-memory backend for multi-write tests"
+        }
+
+        async fn validate(&self, _config: &PluginConfig) -> Result<()> {
+            Ok(())
+        }
+
+        async fn initialize(&self, _config: PluginConfig) -> Result<Box<dyn FileSystem>> {
+            Ok(Box::new(crate::plugins::memfs::MemFileSystem::new()))
+        }
+
+        fn config_params(&self) -> &[super::super::types::ConfigParameter] {
+            &[]
         }
     }
 
@@ -1351,6 +1629,87 @@ mod tests {
 
         fn config_params(&self) -> &[super::super::types::ConfigParameter] {
             &[]
+        }
+    }
+
+    #[async_trait]
+    impl ServicePlugin for ChangingSourceTypePlugin {
+        fn name(&self) -> &str {
+            "changing-source-type"
+        }
+
+        fn readme(&self) -> &str {
+            "Changes the source type after its first stat for copy race tests"
+        }
+
+        async fn validate(&self, _config: &PluginConfig) -> Result<()> {
+            Ok(())
+        }
+
+        async fn initialize(&self, _config: PluginConfig) -> Result<Box<dyn FileSystem>> {
+            Ok(Box::new(ChangingSourceTypeFs {
+                source_stats: self.source_stats.clone(),
+            }))
+        }
+
+        fn config_params(&self) -> &[super::super::types::ConfigParameter] {
+            &[]
+        }
+    }
+
+    #[async_trait]
+    impl FileSystem for ChangingSourceTypeFs {
+        async fn create(&self, _path: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn mkdir(&self, _path: &str, _mode: u32) -> Result<()> {
+            Ok(())
+        }
+
+        async fn remove(&self, _path: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn remove_all(&self, _path: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn read(&self, _path: &str, _offset: u64, _size: u64) -> Result<Vec<u8>> {
+            Ok(b"source".to_vec())
+        }
+
+        async fn write(
+            &self,
+            _path: &str,
+            data: &[u8],
+            _offset: u64,
+            _flags: WriteFlag,
+        ) -> Result<u64> {
+            Ok(data.len() as u64)
+        }
+
+        async fn read_dir(&self, _path: &str) -> Result<Vec<FileInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn stat(&self, path: &str) -> Result<FileInfo> {
+            if path != "/src.md" {
+                return Err(Error::not_found(path));
+            }
+            if self.source_stats.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(FileInfo::new_file(path.to_string(), 6, 0o644))
+            } else {
+                Ok(FileInfo::new_dir(path.to_string(), 0o755))
+            }
+        }
+
+        async fn rename(&self, _old_path: &str, _new_path: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn chmod(&self, _path: &str, _mode: u32) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -1492,6 +1851,228 @@ mod tests {
         ));
         mfs.set_pathlock_manager(manager).await;
         mfs
+    }
+
+    #[tokio::test]
+    async fn copy_file_publishes_complete_destination_without_visible_staging() {
+        use crate::plugins::MemFSPlugin;
+        let mfs = with_test_pathlock_manager(Arc::new(MountableFS::new())).await;
+        mfs.register_plugin(MemFSPlugin).await;
+        mfs.mount(test_config("memfs", "/local")).await.unwrap();
+        mfs.write("/local/src.md", b"source", 0, WriteFlag::Create).await.unwrap();
+
+        assert_eq!(mfs.copy("/local/src.md", "/local/dst.md", false).await.unwrap(), 1);
+        assert_eq!(mfs.read("/local/dst.md", 0, 0).await.unwrap(), b"source");
+        assert!(mfs.read_dir("/local").await.unwrap().iter().all(|entry| {
+            !entry.name.starts_with(".ragfs-copy-stage-")
+        }));
+    }
+
+    #[tokio::test]
+    async fn copy_rejects_source_type_change_after_lock_acquisition() {
+        let mfs = with_test_pathlock_manager(Arc::new(MountableFS::new())).await;
+        mfs.register_plugin(ChangingSourceTypePlugin {
+            source_stats: Arc::new(AtomicU64::new(0)),
+        })
+        .await;
+        mfs.mount(test_config("changing-source-type", "/local"))
+            .await
+            .unwrap();
+
+        let error = mfs
+            .copy("/local/src.md", "/local/dst.md", false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::InvalidOperation(message)
+                if message == "copy source type changed while acquiring locks: /local/src.md"
+        ));
+    }
+
+    #[tokio::test]
+    async fn copy_reuses_outer_source_and_target_lease_for_staging() {
+        use crate::plugins::MemFSPlugin;
+        let mfs = with_test_pathlock_manager(Arc::new(MountableFS::new())).await;
+        mfs.register_plugin(MemFSPlugin).await;
+        mfs.mount(test_config("memfs", "/local")).await.unwrap();
+        mfs.write("/local/src.md", b"source", 0, WriteFlag::Create).await.unwrap();
+        let manager = mfs.pathlock_manager.get().unwrap().clone();
+        let outer = manager
+            .acquire_batch(
+                &[
+                    PathLockRequest { path: "/local/src.md".to_string(), kind: PathLockKind::Exact },
+                    PathLockRequest { path: "/local/dst.md".to_string(), kind: PathLockKind::Exact },
+                ],
+                Duration::ZERO,
+                None,
+            )
+            .await
+            .unwrap();
+        let ctx = Arc::new(FsContextInner::with_pathlock(
+            "tenant",
+            PathLockContext {
+                lease_ref: Some(outer.lease.lease_ref.clone()),
+                disable_auto_pathlock: false,
+            },
+        ));
+
+        let copied = FS_CTX
+            .scope(ctx, mfs.copy("/local/src.md", "/local/dst.md", false))
+            .await
+            .unwrap();
+
+        assert_eq!(copied, 1);
+        assert!(manager.get_owned_lease_by_ref(&outer.lease.lease_ref).await.is_some());
+        manager.release(&outer).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_directory_recursively_preserves_nested_and_empty_entries() {
+        use crate::plugins::MemFSPlugin;
+        let mfs = with_test_pathlock_manager(Arc::new(MountableFS::new())).await;
+        mfs.register_plugin(MemFSPlugin).await;
+        mfs.mount(test_config("memfs", "/local")).await.unwrap();
+        mfs.mkdir("/local/src", 0o755).await.unwrap();
+        mfs.mkdir("/local/src/nested", 0o755).await.unwrap();
+        mfs.mkdir("/local/src/empty", 0o755).await.unwrap();
+        mfs.write("/local/src/nested/data.bin", &[0, 1, 2, 255], 0, WriteFlag::Create)
+            .await.unwrap();
+
+        assert_eq!(mfs.copy("/local/src", "/local/dst", true).await.unwrap(), 4);
+        assert_eq!(mfs.read("/local/dst/nested/data.bin", 0, 0).await.unwrap(), &[0, 1, 2, 255]);
+        assert!(mfs.stat("/local/dst/empty").await.unwrap().is_dir);
+    }
+
+    #[tokio::test]
+    async fn copy_file_uses_multiwrite_pipeline_for_staging_and_publish() {
+        let mfs = with_test_pathlock_manager(Arc::new(MountableFS::new())).await;
+        mfs.register_plugin(NamedMemPlugin {
+            name: "primary-mem".to_string(),
+        })
+        .await;
+        mfs.register_plugin(NamedMemPlugin {
+            name: "backup-mem".to_string(),
+        })
+        .await;
+        mfs.mount(multiwrite_test_config(
+            "primary-mem",
+            "backup-mem",
+            "/local",
+        ))
+        .await
+        .unwrap();
+
+        FS_CTX
+            .scope(
+                Arc::new(FsContextInner::new("acct".to_string())),
+                async {
+                    mfs.write("/local/src.md", b"source", 0, WriteFlag::Create)
+                        .await
+                        .unwrap();
+
+                    assert_eq!(
+                        mfs.copy("/local/src.md", "/local/dst.md", false)
+                            .await
+                            .unwrap(),
+                        1
+                    );
+                    assert_eq!(
+                        mfs.read("/local/dst.md", 0, 0).await.unwrap(),
+                        b"source"
+                    );
+                    assert!(mfs.read_dir("/local").await.unwrap().iter().all(|entry| {
+                        !entry.name.starts_with(COPY_STAGE_FILE_PREFIX)
+                    }));
+                },
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn copy_directory_requires_recursive_and_does_not_create_destination() {
+        use crate::plugins::MemFSPlugin;
+        let mfs = with_test_pathlock_manager(Arc::new(MountableFS::new())).await;
+        mfs.register_plugin(MemFSPlugin).await;
+        mfs.mount(test_config("memfs", "/local")).await.unwrap();
+        mfs.mkdir("/local/src", 0o755).await.unwrap();
+
+        let error = mfs.copy("/local/src", "/local/dst", false).await.unwrap_err();
+        assert!(error.to_string().contains("recursive copy is required"));
+        assert!(matches!(mfs.stat("/local/dst").await, Err(Error::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn copy_directory_failure_removes_staging_without_publishing_destination() {
+        use crate::plugins::MemFSPlugin;
+        let mfs = with_test_pathlock_manager(Arc::new(MountableFS::new())).await;
+        mfs.register_plugin(MemFSPlugin).await;
+        mfs.mount(test_config("memfs", "/local")).await.unwrap();
+        mfs.mkdir("/local/src", 0o755).await.unwrap();
+        mfs.mkdir("/local/src/nested", 0o755).await.unwrap();
+        mfs.mount(test_config("memfs", "/local/src/nested"))
+            .await
+            .unwrap();
+        mfs.write(
+            "/local/src/nested/data.bin",
+            b"cross-mount",
+            0,
+            WriteFlag::Create,
+        )
+        .await
+        .unwrap();
+
+        let error = mfs.copy("/local/src", "/local/dst", true).await.unwrap_err();
+
+        assert!(error.to_string().contains("share one mount"), "{error}");
+        assert!(matches!(mfs.stat("/local/dst").await, Err(Error::NotFound(_))));
+        assert!(mfs.read_internal_dir("/local").await.unwrap().iter().all(|entry| {
+            !entry.name.starts_with(COPY_STAGE_FILE_PREFIX)
+        }));
+    }
+
+    #[tokio::test]
+    async fn copy_rejects_existing_or_descendant_destination() {
+        use crate::plugins::MemFSPlugin;
+        let mfs = with_test_pathlock_manager(Arc::new(MountableFS::new())).await;
+        mfs.register_plugin(MemFSPlugin).await;
+        mfs.mount(test_config("memfs", "/local")).await.unwrap();
+        mfs.mkdir("/local/src", 0o755).await.unwrap();
+        mfs.write("/local/existing", b"old", 0, WriteFlag::Create).await.unwrap();
+
+        assert!(matches!(mfs.copy("/local/src", "/local/existing", true).await, Err(Error::AlreadyExists(_))));
+        assert!(matches!(mfs.copy("/local/src", "/local/src/child", true).await, Err(Error::InvalidOperation(_))));
+    }
+
+    #[tokio::test]
+    async fn copy_staging_is_hidden_only_from_public_directory_reads() {
+        use crate::plugins::MemFSPlugin;
+        let mfs = with_test_pathlock_manager(Arc::new(MountableFS::new())).await;
+        mfs.register_plugin(MemFSPlugin).await;
+        mfs.mount(test_config("memfs", "/local")).await.unwrap();
+        mfs.mkdir("/local/.ragfs-copy-stage-diagnostic", 0o755).await.unwrap();
+        mfs.write("/local/.ragfs-copy-stage-diagnostic/child.md", b"partial", 0, WriteFlag::Create)
+            .await.unwrap();
+
+        assert!(mfs.read_dir("/local").await.unwrap().iter().all(|entry| {
+            entry.name != ".ragfs-copy-stage-diagnostic"
+        }));
+        assert!(mfs.read_internal_dir("/local").await.unwrap().iter().any(|entry| {
+            entry.name == ".ragfs-copy-stage-diagnostic"
+        }));
+        assert!(mfs.tree_directory("/local", true, None, None).await.unwrap().iter().all(|entry| {
+            !entry.path.contains(".ragfs-copy-stage-diagnostic")
+        }));
+        assert!(matches!(
+            mfs.copy(
+                "/local/.ragfs-copy-stage-diagnostic",
+                "/local/copied-stage",
+                true,
+            )
+            .await,
+            Err(Error::InvalidOperation(_))
+        ));
     }
 
     #[test]

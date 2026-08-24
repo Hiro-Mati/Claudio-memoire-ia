@@ -92,54 +92,61 @@ def test_cp_rejects_cross_encryption_domain_raw_copy() -> None:
         cp(_CpClient(), "/local/a/data/file.txt", "/mem/data/file.txt")
 
 
-@pytest.mark.asyncio
-async def test_async_cp_streams_when_same_mount_fast_path_is_unavailable() -> None:
-    class _FallbackClient:
-        def __init__(self) -> None:
-            self.cat_calls: list[tuple[str, bool, dict[str, str] | None]] = []
-            self.written_chunks: list[bytes] = []
-
-        def stat(self, path: str, *, ctx: dict[str, str] | None = None) -> dict[str, Any]:
-            del ctx
-            return {"isDir": path.endswith("/data")}
-
-        def copy_within_mount(
-            self, source: str, target: str, *, ctx: dict[str, str] | None = None
-        ) -> dict[str, bool]:
-            del source, target, ctx
-            return {"performed": False}
-
-        def cat(
+def test_sync_cp_preserves_none_return_contract() -> None:
+    class _NativeCopyClient:
+        def cp(
             self,
-            path: str,
+            source: str,
+            target: str,
+            recursive: bool = False,
             *,
-            stream: bool = False,
             ctx: dict[str, str] | None = None,
-        ):
-            self.cat_calls.append((path, stream, ctx))
-            if not stream:
-                raise AssertionError("fallback copy loaded the complete file")
-            return iter((b"first", b"second"))
+        ) -> dict[str, int]:
+            del source, target, recursive, ctx
+            return {"entries_copied": 1}
 
-        def write(self, path: str, data, *, ctx: dict[str, str] | None = None) -> str:
-            del path, ctx
-            self.written_chunks = list(data)
-            return "written"
+    result = cp(
+        _NativeCopyClient(),
+        "/local/a/data/file.txt",
+        "/local/a/data/file-copy.txt",
+    )
 
-    client = _FallbackClient()
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_async_cp_calls_native_binding_once_with_recursive_and_ctx() -> None:
+    class _NativeCopyClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, bool, dict[str, str] | None]] = []
+
+        def cp(
+            self,
+            source: str,
+            target: str,
+            recursive: bool = False,
+            *,
+            ctx: dict[str, str] | None = None,
+        ) -> dict[str, int]:
+            self.calls.append((source, target, recursive, ctx))
+            return {"entries_copied": 4}
+
+    client = _NativeCopyClient()
     agfs = AsyncAGFSClient(client)
 
-    await agfs.cp(
-        "/local/acct/data/source.bin",
-        "/local/acct/data/target.bin",
+    result = await agfs.cp(
+        "/local/acct/data/source",
+        "/local/acct/data/target",
+        recursive=True,
         fs_ctx={"account_id": "acct", "lease_ref": "lease"},
     )
 
-    assert client.cat_calls == [
+    assert result == {"entries_copied": 4}
+    assert client.calls == [
         (
-            "/local/acct/data/source.bin",
+            "/local/acct/data/source",
+            "/local/acct/data/target",
             True,
             {"account_id": "acct", "lease_ref": "lease"},
         )
     ]
-    assert client.written_chunks == [b"first", b"second"]

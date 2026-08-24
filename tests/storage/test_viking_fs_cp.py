@@ -77,6 +77,7 @@ class _CopyAGFS:
         self.target_exists = True
         if self.fail_copy:
             raise RuntimeError("injected AGFS copy failure")
+        return {"entries_copied": 1}
 
     async def rm(self, path, recursive=False, fs_ctx=None):
         self.events.append(("rm", path, recursive, fs_ctx))
@@ -136,7 +137,14 @@ class _DirectoryCopyAGFS(_CopyAGFS):
 
     async def cp(self, source, target, recursive=False, fs_ctx=None):
         self.events.append(("cp", source, target, recursive, fs_ctx))
-        self.files[target] = self.files[source]
+        assert source == "/local/acct/resources/source"
+        assert target == "/local/acct/resources/target"
+        assert recursive is True
+        self.directories.add(target)
+        self.directories.add(f"{target}/empty")
+        self.files[f"{target}/.hidden"] = self.files[f"{source}/.hidden"]
+        self.files[f"{target}/data.bin"] = self.files[f"{source}/data.bin"]
+        return {"entries_copied": 4}
 
 
 class _MoveRollbackAGFS(_CopyAGFS):
@@ -331,11 +339,14 @@ async def test_cp_directory_preserves_empty_hidden_and_binary_entries(monkeypatc
     assert "/local/acct/resources/target/empty" in agfs.directories
     assert agfs.files["/local/acct/resources/target/.hidden"] == b"hidden"
     assert agfs.files["/local/acct/resources/target/data.bin"] == b"\x00\xff"
-    assert {path for path, _lease in agfs.exact_leases} == {
-        "/local/acct/resources/target/empty",
-        "/local/acct/resources/target/.hidden",
-        "/local/acct/resources/target/data.bin",
-    }
+    copy_events = [event for event in agfs.events if event[0] == "cp"]
+    assert len(copy_events) == 1
+    assert copy_events[0][1:4] == (
+        "/local/acct/resources/source",
+        "/local/acct/resources/target",
+        True,
+    )
+    assert agfs.exact_leases == []
     vector_copy.assert_awaited_once_with(
         "viking://resources/source",
         "viking://resources/target",

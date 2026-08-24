@@ -1816,6 +1816,29 @@ impl RAGFSBindingClient {
         Ok(result)
     }
 
+    /// Copy one file or directory tree through the native RAGFS transaction boundary.
+    #[pyo3(signature = (src_path, dst_path, recursive=false, ctx=None))]
+    fn cp(
+        &self,
+        py: Python<'_>,
+        src_path: String,
+        dst_path: String,
+        recursive: bool,
+        ctx: Option<HashMap<String, String>>,
+    ) -> PyResult<HashMap<String, u64>> {
+        let fs_ctx = build_fs_context(ctx);
+        let mountable = self.mountable.clone();
+        let entries_copied = self
+            .run_scoped(py, fs_ctx, move || async move {
+                mountable.copy(&src_path, &dst_path, recursive).await
+            })
+            .map_err(to_py_err)?;
+
+        let mut result = HashMap::new();
+        result.insert("entries_copied".to_string(), entries_copied);
+        Ok(result)
+    }
+
     /// Change file permissions.
     #[pyo3(signature = (path, mode, ctx=None))]
     fn chmod(
