@@ -601,7 +601,7 @@ async def test_copy_refresh_message_only_rebuilds_parent_semantics(
         lambda: queue_manager,
     )
     monkeypatch.setattr(
-        "openviking.service.fs_service.mark_semantic_sidecars_pending",
+        "openviking.service.fs_service.mark_abstract_overview_pending",
         mark_pending,
     )
 
@@ -636,7 +636,7 @@ async def test_transfer_refresh_message_records_deleted_source_entry(
         lambda: queue_manager,
     )
     monkeypatch.setattr(
-        "openviking.service.fs_service.mark_semantic_sidecars_pending",
+        "openviking.service.fs_service.mark_abstract_overview_pending",
         AsyncMock(),
     )
 
