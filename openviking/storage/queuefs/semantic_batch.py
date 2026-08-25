@@ -16,6 +16,10 @@ from typing import Any, Mapping, Optional, Sequence
 
 from .semantic_msg import SemanticMsg
 
+MAX_KEYED_BATCH_CONTRIBUTIONS = 1024
+MAX_DISPATCH_KEY_BYTES = 256
+MAX_MERGE_SIGNATURE_BYTES = 256
+
 IDENTITY_FIELDS = frozenset({"account_id", "user_id", "peer_id"})
 SIGNATURE_FIELDS = frozenset(
     {
@@ -57,6 +61,38 @@ class SemanticBatchRoute:
     dispatch_key: str
     merge_signature: str
 
+    def __post_init__(self) -> None:
+        _validate_dispatch_key(self.dispatch_key)
+        _validate_merge_signature(self.merge_signature)
+
+
+def _validate_protocol_identifier(value: Any, *, label: str, max_bytes: int) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"semantic {label} must be a non-empty UTF-8 string")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"semantic {label} must be valid UTF-8") from exc
+    if len(encoded) > max_bytes:
+        raise ValueError(f"semantic {label} exceeds {max_bytes}-byte limit")
+    return value
+
+
+def _validate_dispatch_key(value: Any) -> str:
+    return _validate_protocol_identifier(
+        value,
+        label="dispatch key",
+        max_bytes=MAX_DISPATCH_KEY_BYTES,
+    )
+
+
+def _validate_merge_signature(value: Any) -> str:
+    return _validate_protocol_identifier(
+        value,
+        label="merge signature",
+        max_bytes=MAX_MERGE_SIGNATURE_BYTES,
+    )
+
 
 def _canonical_field_value(msg: SemanticMsg, name: str) -> Any:
     value = getattr(msg, name)
@@ -74,7 +110,7 @@ def build_semantic_dispatch_key(msg: SemanticMsg) -> str:
     """Build the opaque keyed-dispatch identifier from the coalesce key."""
 
     digest = hashlib.sha256(msg.coalesce_key.encode("utf-8")).hexdigest()
-    return f"semantic-v1:{digest}"
+    return _validate_dispatch_key(f"semantic-v1:{digest}")
 
 
 def build_semantic_execution_signature(msg: SemanticMsg) -> str:
@@ -82,7 +118,9 @@ def build_semantic_execution_signature(msg: SemanticMsg) -> str:
 
     values = {name: _canonical_field_value(msg, name) for name in sorted(SIGNATURE_FIELDS)}
     encoded = json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return f"sha256:{hashlib.sha256(encoded.encode('utf-8')).hexdigest()}"
+    return _validate_merge_signature(
+        f"sha256:{hashlib.sha256(encoded.encode('utf-8')).hexdigest()}"
+    )
 
 
 def _has_changes(msg: SemanticMsg) -> bool:
@@ -188,8 +226,14 @@ def decode_keyed_batch_payload(payload: Mapping[str, Any]) -> SemanticBatch:
     if isinstance(schema_version, bool) or schema_version != 1:
         raise ValueError("unsupported semantic keyed batch schema version")
     encoded_contributions = wrapper.get("contributions")
-    if not isinstance(encoded_contributions, list) or not 1 <= len(encoded_contributions) <= 1024:
-        raise ValueError("semantic keyed batch contributions must contain 1..1024 items")
+    if (
+        not isinstance(encoded_contributions, list)
+        or not 1 <= len(encoded_contributions) <= MAX_KEYED_BATCH_CONTRIBUTIONS
+    ):
+        raise ValueError(
+            "semantic keyed batch contributions must contain "
+            f"1..{MAX_KEYED_BATCH_CONTRIBUTIONS} items"
+        )
     if any(not isinstance(item, str) for item in encoded_contributions):
         raise ValueError("semantic keyed batch contributions must be strings")
 
@@ -199,11 +243,13 @@ def decode_keyed_batch_payload(payload: Mapping[str, Any]) -> SemanticBatch:
             messages.append(SemanticMsg.from_json(encoded))
         except Exception as exc:
             raise ValueError("invalid semantic keyed batch contribution") from exc
+    received_dispatch_key = _validate_dispatch_key(wrapper.get("dispatch_key"))
+    received_merge_signature = _validate_merge_signature(wrapper.get("merge_signature"))
     batch = SemanticBatch.from_contributions(messages)
 
-    if wrapper.get("dispatch_key") != batch.dispatch_key:
+    if received_dispatch_key != batch.dispatch_key:
         raise ValueError("semantic keyed batch dispatch key mismatch")
-    if wrapper.get("merge_signature") != batch.merge_signature:
+    if received_merge_signature != batch.merge_signature:
         raise ValueError("semantic keyed batch merge signature mismatch")
     return batch
 

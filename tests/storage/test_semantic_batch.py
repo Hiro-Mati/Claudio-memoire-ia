@@ -13,8 +13,12 @@ from openviking.storage.queuefs.semantic_batch import (
     CONTRIBUTION_FIELDS,
     GUARD_FIELDS,
     IDENTITY_FIELDS,
+    MAX_DISPATCH_KEY_BYTES,
+    MAX_KEYED_BATCH_CONTRIBUTIONS,
+    MAX_MERGE_SIGNATURE_BYTES,
     SIGNATURE_FIELDS,
     SemanticBatch,
+    SemanticBatchRoute,
     build_semantic_dispatch_key,
     build_semantic_execution_signature,
     decode_keyed_batch_payload,
@@ -142,6 +146,53 @@ def test_keyed_payload_rejects_signature_mismatch():
     payload["_queuefs_keyed_batch"]["merge_signature"] = "sha256:wrong"
     with pytest.raises(ValueError, match="merge signature"):
         decode_keyed_batch_payload(payload)
+
+
+def test_protocol_limits_are_named_and_contribution_limit_is_enforced():
+    assert MAX_KEYED_BATCH_CONTRIBUTIONS == 1024
+    assert MAX_DISPATCH_KEY_BYTES > 0
+    assert MAX_MERGE_SIGNATURE_BYTES > 0
+
+    msg = eligible_msg()
+    route = semantic_batch_route(msg, task_owned=False)
+    assert route is not None
+    payload = encode_test_batch(route, [msg.to_json()] * (MAX_KEYED_BATCH_CONTRIBUTIONS + 1))
+    with pytest.raises(ValueError, match="1..1024"):
+        decode_keyed_batch_payload(payload)
+
+
+def test_protocol_identifiers_use_non_empty_utf8_byte_caps():
+    over_dispatch = "é" * (MAX_DISPATCH_KEY_BYTES // 2 + 1)
+    over_signature = "é" * (MAX_MERGE_SIGNATURE_BYTES // 2 + 1)
+
+    with pytest.raises(ValueError, match="dispatch key"):
+        SemanticBatchRoute(over_dispatch, "signature")
+    with pytest.raises(ValueError, match="merge signature"):
+        SemanticBatchRoute("dispatch", over_signature)
+    with pytest.raises(ValueError, match="dispatch key"):
+        SemanticBatchRoute("", "signature")
+    with pytest.raises(ValueError, match="merge signature"):
+        SemanticBatchRoute("dispatch", "")
+
+
+def test_keyed_payload_rejects_oversized_utf8_wrapper_identifiers():
+    msg = eligible_msg()
+    route = semantic_batch_route(msg, task_owned=False)
+    assert route is not None
+
+    dispatch_payload = encode_test_batch(route, [msg.to_json()])
+    dispatch_payload["_queuefs_keyed_batch"]["dispatch_key"] = "é" * (
+        MAX_DISPATCH_KEY_BYTES // 2 + 1
+    )
+    with pytest.raises(ValueError, match="dispatch key"):
+        decode_keyed_batch_payload(dispatch_payload)
+
+    signature_payload = encode_test_batch(route, [msg.to_json()])
+    signature_payload["_queuefs_keyed_batch"]["merge_signature"] = "é" * (
+        MAX_MERGE_SIGNATURE_BYTES // 2 + 1
+    )
+    with pytest.raises(ValueError, match="merge signature"):
+        decode_keyed_batch_payload(signature_payload)
 
 
 def test_keyed_payload_decodes_contributions_and_queue_envelope():
