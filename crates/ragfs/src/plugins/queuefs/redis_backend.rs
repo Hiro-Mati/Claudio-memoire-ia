@@ -1,6 +1,7 @@
 use super::backend::{
-    KeyedBatchCreateReason, KeyedEnqueueOutcome, KeyedEnqueueRequest, Message, QueueBackend,
-    StoredMessage, MAX_KEYED_BATCH_BYTES, MAX_KEYED_BATCH_CONTRIBUTIONS,
+    KeyedBatchBody, KeyedBatchCreateReason, KeyedBatchEnvelope, KeyedEnqueueOutcome,
+    KeyedEnqueueRequest, Message, QueueBackend, StoredMessage, KEYED_BATCH_SCHEMA_VERSION,
+    MAX_KEYED_BATCH_BYTES, MAX_KEYED_BATCH_CONTRIBUTIONS,
 };
 use super::{RedisMode, RedisQueueOptions};
 use crate::core::errors::{Error, Result};
@@ -85,7 +86,7 @@ const ENQUEUE_KEYED_SCRIPT: &str = r#"
 -- ARGV[4] merge signature, ARGV[5] contribution, ARGV[6] timestamp,
 -- ARGV[7] count cap, ARGV[8] byte cap, ARGV[9] message prefix.
 if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 then
-    return redis.error_reply('queue not found: ' .. ARGV[1])
+    return nil
 end
 
 local reason = 'no_pending'
@@ -128,9 +129,6 @@ local body = {
     }
 }
 local encoded_data = cjson.encode(body)
-if string.len(encoded_data) > tonumber(ARGV[8]) then
-    return redis.error_reply('keyed batch contribution exceeds byte limit')
-end
 local stored = cjson.encode({
     id = ARGV[2],
     data = encoded_data,
@@ -422,6 +420,35 @@ fn parse_keyed_enqueue_result(values: Vec<String>) -> Result<KeyedEnqueueOutcome
             contribution_count: count,
         })
     }
+}
+
+/// Map an atomically observed missing queue or decode a successful keyed enqueue result.
+fn parse_keyed_enqueue_script_result(
+    values: Option<Vec<String>>,
+    queue_name: &str,
+) -> Result<KeyedEnqueueOutcome> {
+    values.map_or_else(
+        || Err(Error::NotFound(format!("queue '{queue_name}' not found"))),
+        parse_keyed_enqueue_result,
+    )
+}
+
+/// Reject a contribution whose single keyed envelope already exceeds the Task 2 byte cap.
+fn validate_single_keyed_batch_size(request: &KeyedEnqueueRequest) -> Result<()> {
+    let encoded = serde_json::to_vec(&KeyedBatchEnvelope {
+        _queuefs_keyed_batch: KeyedBatchBody {
+            schema_version: KEYED_BATCH_SCHEMA_VERSION,
+            dispatch_key: request.dispatch_key.clone(),
+            merge_signature: request.merge_signature.clone(),
+            contributions: vec![request.data.clone()],
+        },
+    })?;
+    if encoded.len() > MAX_KEYED_BATCH_BYTES {
+        return Err(Error::InvalidOperation(format!(
+            "keyed batch payload exceeds {MAX_KEYED_BATCH_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 struct SentinelConnection {
@@ -1038,6 +1065,7 @@ impl QueueBackend for RedisQueueBackend {
         request: KeyedEnqueueRequest,
     ) -> Result<KeyedEnqueueOutcome> {
         request.validate()?;
+        validate_single_keyed_batch_size(&request)?;
         let queue_names_key = queue_names_key(&self.key_prefix);
         let keys = QueueKeys::new(&self.key_prefix, queue_name);
         let message_id = Uuid::new_v4().to_string();
@@ -1058,9 +1086,9 @@ impl QueueBackend for RedisQueueBackend {
                 .arg(MAX_KEYED_BATCH_CONTRIBUTIONS)
                 .arg(MAX_KEYED_BATCH_BYTES)
                 .arg(&keys.message_prefix)
-                .invoke::<Vec<String>>(connection)
+                .invoke::<Option<Vec<String>>>(connection)
         })?;
-        parse_keyed_enqueue_result(values)
+        parse_keyed_enqueue_script_result(values, queue_name)
     }
 
     /// Move the oldest pending message to processing and return its payload atomically.
@@ -1536,6 +1564,24 @@ mod tests {
     }
 
     #[test]
+    fn keyed_enqueue_missing_queue_and_single_envelope_overflow_use_public_error_variants() {
+        assert!(matches!(
+            parse_keyed_enqueue_script_result(None, "Semantic"),
+            Err(Error::NotFound(message)) if message == "queue 'Semantic' not found"
+        ));
+
+        let oversized = keyed_request("k", "s", &"x".repeat(MAX_KEYED_BATCH_BYTES));
+        assert!(matches!(
+            validate_single_keyed_batch_size(&oversized),
+            Err(Error::InvalidOperation(message))
+                if message == format!(
+                    "keyed batch payload exceeds {MAX_KEYED_BATCH_BYTES} bytes"
+                )
+        ));
+        validate_single_keyed_batch_size(&keyed_request("k", "s", "fits")).unwrap();
+    }
+
+    #[test]
     /// Derive the last enqueue time from the latest pending message timestamp.
     fn last_enqueue_time_comes_from_pending_messages() {
         let mut first = Message::new(b"first".to_vec());
@@ -1758,6 +1804,10 @@ mod tests {
         let message_key = keys.message(&message.id);
 
         assert!(backend.enqueue(queue, message).is_err());
+        assert!(matches!(
+            backend.enqueue_keyed(queue, keyed_request("k", "s", "orphan")),
+            Err(Error::NotFound(message)) if message == "queue 'removed' not found"
+        ));
         let existing_keys = backend
             .with_connection("test_enqueue_missing_queue keys", |connection| {
                 redis::cmd("EXISTS")
@@ -1765,6 +1815,8 @@ mod tests {
                     .arg(&message_key)
                     .arg(&keys.pending)
                     .arg(&keys.meta)
+                    .arg(&keys.active_keys)
+                    .arg(&keys.pending_tails)
                     .query::<usize>(connection)
             })
             .unwrap();
@@ -1877,9 +1929,66 @@ mod tests {
         first
             .enqueue_keyed(&queue, keyed_request("k", "s", "successor"))
             .unwrap();
+        first
+            .enqueue_keyed(&queue, keyed_request("other", "s", "dispatchable"))
+            .unwrap();
+        let other = second.dequeue(&queue).unwrap().unwrap();
+        assert_eq!(other.dispatch_key.as_deref(), Some("other"));
+        assert!(second.ack(&queue, &other.id).unwrap());
         assert!(second.dequeue(&queue).unwrap().is_none());
         first.ack(&queue, &active.id).unwrap();
-        assert!(second.dequeue(&queue).unwrap().is_some());
+        let successor = second.dequeue(&queue).unwrap().unwrap();
+        assert_eq!(successor.dispatch_key.as_deref(), Some("k"));
+        assert_eq!(decode_batch(&successor).contributions, ["successor"]);
+        assert!(second.ack(&queue, &successor.id).unwrap());
+
+        let count_id = created_message_id(
+            first
+                .enqueue_keyed(&queue, keyed_request("count", "s", "0"))
+                .unwrap(),
+        );
+        for index in 1..MAX_KEYED_BATCH_CONTRIBUTIONS {
+            let outcome = first
+                .enqueue_keyed(&queue, keyed_request("count", "s", &index.to_string()))
+                .unwrap();
+            if index + 1 == MAX_KEYED_BATCH_CONTRIBUTIONS {
+                assert_eq!(
+                    outcome,
+                    KeyedEnqueueOutcome::Merged {
+                        message_id: count_id.clone(),
+                        contribution_count: MAX_KEYED_BATCH_CONTRIBUTIONS,
+                    }
+                );
+            }
+        }
+        let count_successor = first
+            .enqueue_keyed(&queue, keyed_request("count", "s", "overflow"))
+            .unwrap();
+        assert!(matches!(
+            count_successor,
+            KeyedEnqueueOutcome::Created {
+                reason: KeyedBatchCreateReason::Count,
+                ref message_id,
+            } if message_id != &count_id
+        ));
+
+        let half_limit = "x".repeat(MAX_KEYED_BATCH_BYTES / 2);
+        let byte_id = created_message_id(
+            first
+                .enqueue_keyed(&queue, keyed_request("bytes", "s", &half_limit))
+                .unwrap(),
+        );
+        let byte_successor = first
+            .enqueue_keyed(&queue, keyed_request("bytes", "s", &half_limit))
+            .unwrap();
+        assert!(matches!(
+            byte_successor,
+            KeyedEnqueueOutcome::Created {
+                reason: KeyedBatchCreateReason::Bytes,
+                ref message_id,
+            } if message_id != &byte_id
+        ));
+        assert_eq!(second.size(&queue).unwrap(), 4);
         second.remove_queue(&queue).unwrap();
     }
 
@@ -1919,7 +2028,37 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+
+        backend
+            .enqueue_keyed("Semantic", keyed_request("remove", "s1", "active"))
+            .unwrap();
+        backend.dequeue("Semantic").unwrap().unwrap();
+        backend
+            .enqueue_keyed("Semantic", keyed_request("remove", "s2", "tail"))
+            .unwrap();
+        backend
+            .with_connection("assert keyed indexes populated", |connection| {
+                let active: usize = redis::cmd("HLEN")
+                    .arg(&keys.active_keys)
+                    .query(connection)?;
+                let tails: usize = redis::cmd("HLEN")
+                    .arg(&keys.pending_tails)
+                    .query(connection)?;
+                assert_eq!((active, tails), (1, 1));
+                Ok(())
+            })
+            .unwrap();
         backend.remove_queue("Semantic").unwrap();
+        backend
+            .with_connection("assert removed keyed indexes absent", |connection| {
+                let existing: usize = redis::cmd("EXISTS")
+                    .arg(&keys.active_keys)
+                    .arg(&keys.pending_tails)
+                    .query(connection)?;
+                assert_eq!(existing, 0);
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
