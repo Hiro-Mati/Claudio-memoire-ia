@@ -349,8 +349,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     # maintenance. Let the newest message aggregate while this
                     # one still summarizes/vectorizes its changed files.
                     logger.info(
-                        "Downgrading stale semantic message to file-only work: "
-                        "uri=%s version=%s",
+                        "Downgrading stale semantic message to file-only work: uri=%s version=%s",
                         msg.uri,
                         msg.coalesce_version,
                     )
@@ -767,10 +766,7 @@ class SemanticProcessor(DequeueHandlerBase):
         if msg.skip_vectorization:
             logger.info(f"Skipping vectorization for {dir_uri} (requested via SemanticMsg)")
             return
-        if not (
-            wrote_semantics.overview_body_changed
-            or wrote_semantics.abstract_body_changed
-        ):
+        if not (wrote_semantics.overview_body_changed or wrote_semantics.abstract_body_changed):
             logger.info(
                 "Skipping directory vectorization for %s (visible semantics unchanged)",
                 dir_uri,
@@ -1544,6 +1540,9 @@ class SemanticProcessor(DequeueHandlerBase):
         overview: str,
         ctx: Optional[RequestContext] = None,
         ingest_options: IngestOptions | None = None,
+        *,
+        telemetry_id: Optional[str] = None,
+        track_wait: bool = True,
     ) -> None:
         """Create directory Context and enqueue to EmbeddingQueue."""
 
@@ -1557,6 +1556,8 @@ class SemanticProcessor(DequeueHandlerBase):
             context_type=context_type,
             ctx=active_ctx,
             ingest_options=ingest_options,
+            telemetry_id=telemetry_id,
+            track_wait=track_wait,
         )
 
     async def _vectorize_single_file(
@@ -1569,6 +1570,9 @@ class SemanticProcessor(DequeueHandlerBase):
         use_summary: bool = False,
         preserve_existing_created_at: bool = False,
         ingest_options: IngestOptions | None = None,
+        *,
+        telemetry_id: Optional[str] = None,
+        track_wait: bool = True,
     ) -> None:
         """Vectorize a single file using its content or summary."""
         from openviking.utils.embedding_utils import vectorize_file
@@ -1583,4 +1587,6 @@ class SemanticProcessor(DequeueHandlerBase):
             use_summary=use_summary,
             preserve_existing_created_at=preserve_existing_created_at,
             ingest_options=ingest_options,
+            telemetry_id=telemetry_id,
+            track_wait=track_wait,
         )

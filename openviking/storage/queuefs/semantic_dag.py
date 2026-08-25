@@ -7,7 +7,8 @@ import re
 import threading
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, Set
+from types import MappingProxyType
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Sequence, Set
 from weakref import WeakKeyDictionary
 
 from openviking.parse.parsers.media import get_media_type
@@ -28,6 +29,8 @@ from openviking.utils.ingest_options import IngestOptions
 from openviking_cli.utils import VikingURI
 from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.logger import get_logger
+
+from .semantic_msg import SemanticMsg
 
 logger = get_logger(__name__)
 
@@ -173,6 +176,8 @@ class SemanticDagExecutor:
         source: Optional[Dict[str, str]] = None,
         generation_trigger: str = "semantic_refresh",
         aggregate_directory: bool = True,
+        file_contributions: Optional[Mapping[str, Sequence[SemanticMsg]]] = None,
+        shared_directory_embedding: bool = False,
     ):
         self._processor = processor
         self._context_type = context_type
@@ -190,6 +195,14 @@ class SemanticDagExecutor:
         self._source = dict(source) if source else None
         self._generation_trigger = generation_trigger
         self._aggregate_directory = aggregate_directory
+        self._file_contributions = (
+            None
+            if file_contributions is None
+            else MappingProxyType(
+                {path: tuple(contributions) for path, contributions in file_contributions.items()}
+            )
+        )
+        self._shared_directory_embedding = shared_directory_embedding
         self._task_context = get_task_context()
         self._telemetry = get_current_telemetry()
         self._stale = False
@@ -376,9 +389,7 @@ class SemanticDagExecutor:
                 key=lambda item: item[1].rsplit("/", 1)[-1],
             )
             sampled_entries = deterministic_sample(direct_entries, sample_limit)
-            sampled_children_dirs = {
-                uri for kind, uri in sampled_entries if kind == "directory"
-            }
+            sampled_children_dirs = {uri for kind, uri in sampled_entries if kind == "directory"}
             sampled_file_paths = {uri for kind, uri in sampled_entries if kind == "file"}
             pending_snapshot = (
                 await read_abstract_overview_pending_snapshot(
@@ -691,15 +702,29 @@ class SemanticDagExecutor:
         if need_vectorize and not self._skip_vectorization:
             use_summary = self._is_code_repo and bool(summary_dict.get("summary"))
             try:
-                await self._processor._vectorize_single_file(
-                    parent_uri=parent_uri,
-                    context_type=self._context_type,
-                    file_path=file_path,
-                    summary_dict=summary_dict,
-                    ctx=self._ctx,
-                    use_summary=use_summary,
-                    ingest_options=self._ingest_options,
-                )
+                if self._file_contributions is None:
+                    await self._processor._vectorize_single_file(
+                        parent_uri=parent_uri,
+                        context_type=self._context_type,
+                        file_path=file_path,
+                        summary_dict=summary_dict,
+                        ctx=self._ctx,
+                        use_summary=use_summary,
+                        ingest_options=self._ingest_options,
+                    )
+                else:
+                    for contribution in self._file_contributions.get(file_path, ()):
+                        await self._processor._vectorize_single_file(
+                            parent_uri=parent_uri,
+                            context_type=self._context_type,
+                            file_path=file_path,
+                            summary_dict=summary_dict,
+                            ctx=self._ctx,
+                            use_summary=use_summary,
+                            ingest_options=contribution.ingest_options,
+                            telemetry_id=contribution.telemetry_id,
+                            track_wait=True,
+                        )
             except Exception as e:
                 logger.error(
                     "Failed to schedule vectorization for %s: %s",
@@ -947,14 +972,26 @@ class SemanticDagExecutor:
         else:
             if need_vectorize and not self._skip_vectorization:
                 try:
-                    await self._processor._vectorize_directory(
-                        dir_uri,
-                        context_type=self._context_type,
-                        abstract=abstract,
-                        overview=overview,
-                        ctx=self._ctx,
-                        ingest_options=self._ingest_options,
-                    )
+                    if self._shared_directory_embedding:
+                        await self._processor._vectorize_directory(
+                            dir_uri,
+                            context_type=self._context_type,
+                            abstract=abstract,
+                            overview=overview,
+                            ctx=self._ctx,
+                            ingest_options=None,
+                            telemetry_id="",
+                            track_wait=False,
+                        )
+                    else:
+                        await self._processor._vectorize_directory(
+                            dir_uri,
+                            context_type=self._context_type,
+                            abstract=abstract,
+                            overview=overview,
+                            ctx=self._ctx,
+                            ingest_options=self._ingest_options,
+                        )
                 except Exception as e:
                     logger.error(
                         "Failed to schedule vectorization for %s: %s",

@@ -8,9 +8,12 @@ from types import SimpleNamespace
 import pytest
 
 from openviking.server.identity import RequestContext, Role
+from openviking.service.resource_service import ResourceService
 from openviking.storage.content_write import ContentWriteCoordinator
 from openviking.telemetry.context import bind_telemetry
 from openviking.telemetry.operation import OperationTelemetry
+from openviking.telemetry.request_wait_tracker import RequestWaitTracker
+from openviking.utils import embedding_utils
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -42,15 +45,31 @@ class _ExplodingQueueManager:
         raise AssertionError("global queue wait should not be used")
 
 
+class _RecordingEmbeddingQueue:
+    def __init__(self):
+        self.messages = []
+
+    async def enqueue(self, message):
+        self.messages.append(message)
+        return message.id
+
+
 class _FakeVikingFS:
     def __init__(self, file_uri: str, root_uri: str):
         self._file_uri = file_uri
         self._root_uri = root_uri
         self.content = {file_uri: "original"}
-        self._async_agfs = SimpleNamespace(
-            pathlock_acquire_exact=lambda lock_path: SimpleNamespace(id="lock-1"),
-            pathlock_release=lambda lease: None,
-        )
+        self._async_agfs = self
+
+    def _ensure_mutable_access(self, uri: str, ctx):
+        del uri, ctx
+
+    async def pathlock_acquire_exact(self, lock_path):
+        del lock_path
+        return SimpleNamespace(id="lock-1")
+
+    async def pathlock_release(self, lease):
+        del lease
 
     async def stat(self, uri: str, ctx=None):
         del ctx
@@ -82,21 +101,25 @@ class _FakeVikingFS:
 
 
 @pytest.mark.asyncio
-async def test_add_skill_wait_uses_request_tracker(service, monkeypatch):
+async def test_add_skill_wait_uses_request_tracker(monkeypatch):
     tracker = _FakeRequestWaitTracker(
         {
             "Semantic": {"processed": 0, "error_count": 0, "errors": []},
             "Embedding": {"processed": 1, "error_count": 0, "errors": []},
         }
     )
-    ctx = RequestContext(user=service.user, role=Role.ROOT)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
     telemetry = OperationTelemetry(operation="resources.add_skill", enabled=True)
 
     async def _fake_process_skill(**kwargs):
         del kwargs
         return {"status": "success", "uri": "viking://user/default/skills/demo", "name": "demo"}
 
-    monkeypatch.setattr(service.resources._skill_processor, "process_skill", _fake_process_skill)
+    resource_service = ResourceService(
+        viking_fs=object(),
+        resource_processor=object(),
+        skill_processor=SimpleNamespace(process_skill=_fake_process_skill),
+    )
     monkeypatch.setattr(
         "openviking.service.resource_service.get_queue_manager",
         lambda: _ExplodingQueueManager(),
@@ -108,11 +131,12 @@ async def test_add_skill_wait_uses_request_tracker(service, monkeypatch):
     )
 
     with bind_telemetry(telemetry):
-        result = await service.resources.add_skill(
+        result = await resource_service.add_skill(
             data={"name": "demo", "content": "# Demo"},
             ctx=ctx,
             wait=True,
             timeout=9.0,
+            target_uri="viking://user/default/skills",
         )
 
     assert result["queue_status"] == tracker.queue_status
@@ -123,21 +147,25 @@ async def test_add_skill_wait_uses_request_tracker(service, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_add_skill_wait_uses_request_tracker_when_telemetry_disabled(service, monkeypatch):
+async def test_add_skill_wait_uses_request_tracker_when_telemetry_disabled(monkeypatch):
     tracker = _FakeRequestWaitTracker(
         {
             "Semantic": {"processed": 0, "error_count": 0, "errors": []},
             "Embedding": {"processed": 1, "error_count": 0, "errors": []},
         }
     )
-    ctx = RequestContext(user=service.user, role=Role.ROOT)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
     telemetry = OperationTelemetry(operation="resources.add_skill", enabled=False)
 
     async def _fake_process_skill(**kwargs):
         del kwargs
         return {"status": "success", "uri": "viking://user/default/skills/demo", "name": "demo"}
 
-    monkeypatch.setattr(service.resources._skill_processor, "process_skill", _fake_process_skill)
+    resource_service = ResourceService(
+        viking_fs=object(),
+        resource_processor=object(),
+        skill_processor=SimpleNamespace(process_skill=_fake_process_skill),
+    )
     monkeypatch.setattr(
         "openviking.service.resource_service.get_queue_manager",
         lambda: _ExplodingQueueManager(),
@@ -149,11 +177,12 @@ async def test_add_skill_wait_uses_request_tracker_when_telemetry_disabled(servi
     )
 
     with bind_telemetry(telemetry):
-        result = await service.resources.add_skill(
+        result = await resource_service.add_skill(
             data={"name": "demo", "content": "# Demo"},
             ctx=ctx,
             wait=True,
             timeout=9.0,
+            target_uri="viking://user/default/skills",
         )
 
     assert result["root_uri"] == "viking://user/default/skills/demo"
@@ -264,6 +293,48 @@ async def test_content_write_wait_uses_request_tracker_when_telemetry_disabled(m
     assert tracker.cleaned == [telemetry.telemetry_id]
     assert result["semantic_status"] == "complete"
     assert result["vector_status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_keyed_write_wait_excludes_detached_directory_embeddings(monkeypatch):
+    tracker = RequestWaitTracker()
+    telemetry_id = "tm-keyed-file-wait"
+    semantic_id = "semantic-batch"
+    file_embedding = SimpleNamespace(id="file-vector", telemetry_id=telemetry_id)
+    directory_embedding = SimpleNamespace(id="directory-vector", telemetry_id="")
+    queue = _RecordingEmbeddingQueue()
+    tracker.cleanup(telemetry_id)
+    tracker.register_request(telemetry_id)
+    tracker.register_semantic_root(telemetry_id, semantic_id)
+    monkeypatch.setattr(embedding_utils, "get_request_wait_tracker", lambda: tracker)
+
+    try:
+        await embedding_utils._enqueue_embedding_message(
+            queue,
+            directory_embedding,
+            failure_message="directory embedding failed",
+            track_wait=False,
+        )
+        await embedding_utils._enqueue_embedding_message(
+            queue,
+            file_embedding,
+            failure_message="file embedding failed",
+            track_wait=True,
+        )
+
+        tracker.mark_semantic_done(telemetry_id, semantic_id)
+        assert tracker.is_complete(telemetry_id) is False
+
+        tracker.mark_embedding_done(telemetry_id, file_embedding.id)
+        await tracker.wait_for_request(telemetry_id, timeout=0.01, poll_interval=0.001)
+
+        assert tracker.is_complete(telemetry_id) is True
+        assert [message.id for message in queue.messages] == [
+            directory_embedding.id,
+            file_embedding.id,
+        ]
+    finally:
+        tracker.cleanup(telemetry_id)
 
 
 async def _return_true(handle, path):

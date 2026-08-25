@@ -100,29 +100,31 @@ async def _enqueue_embedding_message(
     embedding_msg,
     *,
     failure_message: str,
+    track_wait: bool = True,
 ) -> bool:
     """Persist one embedding message and settle request tracking on enqueue failure."""
     wait_tracker = get_request_wait_tracker()
-    wait_tracker.register_embedding_root(embedding_msg.telemetry_id, embedding_msg.id)
+    if track_wait:
+        wait_tracker.register_embedding_root(embedding_msg.telemetry_id, embedding_msg.id)
 
     try:
         enqueue_id = await embedding_queue.enqueue(embedding_msg)
     except BaseException as exc:
-        wait_tracker.mark_embedding_failed(
-            embedding_msg.telemetry_id,
-            embedding_msg.id,
-            f"{failure_message}: {exc}",
-        )
+        if track_wait:
+            wait_tracker.mark_embedding_failed(
+                embedding_msg.telemetry_id,
+                embedding_msg.id,
+                f"{failure_message}: {exc}",
+            )
         raise
 
-    if not enqueue_id:
+    if not enqueue_id and track_wait:
         wait_tracker.mark_embedding_failed(
             embedding_msg.telemetry_id,
             embedding_msg.id,
             failure_message,
         )
-        return False
-    return True
+    return bool(enqueue_id)
 
 
 def _coerce_datetime(value: object) -> Optional[datetime]:
@@ -363,6 +365,9 @@ async def vectorize_directory_meta(
     scalar_overrides: Optional[Dict[int, Dict[str, Any]]] = None,
     ingest_options: IngestOptions | None = None,
     include_abstract: bool = True,
+    *,
+    telemetry_id: Optional[str] = None,
+    track_wait: bool = True,
 ) -> None:
     """
     Vectorize directory metadata (.abstract.md and .overview.md).
@@ -412,6 +417,8 @@ async def vectorize_directory_meta(
                 Vectorize(text=embedding_text_for_body(ContextLevel.ABSTRACT, uri, abstract))
             )
             msg_abstract = EmbeddingMsgConverter.from_context(context_abstract)
+            if msg_abstract and telemetry_id is not None:
+                msg_abstract.telemetry_id = telemetry_id
             _apply_scalar_overrides(
                 msg_abstract,
                 (scalar_overrides or {}).get(int(ContextLevel.ABSTRACT.value)),
@@ -423,6 +430,7 @@ async def vectorize_directory_meta(
                         embedding_queue,
                         msg_abstract,
                         failure_message=f"Failed to enqueue directory L0 vector for {uri}",
+                        track_wait=track_wait,
                     )
                     if enqueued:
                         logger.debug(f"Enqueued directory L0 (abstract) for vectorization: {uri}")
@@ -457,6 +465,8 @@ async def vectorize_directory_meta(
                 Vectorize(text=embedding_text_for_body(ContextLevel.OVERVIEW, uri, overview))
             )
             msg_overview = EmbeddingMsgConverter.from_context(context_overview)
+            if msg_overview and telemetry_id is not None:
+                msg_overview.telemetry_id = telemetry_id
             _apply_scalar_overrides(
                 msg_overview,
                 (scalar_overrides or {}).get(int(ContextLevel.OVERVIEW.value)),
@@ -468,6 +478,7 @@ async def vectorize_directory_meta(
                         embedding_queue,
                         msg_overview,
                         failure_message=f"Failed to enqueue directory L1 vector for {uri}",
+                        track_wait=track_wait,
                     )
                     if enqueued:
                         logger.debug(f"Enqueued directory L1 (overview) for vectorization: {uri}")
@@ -501,6 +512,9 @@ async def vectorize_file(
     preserve_existing_created_at: bool = False,
     scalar_override: Optional[Dict[str, Any]] = None,
     ingest_options: IngestOptions | None = None,
+    *,
+    telemetry_id: Optional[str] = None,
+    track_wait: bool = True,
 ) -> bool:
     """
     Vectorize a single file.
@@ -619,6 +633,8 @@ async def vectorize_file(
         embedding_msg = EmbeddingMsgConverter.from_context(context)
         if not embedding_msg:
             return False
+        if telemetry_id is not None:
+            embedding_msg.telemetry_id = telemetry_id
 
         _apply_scalar_overrides(embedding_msg, scalar_override)
         _apply_ingest_options(embedding_msg, ingest_options)
@@ -626,6 +642,7 @@ async def vectorize_file(
             embedding_queue,
             embedding_msg,
             failure_message=f"Failed to enqueue file vector for {file_path}",
+            track_wait=track_wait,
         )
         if not enqueued:
             return False
