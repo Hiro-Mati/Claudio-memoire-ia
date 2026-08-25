@@ -141,6 +141,9 @@ class QueueManager:
     async def prepare_task_tracking(self, tracker: Any) -> None:
         """Rebuild task work from QueueFS before any consumer starts."""
         snapshots = {name: await queue.snapshot() for name, queue in self._queues.items()}
+        semantic_queue = self._queues.get(self.SEMANTIC)
+        if isinstance(semantic_queue, SemanticQueue):
+            semantic_queue.bootstrap_legacy_coalesce(snapshots.get(self.SEMANTIC, []))
         owners = self._task_work_index.rebuild(snapshots)
         tracker.attach_work_index(self._task_work_index)
         await tracker.restore_work_tasks(owners)

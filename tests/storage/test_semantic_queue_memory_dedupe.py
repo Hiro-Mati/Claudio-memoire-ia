@@ -80,7 +80,7 @@ async def test_non_memory_context_not_deduped():
 
 
 @pytest.mark.asyncio
-async def test_coalesced_semantic_messages_mark_old_version_stale():
+async def test_legacy_coalesced_semantic_messages_mark_old_version_stale():
     mock_agfs = MagicMock()
     with patch.object(NamedQueue, "enqueue", new_callable=AsyncMock) as named_enqueue:
         named_enqueue.return_value = "queued-id"
@@ -89,11 +89,13 @@ async def test_coalesced_semantic_messages_mark_old_version_stale():
         first = SemanticMsg(
             uri="viking://resources/docs",
             context_type="resource",
+            recursive=True,
             coalesce_key=coalesce_key,
         )
         second = SemanticMsg(
             uri="viking://resources/docs",
             context_type="resource",
+            recursive=True,
             coalesce_key=first.coalesce_key,
         )
 
@@ -147,7 +149,9 @@ class _FakeMemoryDirFS:
 def _patch_semantic_config(monkeypatch, *, overview_sample_limit=32):
     monkeypatch.setattr(
         "openviking.storage.queuefs.semantic_processor.get_openviking_config",
-        lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=overview_sample_limit)),
+        lambda: SimpleNamespace(
+            semantic=SimpleNamespace(overview_sample_limit=overview_sample_limit)
+        ),
     )
 
 
@@ -218,8 +222,14 @@ async def test_memory_directory_summarizes_all_uncached_files(monkeypatch):
         name = file_path.rsplit("/", 1)[-1]
         return {"name": name, "summary": f"summary:{name}"}
 
-    async def generate_overview(dir_uri, file_summaries, children_abstracts, llm_sem=None):
-        del dir_uri, children_abstracts, llm_sem
+    async def generate_overview(
+        dir_uri,
+        file_summaries,
+        children_abstracts,
+        llm_sem=None,
+        total_files=0,
+    ):
+        del dir_uri, children_abstracts, llm_sem, total_files
         summaries.extend(file_summaries)
         return "overview"
 
@@ -267,8 +277,14 @@ async def test_memory_directory_vectorizes_changed_files_with_generated_summary(
         name = file_path.rsplit("/", 1)[-1]
         return {"name": name, "summary": f"summary:{name}", "content": "raw content"}
 
-    async def generate_overview(dir_uri, file_summaries, children_abstracts, llm_sem=None):
-        del dir_uri, children_abstracts, llm_sem
+    async def generate_overview(
+        dir_uri,
+        file_summaries,
+        children_abstracts,
+        llm_sem=None,
+        total_files=0,
+    ):
+        del dir_uri, children_abstracts, llm_sem, total_files
         assert len(captured_file_vectorize) == 1
         assert all("content" not in summary for summary in file_summaries)
         return "overview"

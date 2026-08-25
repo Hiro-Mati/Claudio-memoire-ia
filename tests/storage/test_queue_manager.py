@@ -7,13 +7,24 @@ import os
 import subprocess
 import sys
 import threading
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 
 import openviking.storage.queuefs.named_queue as named_queue_module
 from openviking.storage.queuefs.named_queue import NamedQueue
 from openviking.storage.queuefs.queue_manager import QueueManager
+from openviking.storage.queuefs.semantic_msg import SemanticMsg
+
+
+def _legacy_semantic_message(*, coalesce_version: int) -> SemanticMsg:
+    return SemanticMsg(
+        uri="viking://resources/bootstrap",
+        context_type="resource",
+        recursive=True,
+        coalesce_key="resource|account|user|peer|viking://resources/bootstrap",
+        coalesce_version=coalesce_version,
+    )
 
 
 def test_queuefs_package_imports_in_a_clean_process(tmp_path) -> None:
@@ -41,6 +52,26 @@ def test_queue_concurrency_uses_separate_configured_values() -> None:
     assert manager._max_concurrent_for_queue(manager.EXTERNAL_PARSE) == 9
     assert manager._max_concurrent_for_queue(manager.ADD_RESOURCE) == 7
     assert manager._max_concurrent_for_queue(manager.SESSION_COMMIT) == 5
+
+
+@pytest.mark.asyncio
+async def test_prepare_task_tracking_bootstraps_semantic_before_start(monkeypatch):
+    manager = QueueManager(agfs=MagicMock())
+    semantic = manager.get_queue(manager.SEMANTIC, allow_create=True)
+    embedding = manager.get_queue(manager.EMBEDDING, allow_create=True)
+    semantic_snapshot = [
+        {"id": "physical", "data": _legacy_semantic_message(coalesce_version=9).to_json()}
+    ]
+    semantic.snapshot = AsyncMock(return_value=semantic_snapshot)
+    embedding.snapshot = AsyncMock(return_value=[])
+    semantic.bootstrap_legacy_coalesce = Mock()
+    tracker = MagicMock()
+    tracker.restore_work_tasks = AsyncMock()
+
+    await manager.prepare_task_tracking(tracker)
+
+    semantic.bootstrap_legacy_coalesce.assert_called_once_with(semantic_snapshot)
+    assert manager.is_running() is False
 
 
 @pytest.mark.asyncio

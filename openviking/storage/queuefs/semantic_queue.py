@@ -4,11 +4,13 @@
 
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
+from openviking.service.task_work_index import get_task_context
 from openviking_cli.utils.logger import get_logger
 
 from .named_queue import NamedQueue
+from .semantic_batch import iter_semantic_messages_from_queue_envelope, semantic_batch_route
 from .semantic_msg import SemanticMsg
 
 logger = get_logger(__name__)
@@ -26,6 +28,13 @@ def is_semantic_coalesce_stale(coalesce_key: str, coalesce_version: int) -> bool
         return coalesce_version < _SEMANTIC_COALESCE_VERSION.get(coalesce_key, 0)
 
 
+def _allocate_legacy_version(coalesce_key: str) -> int:
+    with _SEMANTIC_COALESCE_LOCK:
+        version = _SEMANTIC_COALESCE_VERSION.get(coalesce_key, 0) + 1
+        _SEMANTIC_COALESCE_VERSION[coalesce_key] = version
+        return version
+
+
 def is_semantic_msg_stale(msg: SemanticMsg) -> bool:
     return is_semantic_coalesce_stale(msg.coalesce_key, msg.coalesce_version)
 
@@ -41,6 +50,32 @@ class SemanticQueue(NamedQueue):
     @staticmethod
     def _memory_parent_semantic_key(msg: SemanticMsg) -> str:
         return f"{msg.account_id}|{msg.user_id}|{msg.peer_id}|{msg.uri}"
+
+    def bootstrap_legacy_coalesce(self, snapshot: list[dict[str, Any]]) -> None:
+        """Restore legacy ordinary-message coalesce version watermarks."""
+        maxima: dict[str, int] = {}
+        for envelope in snapshot:
+            try:
+                messages = iter_semantic_messages_from_queue_envelope(envelope)
+            except Exception as exc:
+                logger.debug("[SemanticQueue] Skipping invalid snapshot envelope: %s", exc)
+                continue
+            for msg in messages:
+                if (
+                    msg.coalesce_key
+                    and isinstance(msg.coalesce_version, int)
+                    and msg.coalesce_version > 0
+                ):
+                    maxima[msg.coalesce_key] = max(
+                        maxima.get(msg.coalesce_key, 0),
+                        msg.coalesce_version,
+                    )
+        with _SEMANTIC_COALESCE_LOCK:
+            for key, version in maxima.items():
+                _SEMANTIC_COALESCE_VERSION[key] = max(
+                    _SEMANTIC_COALESCE_VERSION.get(key, 0),
+                    version,
+                )
 
     async def enqueue(self, msg: SemanticMsg) -> str:
         """Serialize SemanticMsg object and store in queue."""
@@ -64,11 +99,17 @@ class SemanticQueue(NamedQueue):
                     for k in stale[:800]:
                         self._memory_parent_semantic_last.pop(k, None)
 
+        route = semantic_batch_route(msg, task_owned=get_task_context() is not None)
+        if route is not None:
+            msg.coalesce_version = 0
+            return await super().enqueue_keyed(
+                msg.to_dict(),
+                dispatch_key=route.dispatch_key,
+                merge_signature=route.merge_signature,
+            )
+
         if msg.coalesce_key:
-            with _SEMANTIC_COALESCE_LOCK:
-                version = _SEMANTIC_COALESCE_VERSION.get(msg.coalesce_key, 0) + 1
-                _SEMANTIC_COALESCE_VERSION[msg.coalesce_key] = version
-                msg.coalesce_version = version
+            msg.coalesce_version = _allocate_legacy_version(msg.coalesce_key)
 
         return await super().enqueue(msg.to_dict())
 
