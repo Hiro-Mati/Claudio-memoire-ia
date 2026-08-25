@@ -17,8 +17,8 @@ from typing import Any, Mapping, Optional, Sequence
 from .semantic_msg import SemanticMsg
 
 MAX_KEYED_BATCH_CONTRIBUTIONS = 1024
-MAX_DISPATCH_KEY_BYTES = 256
-MAX_MERGE_SIGNATURE_BYTES = 256
+MAX_DISPATCH_KEY_BYTES = 512
+MAX_MERGE_SIGNATURE_BYTES = 128
 
 IDENTITY_FIELDS = frozenset({"account_id", "user_id", "peer_id"})
 SIGNATURE_FIELDS = frozenset(

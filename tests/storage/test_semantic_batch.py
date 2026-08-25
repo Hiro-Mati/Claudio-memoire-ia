@@ -150,8 +150,8 @@ def test_keyed_payload_rejects_signature_mismatch():
 
 def test_protocol_limits_are_named_and_contribution_limit_is_enforced():
     assert MAX_KEYED_BATCH_CONTRIBUTIONS == 1024
-    assert MAX_DISPATCH_KEY_BYTES > 0
-    assert MAX_MERGE_SIGNATURE_BYTES > 0
+    assert MAX_DISPATCH_KEY_BYTES == 512
+    assert MAX_MERGE_SIGNATURE_BYTES == 128
 
     msg = eligible_msg()
     route = semantic_batch_route(msg, task_owned=False)
@@ -162,8 +162,13 @@ def test_protocol_limits_are_named_and_contribution_limit_is_enforced():
 
 
 def test_protocol_identifiers_use_non_empty_utf8_byte_caps():
-    over_dispatch = "é" * (MAX_DISPATCH_KEY_BYTES // 2 + 1)
-    over_signature = "é" * (MAX_MERGE_SIGNATURE_BYTES // 2 + 1)
+    at_dispatch = "é" * (MAX_DISPATCH_KEY_BYTES // 2)
+    at_signature = "é" * (MAX_MERGE_SIGNATURE_BYTES // 2)
+    over_dispatch = at_dispatch + "é"
+    over_signature = at_signature + "é"
+
+    SemanticBatchRoute(at_dispatch, "signature")
+    SemanticBatchRoute("dispatch", at_signature)
 
     with pytest.raises(ValueError, match="dispatch key"):
         SemanticBatchRoute(over_dispatch, "signature")
