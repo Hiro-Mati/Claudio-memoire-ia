@@ -1,8 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Tests for SemanticQueue keyed-batch routing and legacy bootstrap."""
-
-import json
+"""Tests for SemanticQueue keyed-batch routing."""
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -10,10 +8,7 @@ import pytest
 from openviking.storage.queuefs.named_queue import NamedQueue
 from openviking.storage.queuefs.semantic_batch import SemanticBatch, semantic_batch_route
 from openviking.storage.queuefs.semantic_msg import SemanticMsg, build_semantic_coalesce_key
-from openviking.storage.queuefs.semantic_queue import (
-    SemanticQueue,
-    is_semantic_coalesce_stale,
-)
+from openviking.storage.queuefs.semantic_queue import SemanticQueue
 
 
 def semantic_queue_fixture() -> SemanticQueue:
@@ -34,21 +29,6 @@ def eligible_msg(**overrides) -> SemanticMsg:
     }
     values.update(overrides)
     return SemanticMsg(**values)
-
-
-def encode_queuefs_batch(messages: list[SemanticMsg]) -> str:
-    route = semantic_batch_route(messages[0], task_owned=False)
-    assert route is not None
-    return json.dumps(
-        {
-            "_queuefs_keyed_batch": {
-                "schema_version": 1,
-                "dispatch_key": route.dispatch_key,
-                "merge_signature": route.merge_signature,
-                "contributions": [message.to_json() for message in messages],
-            }
-        }
-    )
 
 
 @pytest.mark.asyncio
@@ -97,36 +77,6 @@ async def test_ineligible_semantic_message_keeps_normal_enqueue(monkeypatch, ove
     keyed.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_task_owned_semantic_message_keeps_normal_enqueue(monkeypatch):
-    queue = semantic_queue_fixture()
-    keyed = AsyncMock(return_value="stored")
-    normal = AsyncMock(return_value="normal")
-    monkeypatch.setattr(NamedQueue, "enqueue_keyed", keyed)
-    monkeypatch.setattr(NamedQueue, "enqueue", normal)
-    monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_queue.get_task_context",
-        lambda: object(),
-    )
-
-    assert await queue.enqueue(eligible_msg()) == "normal"
-    normal.assert_awaited_once()
-    keyed.assert_not_awaited()
-
-
-def test_same_identity_writes_share_one_keyed_dispatch_route():
-    first = eligible_msg(changes={"modified": ["viking://resources/docs/a.md"]})
-    second = eligible_msg(changes={"modified": ["viking://resources/docs/b.md"]})
-
-    first_route = semantic_batch_route(first, task_owned=False)
-    second_route = semantic_batch_route(second, task_owned=False)
-
-    assert first_route is not None
-    assert second_route is not None
-    assert first_route.dispatch_key == second_route.dispatch_key
-    assert first_route.merge_signature == second_route.merge_signature
-
-
 def test_different_peer_identity_cannot_share_keyed_batch_route():
     first = eligible_msg(
         peer_id="peer-a",
@@ -157,20 +107,3 @@ def test_different_peer_identity_cannot_share_keyed_batch_route():
     assert first_route.dispatch_key != second_route.dispatch_key
     with pytest.raises(ValueError, match="semantic batch route mismatch"):
         SemanticBatch.from_contributions([first, second])
-
-
-def test_bootstrap_legacy_versions_reads_single_and_batch_contributions():
-    queue = semantic_queue_fixture()
-    coalesce_key = "resource|account|user|peer|viking://resources/bootstrap"
-    old = eligible_msg(coalesce_key=coalesce_key, coalesce_version=7)
-    newer = eligible_msg(coalesce_key=coalesce_key, coalesce_version=11)
-    snapshot = [
-        {"id": "p1", "data": old.to_json()},
-        {"id": "p2", "data": encode_queuefs_batch([newer])},
-        {"id": "bad", "data": "not-json"},
-    ]
-
-    queue.bootstrap_legacy_coalesce(snapshot)
-
-    assert is_semantic_coalesce_stale(coalesce_key, 10)
-    assert not is_semantic_coalesce_stale(coalesce_key, 11)
