@@ -83,3 +83,18 @@ async def test_serial_dequeue_requeues_same_physical_id_and_skips_ack(
     assert queue.path + "/requeue" in written_paths
     assert queue.path + "/ack" not in written_paths
     assert async_agfs.write.await_args.args == (queue.path + "/requeue", b"physical-1")
+
+
+@pytest.mark.asyncio
+async def test_serial_dequeue_propagates_requeue_failure_without_ack(
+    queue: NamedQueue, async_agfs: AsyncMock
+) -> None:
+    queue.set_dequeue_handler(_RetryHandler())
+    async_agfs.read.return_value = json.dumps({"id": "physical-1", "data": "{}"}).encode()
+    async_agfs.write.side_effect = RuntimeError("QueueFS requeue failed")
+
+    with pytest.raises(RuntimeError, match="QueueFS requeue failed"):
+        await queue.dequeue()
+
+    async_agfs.write.assert_awaited_once_with(queue.path + "/requeue", b"physical-1")
+    assert queue.path + "/ack" not in [call.args[0] for call in async_agfs.write.await_args_list]

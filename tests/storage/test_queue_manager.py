@@ -72,3 +72,47 @@ async def test_concurrent_worker_retries_same_id_without_ack() -> None:
 
     queue.requeue.assert_awaited_once_with("physical-1")
     queue.ack.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_retry_task_propagates_requeue_failure_without_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = QueueManager(agfs=MagicMock())
+    queue = NamedQueue(MagicMock(), "/queue", "Semantic")
+    queue._initialized = True
+    queue._async_agfs = AsyncMock()
+    queue.set_dequeue_handler(MagicMock())
+    queue.size = AsyncMock(side_effect=[1, 0])
+    queue.dequeue_raw = AsyncMock(return_value={"id": "physical-1", "data": "{}"})
+    queue.process_dequeued = AsyncMock(
+        side_effect=named_queue_module.QueueMessageRetry(delay_seconds=0)
+    )
+    queue.ack = AsyncMock()
+    stop = threading.Event()
+    tasks = []
+    original_create_task = asyncio.create_task
+
+    async def fail_requeue(msg_id: str) -> None:
+        assert msg_id == "physical-1"
+        stop.set()
+        raise RuntimeError("QueueFS requeue failed")
+
+    def record_task(coro):
+        task = original_create_task(coro)
+        tasks.append(task)
+        return task
+
+    queue.requeue = AsyncMock(side_effect=fail_requeue)
+    monkeypatch.setattr(asyncio, "create_task", record_task)
+
+    await asyncio.wait_for(
+        manager._worker_async_concurrent(queue, stop, max_concurrent=2),
+        timeout=1,
+    )
+
+    assert len(tasks) == 1
+    with pytest.raises(RuntimeError, match="QueueFS requeue failed"):
+        tasks[0].result()
+    queue.requeue.assert_awaited_once_with("physical-1")
+    queue.ack.assert_not_awaited()

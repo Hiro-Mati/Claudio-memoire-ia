@@ -273,14 +273,7 @@ class QueueManager:
                 try:
                     await queue.process_dequeued(data)
                 except QueueMessageRetry as retry:
-                    try:
-                        await queue.settle_retry(msg_id, retry)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as e:
-                        logger.error(
-                            f"[QueueManager] Concurrent retry failed for {queue.name}: {e}"
-                        )
+                    await queue.settle_retry(msg_id, retry)
                     return
                 except Exception as e:
                     # Handler did not call report_error; decrement in_progress manually.

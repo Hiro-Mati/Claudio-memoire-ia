@@ -375,16 +375,15 @@ class NamedQueue:
             raw_data = data
             if self._dequeue_handler:
                 self._on_dequeue_start()
-                try:
-                    data = await self.process_dequeued(data)
-                except QueueMessageRetry as retry:
-                    await self.settle_retry(msg_id, retry)
-                    return None
+                data = await self.process_dequeued(data)
             # Ack unconditionally after handler returns (success or handled error).
             # If on_dequeue raises, the exception propagates and ack is skipped —
             # the message will be recovered on next startup.
             await self.ack(msg_id, raw_data)
             return data
+        except QueueMessageRetry as retry:
+            await self.settle_retry(msg_id, retry)
+            return None
         except Exception as e:
             logger.debug(f"[NamedQueue] Dequeue failed for {self.name}: {e}")
             return None
