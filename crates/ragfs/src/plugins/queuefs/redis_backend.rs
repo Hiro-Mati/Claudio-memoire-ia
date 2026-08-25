@@ -1,13 +1,16 @@
-use super::backend::{Message, QueueBackend, StoredMessage};
+use super::backend::{
+    KeyedBatchCreateReason, KeyedEnqueueOutcome, KeyedEnqueueRequest, Message, QueueBackend,
+    StoredMessage, MAX_KEYED_BATCH_BYTES, MAX_KEYED_BATCH_CONTRIBUTIONS,
+};
 use super::{RedisMode, RedisQueueOptions};
 use crate::core::errors::{Error, Result};
+use r2d2::{ManageConnection, Pool};
 use redis::cluster::ClusterClient;
 use redis::sentinel::{SentinelClient, SentinelClientBuilder, SentinelServerType};
 use redis::{
-    Connection, ConnectionAddr, ConnectionInfo, ConnectionLike, IntoConnectionInfo, RedisError,
-    RedisConnectionInfo, RedisResult, ServerErrorKind, TlsMode,
+    Connection, ConnectionAddr, ConnectionInfo, ConnectionLike, IntoConnectionInfo,
+    RedisConnectionInfo, RedisError, RedisResult, ServerErrorKind, TlsMode,
 };
-use r2d2::{ManageConnection, Pool};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -50,7 +53,14 @@ for _, queue in ipairs(queues) do
                 redis.call('DEL', message_prefix .. string.sub(member, 1, separator - 1))
             end
         end
-        redis.call('DEL', prefix .. ':meta', pending_key, processing_key)
+        redis.call(
+            'DEL',
+            prefix .. ':meta',
+            pending_key,
+            processing_key,
+            prefix .. ':active_keys',
+            prefix .. ':pending_tails'
+        )
         redis.call('SREM', KEYS[1], queue)
         removed = removed + 1
     end
@@ -68,30 +78,121 @@ redis.call('HSET', KEYS[4], 'last_updated', ARGV[4])
 return 1
 "#;
 
+const ENQUEUE_KEYED_SCRIPT: &str = r#"
+-- KEYS[1] queue names, KEYS[2] meta, KEYS[3] pending,
+-- KEYS[4] active_keys, KEYS[5] pending_tails.
+-- ARGV[1] queue name, ARGV[2] new id, ARGV[3] dispatch key,
+-- ARGV[4] merge signature, ARGV[5] contribution, ARGV[6] timestamp,
+-- ARGV[7] count cap, ARGV[8] byte cap, ARGV[9] message prefix.
+if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 then
+    return redis.error_reply('queue not found: ' .. ARGV[1])
+end
+
+local reason = 'no_pending'
+local tail_id = redis.call('HGET', KEYS[5], ARGV[3])
+if tail_id then
+    local payload = redis.call('GET', ARGV[9] .. tail_id)
+    if payload then
+        local stored = cjson.decode(payload)
+        local batch = cjson.decode(stored.data)._queuefs_keyed_batch
+        if batch.schema_version ~= 1 then
+            return redis.error_reply('unsupported keyed batch schema version')
+        end
+        if batch.dispatch_key ~= ARGV[3] then
+            return redis.error_reply('keyed pending tail dispatch key mismatch')
+        end
+        if batch.merge_signature ~= ARGV[4] then
+            reason = 'signature'
+        elseif #batch.contributions >= tonumber(ARGV[7]) then
+            reason = 'count'
+        else
+            table.insert(batch.contributions, ARGV[5])
+            local candidate_data = cjson.encode({_queuefs_keyed_batch = batch})
+            if string.len(candidate_data) <= tonumber(ARGV[8]) then
+                stored.data = candidate_data
+                redis.call('SET', ARGV[9] .. tail_id, cjson.encode(stored))
+                redis.call('HSET', KEYS[2], 'last_updated', ARGV[6])
+                return {'merged', tail_id, tostring(#batch.contributions)}
+            end
+            reason = 'bytes'
+        end
+    end
+end
+
+local body = {
+    _queuefs_keyed_batch = {
+        schema_version = 1,
+        dispatch_key = ARGV[3],
+        merge_signature = ARGV[4],
+        contributions = {ARGV[5]}
+    }
+}
+local encoded_data = cjson.encode(body)
+if string.len(encoded_data) > tonumber(ARGV[8]) then
+    return redis.error_reply('keyed batch contribution exceeds byte limit')
+end
+local stored = cjson.encode({
+    id = ARGV[2],
+    data = encoded_data,
+    timestamp = tonumber(ARGV[6]),
+    dispatch_key = ARGV[3],
+    merge_signature = ARGV[4]
+})
+redis.call('SET', ARGV[9] .. ARGV[2], stored)
+redis.call('RPUSH', KEYS[3], ARGV[2])
+redis.call('HSET', KEYS[5], ARGV[3], ARGV[2])
+redis.call('HSET', KEYS[2], 'last_updated', ARGV[6])
+return {'created:' .. reason, ARGV[2], '1'}
+"#;
+
 const DEQUEUE_SCRIPT: &str = r#"
-local id = redis.call('LPOP', KEYS[1])
-if not id then
-    return nil
+-- KEYS[1] pending, KEYS[2] processing, KEYS[3] active_keys,
+-- KEYS[4] pending_tails. ARGV[1] message prefix, ARGV[2] instance id,
+-- ARGV[3] processing score.
+local ids = redis.call('LRANGE', KEYS[1], 0, -1)
+for _, id in ipairs(ids) do
+    local payload = redis.call('GET', ARGV[1] .. id)
+    if not payload then
+        return redis.error_reply('queuefs payload missing for message ' .. id)
+    end
+    local stored = cjson.decode(payload)
+    local dispatch_key = stored.dispatch_key
+    if not dispatch_key or dispatch_key == cjson.null
+        or redis.call('HEXISTS', KEYS[3], dispatch_key) == 0 then
+        local tail_id = nil
+        if dispatch_key and dispatch_key ~= cjson.null then
+            tail_id = redis.call('HGET', KEYS[4], dispatch_key)
+        end
+        redis.call('LREM', KEYS[1], 1, id)
+        redis.call('ZADD', KEYS[2], ARGV[3], id .. '|' .. ARGV[2])
+        if dispatch_key and dispatch_key ~= cjson.null then
+            redis.call('HSET', KEYS[3], dispatch_key, id)
+            if tail_id == id then
+                redis.call('HDEL', KEYS[4], dispatch_key)
+            end
+        end
+        return {id, payload}
+    end
 end
-local payload = redis.call('GET', ARGV[1] .. id)
-if not payload then
-    redis.call('LPUSH', KEYS[1], id)
-    return redis.error_reply('queuefs payload missing for message ' .. id)
-end
-redis.call('ZADD', KEYS[2], ARGV[3], id .. '|' .. ARGV[2])
-return {id, payload}
+return nil
 "#;
 
 const PEEK_SCRIPT: &str = r#"
-local id = redis.call('LINDEX', KEYS[1], 0)
-if not id then
-    return nil
+-- KEYS[1] pending, KEYS[2] active_keys. ARGV[1] message prefix.
+local ids = redis.call('LRANGE', KEYS[1], 0, -1)
+for _, id in ipairs(ids) do
+    local payload = redis.call('GET', ARGV[1] .. id)
+    if not payload then
+        return redis.error_reply('queuefs payload missing for message ' .. id)
+    end
+    local stored = cjson.decode(payload)
+    local dispatch_key = stored.dispatch_key
+    if not dispatch_key or dispatch_key == cjson.null
+        or redis.call('HEXISTS', KEYS[2], dispatch_key) == 0 then
+        return payload
+    end
 end
-local payload = redis.call('GET', ARGV[1] .. id)
-if not payload then
-    return redis.error_reply('queuefs payload missing for message ' .. id)
-end
-return payload
+return nil
 "#;
 
 const LIST_UNACKED_SCRIPT: &str = r#"
@@ -120,11 +221,61 @@ return result
 "#;
 
 const ACK_SCRIPT: &str = r#"
+-- KEYS[1] processing, KEYS[2] message, KEYS[3] active_keys.
+-- ARGV[1] message id.
 local members = redis.call('ZRANGE', KEYS[1], 0, -1)
 for _, member in ipairs(members) do
     if string.sub(member, 1, string.len(ARGV[1]) + 1) == ARGV[1] .. '|' then
+        local payload = redis.call('GET', KEYS[2])
+        if not payload then
+            return redis.error_reply('queuefs payload missing for message ' .. ARGV[1])
+        end
+        local stored = cjson.decode(payload)
+        local dispatch_key = stored.dispatch_key
+        local active_id = nil
+        if dispatch_key and dispatch_key ~= cjson.null then
+            active_id = redis.call('HGET', KEYS[3], dispatch_key)
+        end
         redis.call('ZREM', KEYS[1], member)
         redis.call('DEL', KEYS[2])
+        if dispatch_key and dispatch_key ~= cjson.null
+            and active_id == ARGV[1] then
+            redis.call('HDEL', KEYS[3], dispatch_key)
+        end
+        return 1
+    end
+end
+return 0
+"#;
+
+const REQUEUE_SCRIPT: &str = r#"
+-- KEYS[1] processing, KEYS[2] pending, KEYS[3] active_keys,
+-- KEYS[4] pending_tails. ARGV[1] message id, ARGV[2] message prefix.
+local members = redis.call('ZRANGE', KEYS[1], 0, -1)
+for _, member in ipairs(members) do
+    if string.sub(member, 1, string.len(ARGV[1]) + 1) == ARGV[1] .. '|' then
+        local payload = redis.call('GET', ARGV[2] .. ARGV[1])
+        if not payload then
+            return redis.error_reply('queuefs payload missing for message ' .. ARGV[1])
+        end
+        local stored = cjson.decode(payload)
+        local dispatch_key = stored.dispatch_key
+        local active_id = nil
+        local has_pending_tail = false
+        if dispatch_key and dispatch_key ~= cjson.null then
+            active_id = redis.call('HGET', KEYS[3], dispatch_key)
+            has_pending_tail = redis.call('HEXISTS', KEYS[4], dispatch_key) == 1
+        end
+        redis.call('ZREM', KEYS[1], member)
+        if dispatch_key and dispatch_key ~= cjson.null then
+            if active_id == ARGV[1] then
+                redis.call('HDEL', KEYS[3], dispatch_key)
+            end
+            if not has_pending_tail then
+                redis.call('HSET', KEYS[4], dispatch_key, ARGV[1])
+            end
+        end
+        redis.call('LPUSH', KEYS[2], ARGV[1])
         return 1
     end
 end
@@ -143,32 +294,58 @@ for _, member in ipairs(processing) do
         redis.call('DEL', ARGV[1] .. string.sub(member, 1, separator - 1))
     end
 end
-redis.call('DEL', KEYS[1], KEYS[2])
+redis.call('DEL', KEYS[1], KEYS[2], KEYS[3], KEYS[4])
 return #pending + #processing
 "#;
 
 const RECOVER_STALE_SCRIPT: &str = r#"
-local recovered = 0
+-- KEYS[1] processing, KEYS[2] pending, KEYS[3] active_keys,
+-- KEYS[4] pending_tails. ARGV[1] message prefix, ARGV[2] instance prefix.
+local dead_members = {}
 local members = redis.call('ZRANGE', KEYS[1], 0, -1)
 for _, member in ipairs(members) do
     local separator = string.find(member, '|', 1, true)
     if separator then
         local id = string.sub(member, 1, separator - 1)
         local instance = string.sub(member, separator + 1)
-        if redis.call('EXISTS', ARGV[1] .. instance .. ':alive') == 0 then
-            redis.call('ZREM', KEYS[1], member)
-            redis.call('RPUSH', KEYS[2], id)
-            recovered = recovered + 1
+        if redis.call('EXISTS', ARGV[2] .. instance .. ':alive') == 0 then
+            local payload = redis.call('GET', ARGV[1] .. id)
+            if not payload then
+                return redis.error_reply('queuefs payload missing for message ' .. id)
+            end
+            local stored = cjson.decode(payload)
+            table.insert(dead_members, {
+                member = member,
+                id = id,
+                dispatch_key = stored.dispatch_key
+            })
         end
     end
 end
-return recovered
+
+for index = #dead_members, 1, -1 do
+    local dead = dead_members[index]
+    redis.call('ZREM', KEYS[1], dead.member)
+    redis.call('LPUSH', KEYS[2], dead.id)
+    local dispatch_key = dead.dispatch_key
+    if dispatch_key and dispatch_key ~= cjson.null then
+        if redis.call('HGET', KEYS[3], dispatch_key) == dead.id then
+            redis.call('HDEL', KEYS[3], dispatch_key)
+        end
+        if redis.call('HEXISTS', KEYS[4], dispatch_key) == 0 then
+            redis.call('HSET', KEYS[4], dispatch_key, dead.id)
+        end
+    end
+end
+return #dead_members
 "#;
 
 struct QueueKeys {
     meta: String,
     pending: String,
     processing: String,
+    active_keys: String,
+    pending_tails: String,
     message_prefix: String,
 }
 
@@ -180,6 +357,8 @@ impl QueueKeys {
             meta: format!("{prefix}:meta"),
             pending: format!("{prefix}:pending"),
             processing: format!("{prefix}:processing"),
+            active_keys: format!("{prefix}:active_keys"),
+            pending_tails: format!("{prefix}:pending_tails"),
             message_prefix: format!("{prefix}:msg:"),
         }
     }
@@ -187,6 +366,61 @@ impl QueueKeys {
     /// Build the payload key for one message.
     fn message(&self, message_id: &str) -> String {
         format!("{}{message_id}", self.message_prefix)
+    }
+}
+
+/// Decode the private three-field result returned by `ENQUEUE_KEYED_SCRIPT`.
+fn parse_keyed_enqueue_result(values: Vec<String>) -> Result<KeyedEnqueueOutcome> {
+    if values.len() != 3 {
+        return Err(Error::internal(format!(
+            "redis keyed enqueue returned {} fields, expected 3",
+            values.len()
+        )));
+    }
+    let outcome = &values[0];
+    let message_id = &values[1];
+    if message_id.is_empty() {
+        return Err(Error::internal(
+            "redis keyed enqueue returned an empty message id",
+        ));
+    }
+    let count = values[2].parse::<usize>().map_err(|error| {
+        Error::internal(format!(
+            "redis keyed enqueue returned invalid contribution count {:?}: {error}",
+            values[2]
+        ))
+    })?;
+    let created_reason = match outcome.as_str() {
+        "created:no_pending" => Some(KeyedBatchCreateReason::NoPending),
+        "created:signature" => Some(KeyedBatchCreateReason::Signature),
+        "created:count" => Some(KeyedBatchCreateReason::Count),
+        "created:bytes" => Some(KeyedBatchCreateReason::Bytes),
+        "merged" => None,
+        value => {
+            return Err(Error::internal(format!(
+                "redis keyed enqueue returned unknown outcome {value:?}"
+            )))
+        }
+    };
+    if let Some(reason) = created_reason {
+        if count != 1 {
+            return Err(Error::internal(format!(
+                "redis keyed enqueue created result returned contribution count {count}, expected 1"
+            )));
+        }
+        Ok(KeyedEnqueueOutcome::Created {
+            message_id: message_id.clone(),
+            reason,
+        })
+    } else if !(2..=MAX_KEYED_BATCH_CONTRIBUTIONS).contains(&count) {
+        Err(Error::internal(format!(
+            "redis keyed enqueue merged result returned invalid contribution count {count}"
+        )))
+    } else {
+        Ok(KeyedEnqueueOutcome::Merged {
+            message_id: message_id.clone(),
+            contribution_count: count,
+        })
     }
 }
 
@@ -318,11 +552,8 @@ impl ManageConnection for SentinelPoolManager {
                 ))
             })?;
             self.discovery_runtime.block_on(async {
-                match tokio::time::timeout(
-                    SENTINEL_DISCOVERY_TIMEOUT,
-                    sentinel.async_get_client(),
-                )
-                .await
+                match tokio::time::timeout(SENTINEL_DISCOVERY_TIMEOUT, sentinel.async_get_client())
+                    .await
                 {
                     Ok(result) => result,
                     Err(_) => Err(RedisError::from(std::io::Error::new(
@@ -334,10 +565,7 @@ impl ManageConnection for SentinelPoolManager {
         }?;
         let connection = client.get_connection_with_timeout(self.connect_timeout)?;
         configure_connection(&connection, self.command_timeout)?;
-        Ok(SentinelConnection::new(
-            connection,
-            self.generation.clone(),
-        ))
+        Ok(SentinelConnection::new(connection, self.generation.clone()))
     }
 
     /// Validate one checked-out Sentinel data connection.
@@ -368,7 +596,9 @@ impl RedisPool {
     /// Build and initialize the configured topology pool.
     fn open(options: &RedisQueueOptions) -> Result<Self> {
         let config_error = |error| {
-            Error::config(format!("invalid queuefs redis client configuration: {error}"))
+            Error::config(format!(
+                "invalid queuefs redis client configuration: {error}"
+            ))
         };
         match options.mode {
             RedisMode::Singleton => {
@@ -563,15 +793,13 @@ impl RedisQueueBackend {
         let (sender, receiver) = mpsc::channel();
         let pool = self.pool.clone();
         self.heartbeat_stop = Some(sender);
-        self.heartbeat_thread = Some(std::thread::spawn(move || {
-            loop {
-                if let Err(error) = refresh_heartbeat(&pool, &key) {
-                    tracing::warn!("queuefs redis heartbeat failed: {error}");
-                }
-                match receiver.recv_timeout(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)) {
-                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-                    Err(RecvTimeoutError::Timeout) => {}
-                }
+        self.heartbeat_thread = Some(std::thread::spawn(move || loop {
+            if let Err(error) = refresh_heartbeat(&pool, &key) {
+                tracing::warn!("queuefs redis heartbeat failed: {error}");
+            }
+            match receiver.recv_timeout(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {}
             }
         }));
     }
@@ -642,6 +870,9 @@ impl RedisQueueBackend {
                 redis::Script::new(RECOVER_STALE_SCRIPT)
                     .key(&keys.processing)
                     .key(&keys.pending)
+                    .key(&keys.active_keys)
+                    .key(&keys.pending_tails)
+                    .arg(&keys.message_prefix)
                     .arg(&instance_key_prefix)
                     .invoke::<usize>(connection)
             })?;
@@ -661,10 +892,7 @@ impl RedisQueueBackend {
         if self.queue_exists_result(queue_name)? {
             Ok(())
         } else {
-            Err(Error::NotFound(format!(
-                "queue '{}' not found",
-                queue_name
-            )))
+            Err(Error::NotFound(format!("queue '{}' not found", queue_name)))
         }
     }
 
@@ -798,12 +1026,41 @@ impl QueueBackend for RedisQueueBackend {
                 .invoke::<i64>(connection)
         })?;
         if enqueued == 0 {
-            return Err(Error::NotFound(format!(
-                "queue '{}' not found",
-                queue_name
-            )));
+            return Err(Error::NotFound(format!("queue '{}' not found", queue_name)));
         }
         Ok(())
+    }
+
+    /// Atomically merge a contribution into the pending tail for its dispatch key.
+    fn enqueue_keyed(
+        &mut self,
+        queue_name: &str,
+        request: KeyedEnqueueRequest,
+    ) -> Result<KeyedEnqueueOutcome> {
+        request.validate()?;
+        let queue_names_key = queue_names_key(&self.key_prefix);
+        let keys = QueueKeys::new(&self.key_prefix, queue_name);
+        let message_id = Uuid::new_v4().to_string();
+        let timestamp = unix_secs(SystemTime::now());
+        let values = self.with_connection("enqueue_keyed", |connection| {
+            redis::Script::new(ENQUEUE_KEYED_SCRIPT)
+                .key(&queue_names_key)
+                .key(&keys.meta)
+                .key(&keys.pending)
+                .key(&keys.active_keys)
+                .key(&keys.pending_tails)
+                .arg(queue_name)
+                .arg(&message_id)
+                .arg(&request.dispatch_key)
+                .arg(&request.merge_signature)
+                .arg(&request.data)
+                .arg(timestamp)
+                .arg(MAX_KEYED_BATCH_CONTRIBUTIONS)
+                .arg(MAX_KEYED_BATCH_BYTES)
+                .arg(&keys.message_prefix)
+                .invoke::<Vec<String>>(connection)
+        })?;
+        parse_keyed_enqueue_result(values)
     }
 
     /// Move the oldest pending message to processing and return its payload atomically.
@@ -814,6 +1071,8 @@ impl QueueBackend for RedisQueueBackend {
             redis::Script::new(DEQUEUE_SCRIPT)
                 .key(&keys.pending)
                 .key(&keys.processing)
+                .key(&keys.active_keys)
+                .key(&keys.pending_tails)
                 .arg(&keys.message_prefix)
                 .arg(&self.instance_id)
                 .arg(unix_secs(SystemTime::now()))
@@ -836,6 +1095,7 @@ impl QueueBackend for RedisQueueBackend {
         self.with_connection("peek", |connection| {
             redis::Script::new(PEEK_SCRIPT)
                 .key(&keys.pending)
+                .key(&keys.active_keys)
                 .arg(&keys.message_prefix)
                 .invoke::<Option<String>>(connection)
         })?
@@ -879,6 +1139,8 @@ impl QueueBackend for RedisQueueBackend {
             redis::Script::new(CLEAR_SCRIPT)
                 .key(&keys.pending)
                 .key(&keys.processing)
+                .key(&keys.active_keys)
+                .key(&keys.pending_tails)
                 .arg(&keys.message_prefix)
                 .invoke::<usize>(connection)
         })?;
@@ -889,23 +1151,25 @@ impl QueueBackend for RedisQueueBackend {
     fn get_last_enqueue_time(&self, queue_name: &str) -> Result<SystemTime> {
         self.require_queue(queue_name)?;
         let keys = QueueKeys::new(&self.key_prefix, queue_name);
-        let pending_ids = self.with_connection("get_last_enqueue_time list pending", |connection| {
-            redis::cmd("LRANGE")
-                .arg(&keys.pending)
-                .arg(0)
-                .arg(-1)
-                .query::<Vec<String>>(connection)
-        })?;
+        let pending_ids =
+            self.with_connection("get_last_enqueue_time list pending", |connection| {
+                redis::cmd("LRANGE")
+                    .arg(&keys.pending)
+                    .arg(0)
+                    .arg(-1)
+                    .query::<Vec<String>>(connection)
+            })?;
         if pending_ids.is_empty() {
             return Ok(UNIX_EPOCH);
         }
-        let payloads = self.with_connection("get_last_enqueue_time load payloads", |connection| {
-            let mut command = redis::cmd("MGET");
-            for id in &pending_ids {
-                command.arg(keys.message(id));
-            }
-            command.query::<Vec<Option<String>>>(connection)
-        })?;
+        let payloads =
+            self.with_connection("get_last_enqueue_time load payloads", |connection| {
+                let mut command = redis::cmd("MGET");
+                for id in &pending_ids {
+                    command.arg(keys.message(id));
+                }
+                command.query::<Vec<Option<String>>>(connection)
+            })?;
         let payloads = payloads
             .into_iter()
             .enumerate()
@@ -930,7 +1194,24 @@ impl QueueBackend for RedisQueueBackend {
             redis::Script::new(ACK_SCRIPT)
                 .key(&keys.processing)
                 .key(keys.message(msg_id))
+                .key(&keys.active_keys)
                 .arg(msg_id)
+                .invoke::<bool>(connection)
+        })
+    }
+
+    /// Return one processing message to the pending front without changing its payload.
+    fn requeue(&mut self, queue_name: &str, msg_id: &str) -> Result<bool> {
+        self.require_queue(queue_name)?;
+        let keys = QueueKeys::new(&self.key_prefix, queue_name);
+        self.with_connection("requeue", |connection| {
+            redis::Script::new(REQUEUE_SCRIPT)
+                .key(&keys.processing)
+                .key(&keys.pending)
+                .key(&keys.active_keys)
+                .key(&keys.pending_tails)
+                .arg(msg_id)
+                .arg(&keys.message_prefix)
                 .invoke::<bool>(connection)
         })
     }
@@ -958,7 +1239,9 @@ fn heartbeat_key(key_prefix: &str, instance_id: &str) -> String {
 
 /// Return Unix seconds for Redis scores and metadata.
 fn unix_secs(time: SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Return the latest timestamp among the current pending payloads.
@@ -968,7 +1251,11 @@ fn last_enqueue_time_from_pending_payloads(payloads: &[String]) -> Result<System
             .map(StoredMessage::into_message)
             .map(|message| message.timestamp)
             .map_err(|error| Error::Serialization(format!("invalid queue payload: {error}")))?;
-        Ok(if timestamp > latest { timestamp } else { latest })
+        Ok(if timestamp > latest {
+            timestamp
+        } else {
+            latest
+        })
     })
 }
 
@@ -992,9 +1279,7 @@ fn endpoint_connection_info(
     } else {
         info.addr().clone()
     };
-    Ok(info
-        .set_redis_settings(redis_settings)
-        .set_addr(address))
+    Ok(info.set_redis_settings(redis_settings).set_addr(address))
 }
 
 /// Build one Sentinel node address with the configured transport security.
@@ -1107,8 +1392,33 @@ fn redis_error(operation: &str, error: redis::RedisError) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use super::super::backend::{
+        KeyedBatchBody, KeyedBatchEnvelope, KeyedEnqueueOutcome, KeyedEnqueueRequest,
+    };
     use super::*;
+    use std::collections::HashSet;
     use std::time::{Duration, Instant, UNIX_EPOCH};
+
+    fn keyed_request(key: &str, signature: &str, data: &str) -> KeyedEnqueueRequest {
+        KeyedEnqueueRequest {
+            dispatch_key: key.to_string(),
+            merge_signature: signature.to_string(),
+            data: data.to_string(),
+        }
+    }
+
+    fn decode_batch(message: &Message) -> KeyedBatchBody {
+        serde_json::from_slice::<KeyedBatchEnvelope>(&message.data)
+            .unwrap()
+            ._queuefs_keyed_batch
+    }
+
+    fn created_message_id(outcome: KeyedEnqueueOutcome) -> String {
+        match outcome {
+            KeyedEnqueueOutcome::Created { message_id, .. } => message_id,
+            KeyedEnqueueOutcome::Merged { .. } => panic!("expected a new keyed batch"),
+        }
+    }
 
     /// Exercise one complete QueueFS message lifecycle.
     fn assert_queue_flow(mut backend: RedisQueueBackend) {
@@ -1131,10 +1441,7 @@ mod tests {
         assert_eq!(queue_names_key("tenant-a"), "{tenant-a}:ov:queue:names");
         assert_eq!(keys.meta, "{tenant-a}:ov:queue:Semantic:meta");
         assert_eq!(keys.pending, "{tenant-a}:ov:queue:Semantic:pending");
-        assert_eq!(
-            keys.processing,
-            "{tenant-a}:ov:queue:Semantic:processing"
-        );
+        assert_eq!(keys.processing, "{tenant-a}:ov:queue:Semantic:processing");
         assert_eq!(
             keys.message("message-id"),
             "{tenant-a}:ov:queue:Semantic:msg:message-id"
@@ -1143,6 +1450,89 @@ mod tests {
             heartbeat_key("tenant-a", "instance-id"),
             "{tenant-a}:ov:queue:instance:instance-id:alive"
         );
+    }
+
+    #[test]
+    fn queue_keys_include_keyed_dispatch_indexes_in_same_hash_slot() {
+        let keys = QueueKeys::new("tenant-a", "Semantic");
+        assert_eq!(keys.active_keys, "{tenant-a}:ov:queue:Semantic:active_keys");
+        assert_eq!(
+            keys.pending_tails,
+            "{tenant-a}:ov:queue:Semantic:pending_tails"
+        );
+        for key in [
+            &keys.pending,
+            &keys.processing,
+            &keys.active_keys,
+            &keys.pending_tails,
+        ] {
+            assert!(key.starts_with("{tenant-a}"));
+        }
+    }
+
+    #[test]
+    fn keyed_scripts_are_cluster_safe_and_maintain_both_indexes() {
+        assert!(ENQUEUE_KEYED_SCRIPT.contains("pending_tails"));
+        assert!(DEQUEUE_SCRIPT.contains("active_keys"));
+        assert!(ACK_SCRIPT.contains("HDEL"));
+        assert!(REQUEUE_SCRIPT.contains("LPUSH"));
+    }
+
+    #[test]
+    fn keyed_enqueue_result_parser_maps_exact_created_reasons_and_rejects_invalid_values() {
+        for (tag, reason) in [
+            ("created:no_pending", KeyedBatchCreateReason::NoPending),
+            ("created:signature", KeyedBatchCreateReason::Signature),
+            ("created:count", KeyedBatchCreateReason::Count),
+            ("created:bytes", KeyedBatchCreateReason::Bytes),
+        ] {
+            assert_eq!(
+                parse_keyed_enqueue_result(vec![
+                    tag.to_string(),
+                    "message-id".to_string(),
+                    "1".to_string(),
+                ])
+                .unwrap(),
+                KeyedEnqueueOutcome::Created {
+                    message_id: "message-id".to_string(),
+                    reason,
+                }
+            );
+        }
+        assert_eq!(
+            parse_keyed_enqueue_result(vec![
+                "merged".to_string(),
+                "message-id".to_string(),
+                "2".to_string(),
+            ])
+            .unwrap(),
+            KeyedEnqueueOutcome::Merged {
+                message_id: "message-id".to_string(),
+                contribution_count: 2,
+            }
+        );
+
+        for invalid in [
+            vec![
+                "created".to_string(),
+                "message-id".to_string(),
+                "1".to_string(),
+            ],
+            vec![
+                "created:no_pending".to_string(),
+                "message-id".to_string(),
+                "2".to_string(),
+            ],
+            vec![
+                "merged".to_string(),
+                "message-id".to_string(),
+                "1".to_string(),
+            ],
+            vec!["merged".to_string(), "".to_string(), "2".to_string()],
+            vec!["merged".to_string(), "message-id".to_string()],
+        ] {
+            assert!(parse_keyed_enqueue_result(invalid).is_err());
+        }
     }
 
     #[test]
@@ -1448,6 +1838,92 @@ mod tests {
 
     #[test]
     #[ignore = "requires QUEUEFS_REDIS_TEST_URL"]
+    fn redis_two_instances_merge_without_loss_and_single_claim_key() {
+        let endpoint =
+            std::env::var("QUEUEFS_REDIS_TEST_URL").expect("QUEUEFS_REDIS_TEST_URL is required");
+        let options = RedisQueueOptions {
+            endpoints: vec![endpoint],
+            key_prefix: format!("queuefs-keyed-test-{}", Uuid::new_v4()),
+            ..RedisQueueOptions::default()
+        };
+        let mut first = RedisQueueBackend::open(options.clone()).unwrap();
+        let mut second = RedisQueueBackend::open(options.clone()).unwrap();
+        let queue = "Semantic".to_string();
+        first.create_queue(&queue).unwrap();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for index in 0..100 {
+                    first
+                        .enqueue_keyed(&queue, keyed_request("k", "s", &format!("first-{index}")))
+                        .unwrap();
+                }
+            });
+            scope.spawn(|| {
+                for index in 0..100 {
+                    second
+                        .enqueue_keyed(&queue, keyed_request("k", "s", &format!("second-{index}")))
+                        .unwrap();
+                }
+            });
+        });
+        let mut inspector = RedisQueueBackend::open(options).unwrap();
+        assert_eq!(inspector.size(&queue).unwrap(), 1);
+        let merged = inspector.dequeue(&queue).unwrap().unwrap();
+        let contributions = decode_batch(&merged).contributions;
+        assert_eq!(contributions.len(), 200);
+        assert_eq!(contributions.iter().collect::<HashSet<_>>().len(), 200);
+        let active = merged;
+        first
+            .enqueue_keyed(&queue, keyed_request("k", "s", "successor"))
+            .unwrap();
+        assert!(second.dequeue(&queue).unwrap().is_none());
+        first.ack(&queue, &active.id).unwrap();
+        assert!(second.dequeue(&queue).unwrap().is_some());
+        second.remove_queue(&queue).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires QUEUEFS_REDIS_TEST_URL"]
+    fn redis_keyed_requeue_and_clear_remove_dispatch_indexes() {
+        let endpoint =
+            std::env::var("QUEUEFS_REDIS_TEST_URL").expect("QUEUEFS_REDIS_TEST_URL is required");
+        let options = RedisQueueOptions {
+            endpoints: vec![endpoint],
+            key_prefix: format!("queuefs-keyed-cleanup-{}", Uuid::new_v4()),
+            ..RedisQueueOptions::default()
+        };
+        let mut backend = RedisQueueBackend::open(options.clone()).unwrap();
+        backend.create_queue("Semantic").unwrap();
+        backend
+            .enqueue_keyed("Semantic", keyed_request("k", "s1", "old"))
+            .unwrap();
+        let old = backend.dequeue("Semantic").unwrap().unwrap();
+        backend
+            .enqueue_keyed("Semantic", keyed_request("k", "s2", "successor"))
+            .unwrap();
+        assert!(backend.requeue("Semantic", &old.id).unwrap());
+        assert_eq!(backend.dequeue("Semantic").unwrap().unwrap().id, old.id);
+        backend.clear("Semantic").unwrap();
+
+        let keys = QueueKeys::new(&options.key_prefix, "Semantic");
+        backend
+            .with_connection("assert keyed indexes empty", |connection| {
+                let active: usize = redis::cmd("HLEN")
+                    .arg(&keys.active_keys)
+                    .query(connection)?;
+                let tails: usize = redis::cmd("HLEN")
+                    .arg(&keys.pending_tails)
+                    .query(connection)?;
+                assert_eq!((active, tails), (0, 0));
+                Ok(())
+            })
+            .unwrap();
+        backend.remove_queue("Semantic").unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires QUEUEFS_REDIS_TEST_URL"]
     /// Recover processing messages owned by instances without a heartbeat.
     fn redis_backend_recovers_messages_owned_by_dead_instances() {
         let endpoint =
@@ -1459,33 +1935,73 @@ mod tests {
         let queue = format!("queuefs-test-{}", Uuid::new_v4());
         let mut backend = RedisQueueBackend::open(options.clone()).unwrap();
         backend.create_queue(&queue).unwrap();
-        let message = Message::new(b"payload".to_vec());
-        let message_id = message.id.clone();
-        backend.enqueue(&queue, message).unwrap();
+        let old_1 = created_message_id(
+            backend
+                .enqueue_keyed(&queue, keyed_request("k", "s1", "old-1"))
+                .unwrap(),
+        );
+        assert_eq!(backend.dequeue(&queue).unwrap().unwrap().id, old_1);
+        let old_2 = created_message_id(
+            backend
+                .enqueue_keyed(&queue, keyed_request("k", "s2", "old-2"))
+                .unwrap(),
+        );
+        let successor = created_message_id(
+            backend
+                .enqueue_keyed(&queue, keyed_request("k", "s3", "successor"))
+                .unwrap(),
+        );
 
         let keys = QueueKeys::new(&options.key_prefix, &queue);
         backend
             .with_connection("test_dead_owner", |connection| {
                 redis::Script::new(
                     r#"
-local id = redis.call('LPOP', KEYS[1])
-redis.call('ZADD', KEYS[2], ARGV[1], id .. '|dead-instance')
-return id
+redis.call('LREM', KEYS[1], 1, ARGV[1])
+redis.call('ZREM', KEYS[2], ARGV[2] .. '|' .. ARGV[3])
+redis.call('ZADD', KEYS[2], 10, ARGV[2] .. '|dead-instance')
+redis.call('ZADD', KEYS[2], 20, ARGV[1] .. '|dead-instance')
+redis.call('HSET', KEYS[3], 'k', ARGV[1])
+return 1
 "#,
                 )
                 .key(&keys.pending)
                 .key(&keys.processing)
-                .arg(unix_secs(SystemTime::now()))
-                .invoke::<String>(connection)
+                .key(&keys.active_keys)
+                .arg(&old_2)
+                .arg(&old_1)
+                .arg(&backend.instance_id)
+                .invoke::<i64>(connection)
             })
             .unwrap();
         drop(backend);
 
         let mut recovered = RedisQueueBackend::open(options).unwrap();
-        let dequeued = recovered.dequeue(&queue).unwrap().unwrap();
-        assert_eq!(dequeued.id, message_id);
-        assert_eq!(dequeued.data, b"payload");
-        assert!(recovered.ack(&queue, &message_id).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let first_recovered = loop {
+            if let Some(message) = recovered.dequeue(&queue).unwrap() {
+                break message;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "startup recovery did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(first_recovered.id, old_1);
+        assert!(recovered.ack(&queue, &old_1).unwrap());
+        assert_eq!(recovered.dequeue(&queue).unwrap().unwrap().id, old_2);
+        assert!(recovered.ack(&queue, &old_2).unwrap());
+        assert_eq!(recovered.dequeue(&queue).unwrap().unwrap().id, successor);
+        assert!(recovered.ack(&queue, &successor).unwrap());
+        let active_keys = recovered
+            .with_connection("test recovered active keys", |connection| {
+                redis::cmd("HLEN")
+                    .arg(&keys.active_keys)
+                    .query::<usize>(connection)
+            })
+            .unwrap();
+        assert_eq!(active_keys, 0);
         recovered.remove_queue(&queue).unwrap();
     }
 
@@ -1509,10 +2025,7 @@ return id
         drop(backend);
 
         let mut restarted = RedisQueueBackend::open(options).unwrap();
-        assert_eq!(
-            restarted.dequeue(&queue).unwrap().unwrap().id,
-            message_id
-        );
+        assert_eq!(restarted.dequeue(&queue).unwrap().unwrap().id, message_id);
         assert!(restarted.ack(&queue, &message_id).unwrap());
         restarted.remove_queue(&queue).unwrap();
     }
