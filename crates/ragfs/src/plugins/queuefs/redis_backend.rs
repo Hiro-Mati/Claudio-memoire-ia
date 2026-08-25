@@ -129,6 +129,9 @@ local body = {
     }
 }
 local encoded_data = cjson.encode(body)
+if string.len(encoded_data) > tonumber(ARGV[8]) then
+    return {'error:bytes', '', '0'}
+end
 local stored = cjson.encode({
     id = ARGV[2],
     data = encoded_data,
@@ -377,6 +380,16 @@ fn parse_keyed_enqueue_result(values: Vec<String>) -> Result<KeyedEnqueueOutcome
     }
     let outcome = &values[0];
     let message_id = &values[1];
+    if outcome == "error:bytes" {
+        if message_id.is_empty() && values[2] == "0" {
+            return Err(Error::InvalidOperation(format!(
+                "keyed batch payload exceeds {MAX_KEYED_BATCH_BYTES} bytes"
+            )));
+        }
+        return Err(Error::internal(format!(
+            "redis keyed enqueue returned malformed byte error reply {values:?}"
+        )));
+    }
     if message_id.is_empty() {
         return Err(Error::internal(
             "redis keyed enqueue returned an empty message id",
@@ -1582,6 +1595,33 @@ mod tests {
     }
 
     #[test]
+    fn keyed_enqueue_lua_byte_error_reply_is_strict_and_maps_to_invalid_operation() {
+        assert!(matches!(
+            parse_keyed_enqueue_result(vec![
+                "error:bytes".to_string(),
+                String::new(),
+                "0".to_string(),
+            ]),
+            Err(Error::InvalidOperation(message))
+                if message == format!(
+                    "keyed batch payload exceeds {MAX_KEYED_BATCH_BYTES} bytes"
+                )
+        ));
+
+        for malformed in [
+            vec![
+                "error:bytes".to_string(),
+                "message-id".to_string(),
+                "0".to_string(),
+            ],
+            vec!["error:bytes".to_string(), String::new(), "1".to_string()],
+            vec!["error:bytes".to_string(), String::new()],
+        ] {
+            assert!(parse_keyed_enqueue_result(malformed).is_err());
+        }
+    }
+
+    #[test]
     /// Derive the last enqueue time from the latest pending message timestamp.
     fn last_enqueue_time_comes_from_pending_messages() {
         let mut first = Message::new(b"first".to_vec());
@@ -1821,6 +1861,62 @@ mod tests {
             })
             .unwrap();
         assert_eq!(existing_keys, 0);
+    }
+
+    #[test]
+    #[ignore = "requires QUEUEFS_REDIS_TEST_URL"]
+    fn redis_keyed_enqueue_rejects_lua_cjson_byte_overflow_without_writes() {
+        let endpoint =
+            std::env::var("QUEUEFS_REDIS_TEST_URL").expect("QUEUEFS_REDIS_TEST_URL is required");
+        let options = RedisQueueOptions {
+            endpoints: vec![endpoint],
+            key_prefix: format!("queuefs-keyed-cjson-test-{}", Uuid::new_v4()),
+            ..RedisQueueOptions::default()
+        };
+        let mut backend = RedisQueueBackend::open(options.clone()).unwrap();
+        let queue = "Semantic";
+        backend.create_queue(queue).unwrap();
+        let request = keyed_request("slashes", "s", &"/".repeat(MAX_KEYED_BATCH_BYTES / 2));
+        let rust_encoded = serde_json::to_vec(&KeyedBatchEnvelope {
+            _queuefs_keyed_batch: KeyedBatchBody {
+                schema_version: KEYED_BATCH_SCHEMA_VERSION,
+                dispatch_key: request.dispatch_key.clone(),
+                merge_signature: request.merge_signature.clone(),
+                contributions: vec![request.data.clone()],
+            },
+        })
+        .unwrap();
+        assert!(rust_encoded.len() < MAX_KEYED_BATCH_BYTES);
+
+        assert!(matches!(
+            backend.enqueue_keyed(queue, request),
+            Err(Error::InvalidOperation(message))
+                if message == format!(
+                    "keyed batch payload exceeds {MAX_KEYED_BATCH_BYTES} bytes"
+                )
+        ));
+
+        let keys = QueueKeys::new(&options.key_prefix, queue);
+        backend
+            .with_connection(
+                "assert cjson overflow wrote no message or indexes",
+                |connection| {
+                    let pending: usize = redis::cmd("LLEN").arg(&keys.pending).query(connection)?;
+                    let active: usize = redis::cmd("HLEN")
+                        .arg(&keys.active_keys)
+                        .query(connection)?;
+                    let tails: usize = redis::cmd("HLEN")
+                        .arg(&keys.pending_tails)
+                        .query(connection)?;
+                    let messages: Vec<String> = redis::cmd("KEYS")
+                        .arg(format!("{}*", keys.message_prefix))
+                        .query(connection)?;
+                    assert_eq!((pending, active, tails, messages.len()), (0, 0, 0, 0));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        backend.remove_queue(queue).unwrap();
     }
 
     #[test]
