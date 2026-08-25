@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from openviking.storage.queuefs.named_queue import NamedQueue
-from openviking.storage.queuefs.semantic_batch import semantic_batch_route
-from openviking.storage.queuefs.semantic_msg import SemanticMsg
+from openviking.storage.queuefs.semantic_batch import SemanticBatch, semantic_batch_route
+from openviking.storage.queuefs.semantic_msg import SemanticMsg, build_semantic_coalesce_key
 from openviking.storage.queuefs.semantic_queue import (
     SemanticQueue,
     is_semantic_coalesce_stale,
@@ -125,6 +125,38 @@ def test_same_identity_writes_share_one_keyed_dispatch_route():
     assert second_route is not None
     assert first_route.dispatch_key == second_route.dispatch_key
     assert first_route.merge_signature == second_route.merge_signature
+
+
+def test_different_peer_identity_cannot_share_keyed_batch_route():
+    first = eligible_msg(
+        peer_id="peer-a",
+        coalesce_key=build_semantic_coalesce_key(
+            context_type="resource",
+            uri="viking://resources/docs",
+            account_id="account",
+            user_id="user",
+            peer_id="peer-a",
+        ),
+    )
+    second = eligible_msg(
+        peer_id="peer-b",
+        coalesce_key=build_semantic_coalesce_key(
+            context_type="resource",
+            uri="viking://resources/docs",
+            account_id="account",
+            user_id="user",
+            peer_id="peer-b",
+        ),
+    )
+
+    first_route = semantic_batch_route(first, task_owned=False)
+    second_route = semantic_batch_route(second, task_owned=False)
+
+    assert first_route is not None
+    assert second_route is not None
+    assert first_route.dispatch_key != second_route.dispatch_key
+    with pytest.raises(ValueError, match="semantic batch route mismatch"):
+        SemanticBatch.from_contributions([first, second])
 
 
 def test_bootstrap_legacy_versions_reads_single_and_batch_contributions():

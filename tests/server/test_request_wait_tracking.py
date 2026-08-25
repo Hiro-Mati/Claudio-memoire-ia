@@ -3,15 +3,18 @@
 
 """Tests for request-scoped wait behavior on write APIs."""
 
+import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from openviking.server.identity import RequestContext, Role
 from openviking.service.resource_service import ResourceService
 from openviking.storage.content_write import ContentWriteCoordinator
-from openviking.storage.queuefs.semantic_dag import SemanticDagExecutor
+from openviking.storage.queuefs.semantic_batch import semantic_batch_route
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
+from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 from openviking.telemetry.context import bind_telemetry
 from openviking.telemetry.operation import OperationTelemetry
 from openviking.telemetry.request_wait_tracker import RequestWaitTracker
@@ -98,76 +101,6 @@ class _BatchWaitVikingFS:
     def _uri_to_path(self, uri, ctx=None):
         del ctx
         return uri
-
-
-class _BatchWaitProcessor:
-    def __init__(self, tracker):
-        self.tracker = tracker
-        self.file_embeddings = []
-        self.directory_embeddings = []
-
-    async def _generate_single_file_summary(self, file_path, llm_sem=None, ctx=None):
-        del llm_sem, ctx
-        return {"name": file_path.rsplit("/", 1)[-1], "summary": "summary"}
-
-    async def _generate_overview(self, dir_uri, file_summaries, children_abstracts, **kwargs):
-        del dir_uri, file_summaries, children_abstracts, kwargs
-        return "overview"
-
-    def _normalize_overview_generation(self, overview):
-        return overview, "abstract"
-
-    async def _vectorize_single_file(
-        self,
-        parent_uri,
-        context_type,
-        file_path,
-        summary_dict,
-        ctx=None,
-        use_summary=False,
-        preserve_existing_created_at=False,
-        ingest_options=None,
-        *,
-        telemetry_id=None,
-        track_wait=True,
-    ):
-        del (
-            parent_uri,
-            context_type,
-            summary_dict,
-            ctx,
-            use_summary,
-            preserve_existing_created_at,
-            ingest_options,
-        )
-        embedding = SimpleNamespace(
-            id=f"file-{telemetry_id}-{file_path.rsplit('/', 1)[-1]}",
-            telemetry_id=telemetry_id,
-            track_wait=track_wait,
-        )
-        self.file_embeddings.append(embedding)
-        if track_wait:
-            self.tracker.register_embedding_root(embedding.telemetry_id, embedding.id)
-
-    async def _vectorize_directory(
-        self,
-        uri,
-        context_type,
-        abstract,
-        overview,
-        ctx=None,
-        ingest_options=None,
-        *,
-        telemetry_id=None,
-        track_wait=True,
-    ):
-        del uri, context_type, abstract, overview, ctx, ingest_options
-        self.directory_embeddings.extend(
-            [
-                SimpleNamespace(telemetry_id=telemetry_id, track_wait=track_wait),
-                SimpleNamespace(telemetry_id=telemetry_id, track_wait=track_wait),
-            ]
-        )
 
 
 class _FakeVikingFS:
@@ -465,9 +398,10 @@ async def test_three_coalesced_requests_wait_for_their_own_file_embeddings(monke
             account_id="account",
             user_id="user",
             peer_id="user",
+            coalesce_key="resource|account|user|user|viking://resources/docs",
             changes={"modified": [f"{root_uri}/{index}.md"]},
             aggregate_directory=True,
-            telemetry_id=f"tm-{index}",
+            telemetry_id=f"task9-wait-{index}",
         )
         for index in range(3)
     ]
@@ -476,45 +410,87 @@ async def test_three_coalesced_requests_wait_for_their_own_file_embeddings(monke
         tracker.register_request(message.telemetry_id)
         tracker.register_semantic_root(message.telemetry_id, message.id)
 
-    processor = _BatchWaitProcessor(tracker)
     viking_fs = _BatchWaitVikingFS()
+    embedding_queue = _RecordingEmbeddingQueue()
+    queue_manager = SimpleNamespace(
+        EMBEDDING="embedding",
+        get_queue=lambda queue_name: embedding_queue,
+    )
+
+    async def summary(file_path, llm_sem=None, ctx=None):
+        del llm_sem, ctx
+        return {"name": file_path.rsplit("/", 1)[-1], "summary": "summary"}
+
+    async def overview(dir_uri, file_summaries, children_abstracts, **kwargs):
+        del dir_uri, file_summaries, children_abstracts, kwargs
+        return "overview"
+
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.get_viking_fs", lambda: viking_fs
+    )
     monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: viking_fs)
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: viking_fs)
+    monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: queue_manager)
+    monkeypatch.setattr(embedding_utils, "get_request_wait_tracker", lambda: tracker)
     monkeypatch.setattr(
         "openviking.storage.queuefs.semantic_dag.get_openviking_config",
         lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
     )
-    executor = SemanticDagExecutor(
-        processor=processor,
-        context_type="resource",
-        max_concurrent_llm=2,
-        ctx=RequestContext(user=UserIdentifier("account", "user"), role=Role.USER),
-        incremental_update=True,
-        target_uri=root_uri,
-        recursive=False,
-        changes={"modified": [f"{root_uri}/{index}.md" for index in range(3)]},
-        file_contributions={
-            f"{root_uri}/{index}.md": (message,) for index, message in enumerate(messages)
-        },
-        shared_directory_embedding=True,
+    monkeypatch.setattr(
+        embedding_utils,
+        "get_openviking_config",
+        lambda: SimpleNamespace(
+            embedding=SimpleNamespace(text_source="summary_only", max_input_tokens=1000)
+        ),
     )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.SemanticLockScope.resolve",
+        AsyncMock(return_value=SimpleNamespace(lock=None, close=AsyncMock())),
+    )
+    processor = SemanticProcessor(max_concurrent_llm=2)
+    processor._generate_single_file_summary = summary
+    processor._generate_overview = overview
+    processor._normalize_overview_generation = lambda generated: (generated, "abstract")
+    processor._enqueue_parent_refresh = AsyncMock()
+    route = semantic_batch_route(messages[0], task_owned=False)
+    assert route is not None
+    payload = {
+        "id": "physical",
+        "data": json.dumps(
+            {
+                "_queuefs_keyed_batch": {
+                    "schema_version": 1,
+                    "dispatch_key": route.dispatch_key,
+                    "merge_signature": route.merge_signature,
+                    "contributions": [message.to_json() for message in messages],
+                }
+            }
+        ),
+    }
 
     try:
-        await executor.run(root_uri)
+        await processor.on_dequeue(payload)
 
-        assert len(processor.directory_embeddings) == 2
-        assert all(embedding.telemetry_id == "" for embedding in processor.directory_embeddings)
-        assert all(embedding.track_wait is False for embedding in processor.directory_embeddings)
-        assert [embedding.telemetry_id for embedding in processor.file_embeddings] == [
-            "tm-0",
-            "tm-1",
-            "tm-2",
+        directory_embeddings = [
+            embedding
+            for embedding in embedding_queue.messages
+            if embedding.context_data["level"] in {0, 1}
         ]
-
-        for message in messages:
-            tracker.mark_semantic_done(message.telemetry_id, message.id)
+        file_embeddings = [
+            embedding
+            for embedding in embedding_queue.messages
+            if embedding.context_data["level"] == 2
+        ]
+        assert len(directory_embeddings) == 2
+        assert all(embedding.telemetry_id == "" for embedding in directory_embeddings)
+        assert [embedding.telemetry_id for embedding in file_embeddings] == [
+            "task9-wait-0",
+            "task9-wait-1",
+            "task9-wait-2",
+        ]
         assert all(not tracker.is_complete(message.telemetry_id) for message in messages)
 
-        for embedding in processor.file_embeddings:
+        for embedding in file_embeddings:
             tracker.mark_embedding_done(
                 embedding.telemetry_id,
                 embedding.id,
