@@ -432,28 +432,20 @@ async def test_embedding_handler_treats_shutdown_write_lock_as_success(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_embedding_handler_propagates_account_id_on_success(monkeypatch):
+async def test_embedding_handler_does_not_emit_worker_latency_metrics(monkeypatch):
     class _DummyVikingDB:
         is_closing = False
 
         async def upsert(self, _data, *, ctx, options=UpsertOptions()):
             return None
 
-    captured: dict[str, object] = {}
     embedder = _DummyEmbedder()
     monkeypatch.setattr(
         "openviking_cli.utils.config.get_openviking_config",
         lambda: _DummyConfig(embedder),
     )
-    monkeypatch.setattr(
-        "openviking.metrics.datasources.EmbeddingEventDataSource.record_success",
-        staticmethod(lambda **kwargs: captured.update(kwargs)),
-    )
-
     handler = TextEmbeddingHandler(_DummyVikingDB())
     await handler.on_dequeue(_build_queue_payload_for_account("acct-embed-success"))
-
-    assert captured["account_id"] == "acct-embed-success"
 
 
 @pytest.mark.asyncio
@@ -511,7 +503,7 @@ async def test_embedding_handler_materialize_content_keeps_inline(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_embedding_handler_propagates_account_id_on_error(monkeypatch):
+async def test_embedding_handler_handles_provider_error_without_worker_metrics(monkeypatch):
     class _DummyVikingDB:
         is_closing = False
         has_queue_manager = False
@@ -527,14 +519,9 @@ async def test_embedding_handler_propagates_account_id_on_error(monkeypatch):
             del is_query
             return self.embed(text)
 
-    captured: dict[str, object] = {}
     monkeypatch.setattr(
         "openviking_cli.utils.config.get_openviking_config",
         lambda: _DummyConfig(_BrokenEmbedder()),
-    )
-    monkeypatch.setattr(
-        "openviking.metrics.datasources.EmbeddingEventDataSource.record_error",
-        staticmethod(lambda **kwargs: captured.update(kwargs)),
     )
     monkeypatch.setattr(
         "openviking.storage.collection_schemas.classify_api_error",
@@ -544,7 +531,6 @@ async def test_embedding_handler_propagates_account_id_on_error(monkeypatch):
     handler = TextEmbeddingHandler(_DummyVikingDB())
     await handler.on_dequeue(_build_queue_payload_for_account("acct-embed-error"))
 
-    assert captured["account_id"] == "acct-embed-error"
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.requests import Request
@@ -12,9 +14,10 @@ from openviking.metrics.collectors.http import HTTPCollector
 from openviking.metrics.core.registry import MetricRegistry
 from openviking.metrics.datasources.base import EventMetricDataSource
 from openviking.metrics.datasources.http import HttpRequestLifecycleDataSource
-from openviking.metrics.datasources.model_usage import VLMEventDataSource
+from openviking.metrics.datasources.model_usage import EmbeddingEventDataSource, VLMEventDataSource
 from openviking.metrics.exporters.prometheus import PrometheusExporter
 from openviking.metrics.global_api import configure_metric_account_dimension, shutdown_metrics
+from openviking.models.embedder.base import DenseEmbedderBase, EmbedResult
 from openviking.models.vlm.base import VLMBase
 from openviking.observability.context import (
     bind_root_observability_context,
@@ -336,6 +339,22 @@ class _DummyVLM(VLMBase):
         return ""
 
 
+class _DummyEmbedder(DenseEmbedderBase):
+    def __init__(self):
+        super().__init__("e1", {"provider": "openai"})
+
+    def embed(self, content, is_query=False):
+        del content, is_query
+        return EmbedResult(dense_vector=[0.1])
+
+    async def embed_async(self, content, is_query=False):
+        del content, is_query
+        return EmbedResult(dense_vector=[0.1])
+
+    def get_dimension(self):
+        return 1
+
+
 def test_vlm_base_update_token_usage_propagates_current_account(monkeypatch):
     captured: dict[str, object] = {}
 
@@ -357,3 +376,103 @@ def test_vlm_base_update_token_usage_propagates_current_account(monkeypatch):
         reset_root_observability_context(token)
 
     assert captured["account_id"] == "acct-vlm-callsite"
+
+
+def test_vlm_base_records_failed_request_outcome_with_account(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake_record_outcome(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(VLMEventDataSource, "record_outcome", staticmethod(_fake_record_outcome))
+
+    token = _bind_root_context_for_account("acct-vlm-outcome")
+    try:
+        vlm = _DummyVLM({"provider": "volcengine", "model": "m1"})
+        vlm._record_request_outcome("error", 0.5, TimeoutError("request timed out"))
+    finally:
+        reset_root_observability_context(token)
+
+    assert captured == {
+        "provider": "volcengine",
+        "model_name": "m1",
+        "status": "error",
+        "duration_seconds": 0.5,
+        "error_code": "timeout",
+        "account_id": "acct-vlm-outcome",
+    }
+
+
+def test_embedder_base_records_outcome_with_provider_model_and_account(monkeypatch):
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        EmbeddingEventDataSource,
+        "record_outcome",
+        staticmethod(lambda **kwargs: captured.update(kwargs)),
+    )
+
+    token = _bind_root_context_for_account("acct-embedding-outcome")
+    try:
+        _DummyEmbedder().embed("hello")
+    finally:
+        reset_root_observability_context(token)
+
+    assert captured["provider"] == "openai"
+    assert captured["model_name"] == "e1"
+    assert captured["status"] == "ok"
+    assert captured["account_id"] == "acct-embedding-outcome"
+    assert float(captured["duration_seconds"]) >= 0.0
+
+
+def test_embedder_base_records_failed_outcome(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class _FailingEmbedder(_DummyEmbedder):
+        def embed(self, content, is_query=False):
+            del content, is_query
+            raise TimeoutError("request timed out")
+
+    monkeypatch.setattr(
+        EmbeddingEventDataSource,
+        "record_outcome",
+        staticmethod(lambda **kwargs: captured.update(kwargs)),
+    )
+
+    with pytest.raises(TimeoutError):
+        _FailingEmbedder().embed("hello")
+
+    assert captured["status"] == "error"
+    assert captured["error_code"] == "timeout"
+    assert captured["provider"] == "openai"
+    assert captured["model_name"] == "e1"
+
+
+@pytest.mark.asyncio
+async def test_embedder_base_async_outcomes_are_isolated_per_call(monkeypatch):
+    captured: list[dict[str, object]] = []
+
+    class _ConcurrentEmbedder(_DummyEmbedder):
+        async def embed_async(self, content, is_query=False):
+            del is_query
+            if content == "slow":
+                await __import__("asyncio").sleep(0.02)
+            return EmbedResult(dense_vector=[0.1])
+
+    monkeypatch.setattr(
+        EmbeddingEventDataSource,
+        "record_outcome",
+        staticmethod(lambda **kwargs: captured.append(kwargs)),
+    )
+
+    import asyncio
+
+    await asyncio.gather(
+        _ConcurrentEmbedder().embed_async("slow"),
+        _ConcurrentEmbedder().embed_async("fast"),
+    )
+
+    assert len(captured) == 2
+    durations = sorted(float(item["duration_seconds"]) for item in captured)
+    assert durations[0] < 0.01
+    assert durations[1] >= 0.015

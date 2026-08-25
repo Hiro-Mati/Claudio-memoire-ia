@@ -157,7 +157,6 @@ def test_account_dimension_injects_account_id_when_metric_allowlisted_exact():
             {
                 "provider": "openai",
                 "model_name": "text-embedding-3-large",
-                "duration_seconds": 0.1,
                 "prompt_tokens": 1,
                 "completion_tokens": 1,
             },
@@ -182,8 +181,8 @@ def test_account_dimension_injects_account_id_when_metric_allowlisted_by_prefix(
     token = _bind_root_context_for_account("acct-embed-2")
     try:
         EmbeddingCollector().receive(
-            "embedding.success",
-            {"latency_seconds": 0.2},
+            "embedding.outcome",
+            {"provider": "openai", "model_name": "e1", "status": "ok", "duration_seconds": 0.2},
             registry,
         )
     finally:
@@ -192,8 +191,8 @@ def test_account_dimension_injects_account_id_when_metric_allowlisted_by_prefix(
 
     text = PrometheusExporter(registry=registry).render()
     assert (
-        'openviking_embedding_requests_total{account_id="acct-embed-2",status="ok"} 1' in text
-        or 'openviking_embedding_requests_total{account_id="acct-embed-2",status="ok"} 1.0' in text
+        'openviking_embedding_requests_total{account_id="acct-embed-2",model_name="e1",provider="openai",status="ok"} 1' in text
+        or 'openviking_embedding_requests_total{account_id="acct-embed-2",model_name="e1",provider="openai",status="ok"} 1.0' in text
     )
 
 
@@ -214,7 +213,6 @@ def test_account_dimension_returns_overflow_when_max_active_accounts_exceeded():
                     {
                         "provider": "openai",
                         "model_name": "text-embedding-3-large",
-                        "duration_seconds": 0.01,
                         "prompt_tokens": 1,
                         "completion_tokens": 0,
                     },
@@ -241,8 +239,8 @@ def test_account_dimension_returns_unknown_for_not_allowlisted_metric_even_with_
     token = _bind_root_context_for_account("acct-x")
     try:
         EmbeddingCollector().receive(
-            "embedding.success",
-            {"latency_seconds": 0.01},
+            "embedding.outcome",
+            {"provider": "openai", "model_name": "e1", "status": "ok", "duration_seconds": 0.01},
             registry,
         )
     finally:
@@ -251,8 +249,8 @@ def test_account_dimension_returns_unknown_for_not_allowlisted_metric_even_with_
 
     text = PrometheusExporter(registry=registry).render()
     assert (
-        'openviking_embedding_requests_total{account_id="__unknown__",status="ok"} 1' in text
-        or 'openviking_embedding_requests_total{account_id="__unknown__",status="ok"} 1.0' in text
+        'openviking_embedding_requests_total{account_id="__unknown__",model_name="e1",provider="openai",status="ok"} 1' in text
+        or 'openviking_embedding_requests_total{account_id="__unknown__",model_name="e1",provider="openai",status="ok"} 1.0' in text
     )
 
 

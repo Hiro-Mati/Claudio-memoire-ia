@@ -649,39 +649,17 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 # Generate embedding vector(s)
                 if self._embedder:
                     try:
-                        import time as _time
-
-                        _embed_t0 = _time.monotonic()
                         result = await embed_compat(
                             self._embedder,
                             embedding_msg.message,
                             is_query=False,
                         )
-                        _embed_elapsed = _time.monotonic() - _embed_t0
-                        try:
-                            from openviking.metrics.datasources import EmbeddingEventDataSource
-
-                            EmbeddingEventDataSource.record_success(
-                                latency_seconds=float(_embed_elapsed),
-                                account_id=embedding_msg.context_data.get("account_id"),
-                            )
-                        except Exception:
-                            pass
                     except Exception as embed_err:
                         error_msg = self._embedding_error_msg(
                             embedding_msg,
                             f"Failed to generate embedding: {embed_err}",
                         )
                         error_class = classify_api_error(embed_err)
-                        try:
-                            from openviking.metrics.datasources import EmbeddingEventDataSource
-
-                            EmbeddingEventDataSource.record_error(
-                                error_code=str(error_class or "unknown"),
-                                account_id=embedding_msg.context_data.get("account_id"),
-                            )
-                        except Exception:
-                            pass
 
                         if error_class == ERROR_CLASS_INPUT_TOO_LARGE:
                             logger.error(error_msg)
@@ -772,12 +750,6 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         "Embedder not initialized, skipping vector generation",
                     )
                     logger.warning(error_msg)
-                    try:
-                        from openviking.metrics.datasources import EmbeddingEventDataSource
-
-                        EmbeddingEventDataSource.record_error(error_code="not_initialized")
-                    except Exception:
-                        pass
                     self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
                     request_failed_message = error_msg
                     report_error_args = (error_msg, data)

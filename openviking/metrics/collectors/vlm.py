@@ -4,12 +4,12 @@
 """
 Event collector: VLMCollector.
 
-Tracks VLM call count, duration, and token usage:
+Tracks VLM request outcomes, duration, errors, and token usage:
 - Calls counter by provider/model
 - Duration histogram by provider/model
 - Token counters by provider/model
 
-This collector is fed by VLMEventDataSource.record_call(...) events emitted from VLM code paths.
+This collector is fed by VLMEventDataSource events emitted from VLM code paths.
 """
 
 from __future__ import annotations
@@ -53,8 +53,13 @@ class VLMCollector(EventMetricCollector):
     # rule: <METRICS_NAMESPACE>_<DOMAIN>_tokens_total
     # e.g.: openviking_vlm_tokens_total
     TOKENS_TOTAL: ClassVar[str] = MetricCollector.metric_name(DOMAIN, "tokens", unit="total")
+    REQUESTS_TOTAL: ClassVar[str] = MetricCollector.metric_name(DOMAIN, "requests", unit="total")
+    REQUEST_DURATION_SECONDS: ClassVar[str] = MetricCollector.metric_name(
+        DOMAIN, "request_duration", unit="seconds"
+    )
+    ERRORS_TOTAL: ClassVar[str] = MetricCollector.metric_name(DOMAIN, "errors", unit="total")
 
-    SUPPORTED_EVENTS: ClassVar[frozenset[str]] = frozenset({"vlm.call"})
+    SUPPORTED_EVENTS: ClassVar[frozenset[str]] = frozenset({"vlm.call", "vlm.outcome"})
 
     def collect(self, registry=None) -> None:
         """
@@ -72,6 +77,19 @@ class VLMCollector(EventMetricCollector):
         The hook forwards explicit account context from the payload so background VLM work can
         still land in the correct tenant partition.
         """
+        if event_name == "vlm.outcome":
+            self.record_outcome(
+                registry,
+                provider=str(payload["provider"]),
+                model_name=str(payload["model_name"]),
+                status=str(payload["status"]),
+                duration_seconds=float(payload["duration_seconds"]),
+                error_code=str(payload.get("error_code") or "unknown"),
+                account_id=(
+                    None if payload.get("account_id") is None else str(payload.get("account_id"))
+                ),
+            )
+            return
         self.record_call(
             registry,
             provider=str(payload["provider"]),
@@ -136,3 +154,45 @@ class VLMCollector(EventMetricCollector):
             amount=int(prompt_tokens) + int(completion_tokens),
             account_id=account_id,
         )
+
+    def record_outcome(
+        self,
+        registry,
+        *,
+        provider: str,
+        model_name: str,
+        status: str,
+        duration_seconds: float,
+        error_code: str,
+        account_id: str | None = None,
+    ) -> None:
+        """Record one VLM request, including failed attempts and their latency."""
+        labels = {
+            "provider": str(provider),
+            "model_name": str(model_name),
+            "status": "error" if status == "error" else "ok",
+        }
+        registry.inc_counter(
+            self.REQUESTS_TOTAL,
+            labels=labels,
+            label_names=("provider", "model_name", "status"),
+            account_id=account_id,
+        )
+        registry.observe_histogram(
+            self.REQUEST_DURATION_SECONDS,
+            max(float(duration_seconds), 0.0),
+            labels=labels,
+            label_names=("provider", "model_name", "status"),
+            account_id=account_id,
+        )
+        if labels["status"] == "error":
+            registry.inc_counter(
+                self.ERRORS_TOTAL,
+                labels={
+                    "provider": str(provider),
+                    "model_name": str(model_name),
+                    "error_code": str(error_code or "unknown"),
+                },
+                label_names=("provider", "model_name", "error_code"),
+                account_id=account_id,
+            )

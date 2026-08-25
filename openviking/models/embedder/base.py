@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 import asyncio
+import functools
+import inspect
 import logging
 import random
 import time
@@ -26,6 +28,17 @@ from openviking_cli.utils import get_logger
 
 T = TypeVar("T")
 logger = get_logger(__name__)
+
+
+def _normalize_embedding_error_code(exc: Exception) -> str:
+    """Map provider exceptions to the bounded retry-class vocabulary."""
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    try:
+        return str(classify_api_error(exc) or "unknown")
+    except Exception:
+        return "unknown"
+
 
 # A multimodal embedding input is a list of content parts, e.g.
 # [{"type": "text", "text": "..."}, {"type": "image_url", "image_url": {"url": "..."}}]
@@ -166,7 +179,78 @@ class EmbedderBase(ABC):
 
         # Token usage tracking
         self._token_tracker = _get_token_tracker()
-        self._active_call_started_at: float | None = None
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        """Instrument concrete provider entrypoints with isolated request timing."""
+        super().__init_subclass__(**kwargs)
+        # CompositeHybridEmbedder and FailoverEmbedder live in this module and delegate
+        # to concrete providers. Instrumenting them would duplicate provider outcomes.
+        if cls.__module__ == __name__:
+            return
+        for method_name in ("embed", "embed_async"):
+            method = cls.__dict__.get(method_name)
+            if method is None or getattr(method, "_embedding_outcome_instrumented", False):
+                continue
+            setattr(cls, method_name, cls._instrument_embedding_entrypoint(method))
+
+    @staticmethod
+    def _instrument_embedding_entrypoint(method):
+        if inspect.iscoroutinefunction(method):
+
+            @functools.wraps(method)
+            async def async_wrapped(self, *args, **kwargs):
+                started_at = time.monotonic()
+                try:
+                    result = await method(self, *args, **kwargs)
+                except Exception as exc:
+                    self._record_request_outcome("error", time.monotonic() - started_at, exc)
+                    raise
+                self._record_request_outcome("ok", time.monotonic() - started_at)
+                return result
+
+            async_wrapped._embedding_outcome_instrumented = True
+            return async_wrapped
+
+        @functools.wraps(method)
+        def sync_wrapped(self, *args, **kwargs):
+            started_at = time.monotonic()
+            try:
+                result = method(self, *args, **kwargs)
+            except Exception as exc:
+                self._record_request_outcome("error", time.monotonic() - started_at, exc)
+                raise
+            self._record_request_outcome("ok", time.monotonic() - started_at)
+            return result
+
+        sync_wrapped._embedding_outcome_instrumented = True
+        return sync_wrapped
+
+    def _record_request_outcome(
+        self, status: str, duration_seconds: float, exc: Exception | None = None
+    ) -> None:
+        """Emit a provider/model request outcome without affecting embedding execution."""
+        try:
+            from openviking.metrics.datasources import EmbeddingEventDataSource
+            from openviking.observability.context import get_root_observability_context
+
+            root_context = get_root_observability_context()
+            EmbeddingEventDataSource.record_outcome(
+                provider=str(self.provider),
+                model_name=str(self.model_name or "unknown"),
+                status=status,
+                duration_seconds=max(float(duration_seconds), 0.0),
+                error_code=_normalize_embedding_error_code(exc) if exc is not None else None,
+                account_id=root_context.account_id if root_context is not None else None,
+            )
+        except Exception as metric_exc:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "embedding request outcome metrics emit failed provider=%s model_name=%s err=%s: %s",
+                    self.provider,
+                    self.model_name,
+                    type(metric_exc).__name__,
+                    metric_exc,
+                )
 
     def prepare_embedding_input(self, content: "EmbeddingInput") -> "EmbeddingInput":
         """Apply this embedder's input guard before provider calls.
@@ -240,16 +324,8 @@ class EmbedderBase(ABC):
         pass
 
     def _run_with_retry(self, func: Callable[[], T], *, logger=None, operation_name: str) -> T:
-        def _wrapped() -> T:
-            previous_started_at = self._active_call_started_at
-            self._active_call_started_at = time.monotonic()
-            try:
-                return func()
-            finally:
-                self._active_call_started_at = previous_started_at
-
         return retry_sync(
-            _wrapped,
+            func,
             max_retries=self.max_retries,
             logger=logger,
             operation_name=operation_name,
@@ -272,8 +348,6 @@ class EmbedderBase(ABC):
             telemetry.set("embedding.async.wait_ms", round(wait_elapsed * 1000, 3))
 
             started = time.monotonic()
-            previous_started_at = self._active_call_started_at
-            self._active_call_started_at = started
             try:
                 return await func()
             finally:
@@ -288,7 +362,6 @@ class EmbedderBase(ABC):
                         wait_elapsed * 1000,
                         elapsed * 1000,
                     )
-                self._active_call_started_at = previous_started_at
                 semaphore.release()
 
         return await retry_async(
@@ -313,25 +386,12 @@ class EmbedderBase(ABC):
         """Check if result is hybrid (contains both dense and sparse vectors)"""
         return False
 
-    def _resolve_metrics_duration_seconds(self, duration_seconds: float = 0.0) -> float:
-        """Resolve per-call metrics duration from an explicit value or the active call timer."""
-        try:
-            normalized_duration = max(float(duration_seconds), 0.0)
-        except (TypeError, ValueError):
-            normalized_duration = 0.0
-        if normalized_duration > 0:
-            return normalized_duration
-        if self._active_call_started_at is None:
-            return 0.0
-        return max(time.monotonic() - self._active_call_started_at, 0.0)
-
     def update_token_usage(
         self,
         model_name: str,
         provider: str,
         prompt_tokens: int,
         completion_tokens: int,
-        duration_seconds: float = 0.0,
     ) -> None:
         """Update token usage
 
@@ -340,7 +400,6 @@ class EmbedderBase(ABC):
             provider: Provider name (openai, volcengine, etc.)
             prompt_tokens: Number of input tokens
             completion_tokens: Number of output tokens
-            duration_seconds: Wall-clock duration of the embedding provider call in seconds
         """
         self._token_tracker.update(
             model_name=model_name,
@@ -357,7 +416,6 @@ class EmbedderBase(ABC):
             EmbeddingEventDataSource.record_call(
                 provider=str(provider),
                 model_name=str(model_name),
-                duration_seconds=self._resolve_metrics_duration_seconds(duration_seconds),
                 prompt_tokens=int(prompt_tokens),
                 completion_tokens=int(completion_tokens),
                 account_id=root_context.account_id if root_context is not None else None,

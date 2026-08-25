@@ -20,10 +20,9 @@ OVERFLOW_ACCOUNT_ID = "__overflow__"
 ACCOUNT_DIMENSION_SUPPORTED_METRICS = frozenset(
     {
         "openviking_embedding_requests_total",
-        "openviking_embedding_latency_seconds",
+        "openviking_embedding_request_duration_seconds",
         "openviking_embedding_errors_total",
         "openviking_embedding_calls_total",
-        "openviking_embedding_call_duration_seconds",
         "openviking_embedding_tokens_input_total",
         "openviking_embedding_tokens_output_total",
         "openviking_embedding_tokens_total",
@@ -47,6 +46,9 @@ ACCOUNT_DIMENSION_SUPPORTED_METRICS = frozenset(
         "openviking_operation_tokens_total",
         "openviking_vlm_calls_total",
         "openviking_vlm_call_duration_seconds",
+        "openviking_vlm_requests_total",
+        "openviking_vlm_request_duration_seconds",
+        "openviking_vlm_errors_total",
         "openviking_vlm_tokens_input_total",
         "openviking_vlm_tokens_output_total",
         "openviking_vlm_tokens_total",

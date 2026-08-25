@@ -200,11 +200,10 @@ Typical `stage` values include:
 | `openviking_vlm_tokens_output_total` | Counter | `account_id, provider, model_name` | VLM output tokens |
 | `openviking_vlm_tokens_total` | Counter | `account_id, provider, model_name` | VLM total tokens |
 | `openviking_vlm_call_duration_seconds` | Histogram | `account_id, provider, model_name` | VLM call duration distribution |
-| `openviking_embedding_requests_total` | Counter | `account_id, status` | embedding request count |
-| `openviking_embedding_latency_seconds` | Histogram | `account_id, status` | embedding latency distribution |
-| `openviking_embedding_errors_total` | Counter | `account_id, error_code` | embedding error count |
+| `openviking_embedding_requests_total` | Counter | `account_id, provider, model_name, status` | embedding provider request count |
+| `openviking_embedding_request_duration_seconds` | Histogram | `account_id, provider, model_name, status` | embedding provider request duration distribution |
+| `openviking_embedding_errors_total` | Counter | `account_id, provider, model_name, error_code` | embedding provider error count |
 | `openviking_embedding_calls_total` | Counter | `account_id, provider, model_name` | embedding provider call count (per-call) |
-| `openviking_embedding_call_duration_seconds` | Histogram | `account_id, provider, model_name` | embedding provider call duration distribution (per-call) |
 | `openviking_embedding_tokens_input_total` | Counter | `account_id, provider, model_name` | embedding input tokens (per-call aggregate) |
 | `openviking_embedding_tokens_output_total` | Counter | `account_id, provider, model_name` | embedding output tokens (per-call aggregate; may not appear if always 0) |
 | `openviking_embedding_tokens_total` | Counter | `account_id, provider, model_name` | embedding total tokens (per-call aggregate) |

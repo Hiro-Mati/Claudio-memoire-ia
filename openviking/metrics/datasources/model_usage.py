@@ -151,13 +151,35 @@ class VLMEventDataSource(EventMetricDataSource):
             },
         )
 
+    @staticmethod
+    def record_outcome(
+        *,
+        provider: str,
+        model_name: str,
+        status: str,
+        duration_seconds: float,
+        error_code: str | None = None,
+        account_id: str | None = None,
+    ) -> None:
+        """Emit one completed VLM request outcome with a bounded error code when failed."""
+        EventMetricDataSource._emit(
+            "vlm.outcome",
+            {
+                "provider": str(provider),
+                "model_name": str(model_name),
+                "status": "error" if status == "error" else "ok",
+                "duration_seconds": max(float(duration_seconds), 0.0),
+                "error_code": str(error_code or "unknown"),
+                "account_id": None if account_id is None else str(account_id),
+            },
+        )
+
 
 class EmbeddingEventDataSource(EventMetricDataSource):
     """
     Event datasource for embedding request outcomes.
 
-    Success and error outcomes are modeled as separate event names so collectors can produce the
-    appropriate request, latency, and error-code series without inspecting exception objects.
+    Provider request outcomes and successful token usage are emitted as separate events.
     """
 
     @staticmethod
@@ -165,18 +187,16 @@ class EmbeddingEventDataSource(EventMetricDataSource):
         *,
         provider: str,
         model_name: str,
-        duration_seconds: float,
         prompt_tokens: int,
         completion_tokens: int,
         account_id: str | None = None,
     ) -> None:
-        """Emit one embedding provider call with tokens, latency, and optional account context."""
+        """Emit one successful embedding provider call with token usage."""
         EventMetricDataSource._emit(
             "embedding.call",
             {
                 "provider": str(provider),
                 "model_name": str(model_name),
-                "duration_seconds": float(duration_seconds),
                 "prompt_tokens": int(prompt_tokens),
                 "completion_tokens": int(completion_tokens),
                 "account_id": None if account_id is None else str(account_id),
@@ -184,32 +204,23 @@ class EmbeddingEventDataSource(EventMetricDataSource):
         )
 
     @staticmethod
-    def record_success(*, latency_seconds: float, account_id: str | None = None) -> None:
-        """
-        Emit an embedding success event with the observed end-to-end latency.
-
-        The latency is expected to cover the full embedding workflow segment that the caller wants
-        reflected in metrics, not just the raw provider round-trip time.
-        """
+    def record_outcome(
+        *,
+        provider: str,
+        model_name: str,
+        status: str,
+        duration_seconds: float,
+        error_code: str | None = None,
+        account_id: str | None = None,
+    ) -> None:
+        """Emit one completed embedding provider request outcome."""
         EventMetricDataSource._emit(
-            "embedding.success",
+            "embedding.outcome",
             {
-                "latency_seconds": float(latency_seconds),
-                "account_id": None if account_id is None else str(account_id),
-            },
-        )
-
-    @staticmethod
-    def record_error(*, error_code: str, account_id: str | None = None) -> None:
-        """
-        Emit an embedding error event with a normalized error code label.
-
-        Callers should translate provider- or worker-specific failures into bounded error codes
-        before invoking this datasource.
-        """
-        EventMetricDataSource._emit(
-            "embedding.error",
-            {
+                "provider": str(provider),
+                "model_name": str(model_name),
+                "status": "error" if status == "error" else "ok",
+                "duration_seconds": max(float(duration_seconds), 0.0),
                 "error_code": str(error_code or "unknown"),
                 "account_id": None if account_id is None else str(account_id),
             },

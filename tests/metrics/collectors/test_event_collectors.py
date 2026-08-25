@@ -13,6 +13,7 @@ from openviking.metrics.collectors.rerank import RerankCollector
 from openviking.metrics.collectors.retrieval import RetrievalCollector
 from openviking.metrics.collectors.session import SessionCollector
 from openviking.metrics.collectors.telemetry_bridge import TelemetryBridgeCollector
+from openviking.metrics.collectors.vlm import VLMCollector
 
 
 class _DummyEventCollector(EventMetricCollector):
@@ -125,6 +126,35 @@ def test_rerank_collector_maps_calls_duration_and_tokens():
     )
 
 
+def test_vlm_collector_records_outcomes_with_latency_and_error_code(registry, render_prometheus):
+    collector = VLMCollector()
+    base_payload = {
+        "provider": "volcengine",
+        "model_name": "seed-2.0",
+        "duration_seconds": 0.4,
+    }
+    collector.receive("vlm.outcome", {**base_payload, "status": "ok"}, registry)
+    collector.receive(
+        "vlm.outcome",
+        {**base_payload, "status": "error", "error_code": "transient"},
+        registry,
+    )
+
+    text = render_prometheus(registry)
+    assert re.search(
+        r'openviking_vlm_requests_total\{(?=[^}]*account_id="__unknown__")(?=[^}]*model_name="seed-2.0")(?=[^}]*provider="volcengine")(?=[^}]*status="ok")[^}]*\} 1(?:\.0)?',
+        text,
+    )
+    assert re.search(
+        r'openviking_vlm_request_duration_seconds_count\{(?=[^}]*account_id="__unknown__")(?=[^}]*model_name="seed-2.0")(?=[^}]*provider="volcengine")(?=[^}]*status="error")[^}]*\} 1(?:\.0)?',
+        text,
+    )
+    assert re.search(
+        r'openviking_vlm_errors_total\{(?=[^}]*account_id="__unknown__")(?=[^}]*error_code="transient")(?=[^}]*model_name="seed-2.0")(?=[^}]*provider="volcengine")[^}]*\} 1(?:\.0)?',
+        text,
+    )
+
+
 def test_telemetry_bridge_collector_records_basic_operation_metrics(registry, render_prometheus):
     c = TelemetryBridgeCollector()
     c.receive(
@@ -197,13 +227,12 @@ def test_global_api_no_longer_exports_metrics_enabled_helper() -> None:
 
 
 def test_embedding_collector_maps_call_metrics_and_tokens(registry, render_prometheus):
-    """`embedding.call` must produce calls/duration/tokens metrics keyed by provider+model."""
+    """`embedding.call` must produce calls/tokens metrics keyed by provider+model."""
     EmbeddingCollector().receive(
         "embedding.call",
         {
             "provider": "openai",
             "model_name": "text-embedding-3-large",
-            "duration_seconds": 0.12,
             "prompt_tokens": 3,
             "completion_tokens": 2,
         },
@@ -216,10 +245,7 @@ def test_embedding_collector_maps_call_metrics_and_tokens(registry, render_prome
         r'openviking_embedding_calls_total\{(?=[^}]*account_id="__unknown__")(?=[^}]*model_name="text-embedding-3-large")(?=[^}]*provider="openai")[^}]*\} 1(?:\.0)?',
         text,
     )
-    assert re.search(
-        r'openviking_embedding_call_duration_seconds_count\{(?=[^}]*account_id="__unknown__")(?=[^}]*model_name="text-embedding-3-large")(?=[^}]*provider="openai")[^}]*\} 1(?:\.0)?',
-        text,
-    )
+    assert "openviking_embedding_call_duration_seconds" not in text
     assert re.search(
         r'openviking_embedding_tokens_input_total\{(?=[^}]*account_id="__unknown__")(?=[^}]*model_name="text-embedding-3-large")(?=[^}]*provider="openai")[^}]*\} 3(?:\.0)?',
         text,
@@ -234,42 +260,33 @@ def test_embedding_collector_maps_call_metrics_and_tokens(registry, render_prome
     )
 
 
-def test_embedding_collector_records_success_volume_and_latency(registry, render_prometheus):
-    """`embedding.success` must increment request volume and observe latency."""
-    EmbeddingCollector().receive(
-        "embedding.success",
-        {"latency_seconds": 0.2},
-        registry,
-    )
-    text = render_prometheus(registry)
-    assert (
-        'openviking_embedding_requests_total{account_id="__unknown__",status="ok"} 1' in text
-        or 'openviking_embedding_requests_total{account_id="__unknown__",status="ok"} 1.0' in text
-    )
-    assert (
-        'openviking_embedding_latency_seconds_count{account_id="__unknown__",status="ok"} 1' in text
-    )
-
-
-def test_embedding_collector_records_error_volume_and_error_code_counter(
+def test_embedding_collector_records_outcomes_with_latency_and_error_code(
     registry, render_prometheus
 ):
-    """`embedding.error` must track request errors and normalize error_code labels."""
-    EmbeddingCollector().receive(
-        "embedding.error",
-        {"error_code": "rate_limit"},
+    """`embedding.outcome` must record provider/model latency and error codes."""
+    collector = EmbeddingCollector()
+    payload = {
+        "provider": "openai",
+        "model_name": "text-embedding-3-large",
+        "duration_seconds": 0.2,
+    }
+    collector.receive("embedding.outcome", {**payload, "status": "ok"}, registry)
+    collector.receive(
+        "embedding.outcome",
+        {**payload, "status": "error", "error_code": "rate_limit"},
         registry,
     )
     text = render_prometheus(registry)
     assert (
-        'openviking_embedding_requests_total{account_id="__unknown__",status="error"} 1' in text
-        or 'openviking_embedding_requests_total{account_id="__unknown__",status="error"} 1.0'
+        'openviking_embedding_requests_total{account_id="__unknown__",model_name="text-embedding-3-large",provider="openai",status="ok"} 1' in text
+        or 'openviking_embedding_requests_total{account_id="__unknown__",model_name="text-embedding-3-large",provider="openai",status="ok"} 1.0'
         in text
     )
+    assert 'openviking_embedding_request_duration_seconds_count{account_id="__unknown__",model_name="text-embedding-3-large",provider="openai",status="ok"} 1' in text
     assert (
-        'openviking_embedding_errors_total{account_id="__unknown__",error_code="rate_limit"} 1'
+        'openviking_embedding_errors_total{account_id="__unknown__",error_code="rate_limit",model_name="text-embedding-3-large",provider="openai"} 1'
         in text
-        or 'openviking_embedding_errors_total{account_id="__unknown__",error_code="rate_limit"} 1.0'
+        or 'openviking_embedding_errors_total{account_id="__unknown__",error_code="rate_limit",model_name="text-embedding-3-large",provider="openai"} 1.0'
         in text
     )
 

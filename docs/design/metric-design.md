@@ -799,7 +799,7 @@ sequenceDiagram
 | Session | `openviking_session_lifecycle_total`、`openviking_session_contexts_used_total`、`openviking_session_archive_total` |
 | Operation Telemetry | `openviking_operation_requests_total`、`openviking_operation_duration_seconds`、`openviking_operation_tokens_total` |
 | VLM | `openviking_vlm_calls_total`、`openviking_vlm_call_duration_seconds`、`openviking_vlm_tokens_input_total`、`openviking_vlm_tokens_output_total`、`openviking_vlm_tokens_total` |
-| Embedding | `openviking_embedding_requests_total`、`openviking_embedding_latency_seconds`、`openviking_embedding_errors_total` |
+| Embedding | `openviking_embedding_requests_total`、`openviking_embedding_request_duration_seconds`、`openviking_embedding_errors_total` |
 
 除上述指标外，其他指标族即使在配置上开启了 `account_id`，当前实现也不会为其注入租户标签。
 

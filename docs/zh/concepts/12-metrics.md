@@ -200,11 +200,10 @@ scrape_configs:
 | `openviking_vlm_tokens_output_total` | Counter | `account_id, provider, model_name` | VLM 输出 token |
 | `openviking_vlm_tokens_total` | Counter | `account_id, provider, model_name` | VLM 总 token |
 | `openviking_vlm_call_duration_seconds` | Histogram | `account_id, provider, model_name` | VLM 调用耗时分布 |
-| `openviking_embedding_requests_total` | Counter | `account_id, status` | embedding 请求数 |
-| `openviking_embedding_latency_seconds` | Histogram | `account_id, status` | embedding 耗时分布 |
-| `openviking_embedding_errors_total` | Counter | `account_id, error_code` | embedding 错误次数 |
+| `openviking_embedding_requests_total` | Counter | `account_id, provider, model_name, status` | embedding provider 请求数 |
+| `openviking_embedding_request_duration_seconds` | Histogram | `account_id, provider, model_name, status` | embedding provider 请求耗时分布 |
+| `openviking_embedding_errors_total` | Counter | `account_id, provider, model_name, error_code` | embedding provider 错误次数 |
 | `openviking_embedding_calls_total` | Counter | `account_id, provider, model_name` | embedding provider 调用次数（per-call） |
-| `openviking_embedding_call_duration_seconds` | Histogram | `account_id, provider, model_name` | embedding provider 调用耗时分布（per-call） |
 | `openviking_embedding_tokens_input_total` | Counter | `account_id, provider, model_name` | embedding 输入 token（per-call 聚合） |
 | `openviking_embedding_tokens_output_total` | Counter | `account_id, provider, model_name` | embedding 输出 token（per-call 聚合；若长期为 0 可能不出现） |
 | `openviking_embedding_tokens_total` | Counter | `account_id, provider, model_name` | embedding 总 token（per-call 聚合） |

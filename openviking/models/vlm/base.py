@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: AGPL-3.0
 """VLM base interface and abstract classes"""
 
+import functools
+import inspect
 import logging
 import re
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,6 +83,78 @@ class VLMBase(ABC):
 
         # Token usage tracking
         self._token_tracker = TokenUsageTracker()
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        """Instrument concrete backend entrypoints without requiring each provider to duplicate it."""
+        super().__init_subclass__(**kwargs)
+        if cls.__module__ == __name__:
+            return
+        for method_name in (
+            "get_completion",
+            "get_completion_async",
+            "get_vision_completion",
+            "get_vision_completion_async",
+            "get_media_completion_async",
+        ):
+            method = cls.__dict__.get(method_name)
+            if method is None or getattr(method, "_vlm_outcome_instrumented", False):
+                continue
+            setattr(cls, method_name, cls._instrument_vlm_entrypoint(method))
+
+    @staticmethod
+    def _instrument_vlm_entrypoint(method):
+        if inspect.iscoroutinefunction(method):
+            @functools.wraps(method)
+            async def async_wrapped(self, *args, **kwargs):
+                started_at = time.monotonic()
+                try:
+                    result = await method(self, *args, **kwargs)
+                except Exception as exc:
+                    self._record_request_outcome("error", time.monotonic() - started_at, exc)
+                    raise
+                self._record_request_outcome("ok", time.monotonic() - started_at)
+                return result
+
+            async_wrapped._vlm_outcome_instrumented = True
+            return async_wrapped
+
+        @functools.wraps(method)
+        def sync_wrapped(self, *args, **kwargs):
+            started_at = time.monotonic()
+            try:
+                result = method(self, *args, **kwargs)
+            except Exception as exc:
+                self._record_request_outcome("error", time.monotonic() - started_at, exc)
+                raise
+            self._record_request_outcome("ok", time.monotonic() - started_at)
+            return result
+
+        sync_wrapped._vlm_outcome_instrumented = True
+        return sync_wrapped
+
+    def _record_request_outcome(
+        self, status: str, duration_seconds: float, exc: Exception | None = None
+    ) -> None:
+        """Emit low-cardinality VLM request outcome metrics without affecting inference."""
+        try:
+            from openviking.metrics.datasources import VLMEventDataSource
+            from openviking.observability.context import get_root_observability_context
+
+            root_context = get_root_observability_context()
+            VLMEventDataSource.record_outcome(
+                provider=str(self.provider),
+                model_name=str(self.model or "unknown"),
+                status=status,
+                duration_seconds=max(float(duration_seconds), 0.0),
+                error_code=_normalize_vlm_error_code(exc) if exc is not None else None,
+                account_id=root_context.account_id if root_context is not None else None,
+            )
+        except Exception as metric_exc:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "vlm request outcome metrics emit failed provider=%s model_name=%s err=%s: %s",
+                    self.provider, self.model, type(metric_exc).__name__, metric_exc
+                )
 
     @abstractmethod
     def get_completion(
@@ -380,6 +455,16 @@ def _annotate_vlm_error(exc: Exception, vlm_instance: "VLMBase") -> None:
     except Exception:
         # Never let annotation break the original error path
         pass
+
+
+def _normalize_vlm_error_code(exc: Exception) -> str:
+    """Map arbitrary provider exceptions to the bounded retry-class vocabulary."""
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    try:
+        return str(classify_api_error(exc) or "unknown")
+    except Exception:
+        return "unknown"
 
 
 class FailoverVLM(VLMBase):
