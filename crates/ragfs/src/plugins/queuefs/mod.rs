@@ -3,12 +3,14 @@
 //! A filesystem-based message queue with multi-queue support where operations are performed
 //! through control files within each queue directory:
 //! - `/queue_name/enqueue` - Write to this file to add a message to the queue
+//! - `/queue_name/enqueue_keyed` - Write a keyed JSON contribution to atomically merge pending work
 //! - `/queue_name/dequeue` - Read from this file to remove and return the first message
 //! - `/queue_name/peek` - Read from this file to view the first message without removing it
 //! - `/queue_name/size` - Read from this file to get the current queue size
 //! - `/queue_name/messages` - Read all unacknowledged messages without changing queue state
 //! - `/queue_name/clear` - Write to this file to clear all messages from the queue
 //! - `/queue_name/ack` - Write message ID to this file to acknowledge and delete it
+//! - `/queue_name/requeue` - Write a processing message ID to return it to the pending queue
 
 mod backend;
 mod redis_backend;
@@ -20,7 +22,10 @@ use crate::core::{
     types::{ConfigParameter, FileInfo, PluginConfig, WriteFlag},
 };
 use async_trait::async_trait;
-use backend::{MemoryBackend, Message, QueueBackend, SQLiteQueueBackend, SQLiteQueueOptions};
+use backend::{
+    KeyedEnqueueRequest, MemoryBackend, Message, QueueBackend, SQLiteQueueBackend,
+    SQLiteQueueOptions,
+};
 use redis_backend::RedisQueueBackend;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -37,6 +42,10 @@ struct ControlFileSpec {
 const CONTROL_FILES: &[ControlFileSpec] = &[
     ControlFileSpec {
         name: "enqueue",
+        mode: 0o222,
+    },
+    ControlFileSpec {
+        name: "enqueue_keyed",
         mode: 0o222,
     },
     ControlFileSpec {
@@ -61,6 +70,10 @@ const CONTROL_FILES: &[ControlFileSpec] = &[
     },
     ControlFileSpec {
         name: "ack",
+        mode: 0o222,
+    },
+    ControlFileSpec {
+        name: "requeue",
         mode: 0o222,
     },
 ];
@@ -466,6 +479,15 @@ impl FileSystem for QueueFileSystem {
                 backend.enqueue(&queue_name, msg)?;
                 Ok(len)
             }
+            "enqueue_keyed" => {
+                let request: KeyedEnqueueRequest =
+                    serde_json::from_slice(data).map_err(|error| {
+                        Error::InvalidOperation(format!("invalid keyed enqueue request: {error}"))
+                    })?;
+                request.validate()?;
+                backend.enqueue_keyed(&queue_name, request)?;
+                Ok(data.len() as u64)
+            }
             "clear" => {
                 backend.clear(&queue_name)?;
                 Ok(0)
@@ -475,8 +497,13 @@ impl FileSystem for QueueFileSystem {
                 backend.ack(&queue_name, &msg_id)?;
                 Ok(0)
             }
+            "requeue" => {
+                let msg_id = String::from_utf8_lossy(data).trim().to_string();
+                backend.requeue(&queue_name, &msg_id)?;
+                Ok(0)
+            }
             _ => Err(Error::InvalidOperation(format!(
-                "Cannot write to '{}'. Use enqueue, clear, or ack",
+                "Cannot write to '{}'. Use enqueue, enqueue_keyed, clear, ack, or requeue",
                 operation
             ))),
         }
@@ -806,6 +833,7 @@ impl ServicePlugin for QueueFSPlugin {
          \n\
          2. Enqueue messages:\n\
             echo 'message data' > /queuefs/Embedding/enqueue\n\
+            echo '{\"dispatch_key\":\"key\",\"merge_signature\":\"sig\",\"data\":\"message\"}' > /queuefs/Embedding/enqueue_keyed\n\
          \n\
          3. Dequeue messages:\n\
             cat /queuefs/Embedding/dequeue\n\
@@ -822,13 +850,18 @@ impl ServicePlugin for QueueFSPlugin {
          7. Ack a message:\n\
             echo '<message_id>' > /queuefs/Embedding/ack\n\
          \n\
+         8. Requeue a processing message:\n\
+            echo '<message_id>' > /queuefs/Embedding/requeue\n\
+         \n\
          Control files per queue:\n\
          - enqueue: Write to add a message to the queue\n\
+         - enqueue_keyed: Write JSON to merge a contribution into a pending keyed batch\n\
          - dequeue: Read to remove and return the first message\n\
          - peek: Read to view the first message without removing it\n\
          - size: Read to get the current queue size\n\
          - clear: Write to clear all messages from the queue\n\
          - ack: Write message id to acknowledge and delete it\n\
+         - requeue: Write a processing message id to return it to pending\n\
          \n\
          Supports nested queues:\n\
             mkdir /queuefs/logs/errors\n\
@@ -871,6 +904,7 @@ impl ServicePlugin for QueueFSPlugin {
 
 #[cfg(test)]
 mod tests {
+    use super::backend::KeyedBatchEnvelope;
     use super::*;
     use serde::Deserialize;
 
@@ -1018,16 +1052,18 @@ mod tests {
 
         // Queue directory should list control files
         let entries = fs.read_dir("/test").await.unwrap();
-        assert_eq!(entries.len(), 7);
+        assert_eq!(entries.len(), 9);
 
         let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
         assert!(names.contains(&"enqueue".to_string()));
+        assert!(names.contains(&"enqueue_keyed".to_string()));
         assert!(names.contains(&"dequeue".to_string()));
         assert!(names.contains(&"peek".to_string()));
         assert!(names.contains(&"size".to_string()));
         assert!(names.contains(&"messages".to_string()));
         assert!(names.contains(&"clear".to_string()));
         assert!(names.contains(&"ack".to_string()));
+        assert!(names.contains(&"requeue".to_string()));
     }
 
     #[tokio::test]
@@ -1402,5 +1438,73 @@ mod tests {
 
         let size = fs.read("/test/size", 0, 0).await.unwrap();
         assert_eq!(String::from_utf8(size).unwrap(), "2");
+    }
+
+    #[tokio::test]
+    async fn enqueue_keyed_control_file_merges_and_requeue_keeps_same_id() {
+        let fs = QueueFileSystem::new();
+        fs.mkdir("/Semantic", 0o755).await.unwrap();
+        let request = serde_json::json!({
+            "dispatch_key": "semantic-v1:key",
+            "merge_signature": "sha256:sig",
+            "data": "first"
+        });
+        fs.write(
+            "/Semantic/enqueue_keyed",
+            request.to_string().as_bytes(),
+            0,
+            WriteFlag::None,
+        )
+        .await
+        .unwrap();
+        let mut second = request.clone();
+        second["data"] = serde_json::Value::String("second".to_string());
+        fs.write(
+            "/Semantic/enqueue_keyed",
+            second.to_string().as_bytes(),
+            0,
+            WriteFlag::None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs.read("/Semantic/size", 0, 0).await.unwrap(), b"1");
+        let active = dequeue_msg(&fs, "Semantic").await;
+        let envelope: KeyedBatchEnvelope = serde_json::from_str(&active.data).unwrap();
+        assert_eq!(
+            envelope._queuefs_keyed_batch.contributions,
+            vec!["first", "second"]
+        );
+        fs.write(
+            "/Semantic/requeue",
+            active.id.as_bytes(),
+            0,
+            WriteFlag::None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dequeue_msg(&fs, "Semantic").await.id, active.id);
+    }
+
+    #[tokio::test]
+    async fn enqueue_keyed_rejects_empty_and_oversized_route_fields() {
+        let fs = QueueFileSystem::new();
+        fs.mkdir("/Semantic", 0o755).await.unwrap();
+        for dispatch_key in [String::new(), "x".repeat(513)] {
+            let request = serde_json::json!({
+                "dispatch_key": dispatch_key,
+                "merge_signature": "sha256:sig",
+                "data": "one"
+            });
+            assert!(matches!(
+                fs.write(
+                    "/Semantic/enqueue_keyed",
+                    request.to_string().as_bytes(),
+                    0,
+                    WriteFlag::None
+                )
+                .await,
+                Err(Error::InvalidOperation(_))
+            ));
+        }
     }
 }

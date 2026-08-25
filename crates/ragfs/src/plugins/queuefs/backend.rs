@@ -7,7 +7,7 @@ use crate::core::errors::{Error, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, types::ValueRef, Connection, Row};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::SystemTime;
 use std::time::{Duration, UNIX_EPOCH};
@@ -22,6 +22,12 @@ pub struct Message {
     pub data: Vec<u8>,
     /// Timestamp when the message was enqueued
     pub timestamp: SystemTime,
+    /// Dispatch key used to serialize keyed batches for the same logical target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_key: Option<String>,
+    /// Signature that defines whether adjacent keyed contributions can merge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_signature: Option<String>,
 }
 
 impl Message {
@@ -31,6 +37,8 @@ impl Message {
             id: Uuid::new_v4().to_string(),
             data,
             timestamp: SystemTime::now(),
+            dispatch_key: None,
+            merge_signature: None,
         }
     }
 }
@@ -42,6 +50,10 @@ pub(super) struct StoredMessage {
     data: Vec<u8>,
     #[serde(default)]
     timestamp: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dispatch_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    merge_signature: Option<String>,
 }
 
 impl StoredMessage {
@@ -51,6 +63,8 @@ impl StoredMessage {
             data: msg.data.clone(),
             // Prefer unix seconds for compatibility with older queue.db producers.
             timestamp: Some(serde_json::Value::Number(unix_secs(msg.timestamp).into())),
+            dispatch_key: msg.dispatch_key.clone(),
+            merge_signature: msg.merge_signature.clone(),
         }
     }
 
@@ -59,8 +73,101 @@ impl StoredMessage {
             id: self.id,
             data: self.data,
             timestamp: parse_stored_timestamp(self.timestamp),
+            dispatch_key: self.dispatch_key,
+            merge_signature: self.merge_signature,
         }
     }
+}
+
+pub const KEYED_BATCH_SCHEMA_VERSION: u8 = 1;
+pub const MAX_KEYED_BATCH_CONTRIBUTIONS: usize = 1024;
+pub const MAX_KEYED_BATCH_BYTES: usize = 8_388_608;
+pub const MAX_DISPATCH_KEY_BYTES: usize = 512;
+pub const MAX_MERGE_SIGNATURE_BYTES: usize = 128;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyedEnqueueRequest {
+    pub dispatch_key: String,
+    pub merge_signature: String,
+    pub data: String,
+}
+
+impl KeyedEnqueueRequest {
+    pub(super) fn validate(&self) -> Result<()> {
+        validate_route_field("dispatch_key", &self.dispatch_key, MAX_DISPATCH_KEY_BYTES)?;
+        validate_route_field(
+            "merge_signature",
+            &self.merge_signature,
+            MAX_MERGE_SIGNATURE_BYTES,
+        )
+    }
+}
+
+fn validate_route_field(name: &str, value: &str, max_bytes: usize) -> Result<()> {
+    if value.is_empty() {
+        return Err(Error::InvalidOperation(format!("{name} must not be empty")));
+    }
+    if value.len() > max_bytes {
+        return Err(Error::InvalidOperation(format!(
+            "{name} must be at most {max_bytes} UTF-8 bytes"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyedBatchCreateReason {
+    NoPending,
+    Signature,
+    Count,
+    Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyedEnqueueOutcome {
+    Created {
+        message_id: String,
+        reason: KeyedBatchCreateReason,
+    },
+    Merged {
+        message_id: String,
+        contribution_count: usize,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct KeyedBatchBody {
+    pub(super) schema_version: u8,
+    pub(super) dispatch_key: String,
+    pub(super) merge_signature: String,
+    pub(super) contributions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct KeyedBatchEnvelope {
+    pub(super) _queuefs_keyed_batch: KeyedBatchBody,
+}
+
+fn serialize_keyed_batch(body: &KeyedBatchBody) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&KeyedBatchEnvelope {
+        _queuefs_keyed_batch: body.clone(),
+    })?)
+}
+
+fn deserialize_keyed_batch(data: &[u8]) -> Result<KeyedBatchBody> {
+    let body = serde_json::from_slice::<KeyedBatchEnvelope>(data)
+        .map_err(|error| Error::Serialization(error.to_string()))?
+        ._queuefs_keyed_batch;
+    if body.schema_version != KEYED_BATCH_SCHEMA_VERSION {
+        return Err(Error::InvalidOperation(format!(
+            "unsupported keyed batch schema version {}",
+            body.schema_version
+        )));
+    }
+    Ok(body)
 }
 
 fn deserialize_stored_message_data<'de, D>(
@@ -152,6 +259,17 @@ pub trait QueueBackend: Send + Sync {
     /// Add a message to the queue
     fn enqueue(&mut self, queue_name: &str, msg: Message) -> Result<()>;
 
+    /// Add a contribution to the pending batch for a dispatch key, or create one.
+    fn enqueue_keyed(
+        &mut self,
+        _queue_name: &str,
+        _request: KeyedEnqueueRequest,
+    ) -> Result<KeyedEnqueueOutcome> {
+        Err(Error::InvalidOperation(
+            "keyed enqueue is not supported by this queue backend".to_string(),
+        ))
+    }
+
     /// Remove and return the first message from the queue
     fn dequeue(&mut self, queue_name: &str) -> Result<Option<Message>>;
 
@@ -172,6 +290,13 @@ pub trait QueueBackend: Send + Sync {
 
     /// Acknowledge (delete) a message by ID
     fn ack(&mut self, queue_name: &str, msg_id: &str) -> Result<bool>;
+
+    /// Return a processing message to the front of the pending queue.
+    fn requeue(&mut self, _queue_name: &str, _msg_id: &str) -> Result<bool> {
+        Err(Error::InvalidOperation(
+            "requeue is not supported by this queue backend".to_string(),
+        ))
+    }
 }
 
 /// Options for SQLite queue backend.
@@ -192,17 +317,54 @@ impl Default for SQLiteQueueOptions {
 
 /// A single queue with its messages
 struct Queue {
-    messages: VecDeque<Message>,
+    pending: VecDeque<String>,
+    messages: HashMap<String, Message>,
+    processing: HashSet<String>,
+    active_keys: HashMap<String, String>,
+    pending_tails: HashMap<String, String>,
     last_enqueue_time: SystemTime,
 }
 
 impl Queue {
     fn new() -> Self {
         Self {
-            messages: VecDeque::new(),
+            pending: VecDeque::new(),
+            messages: HashMap::new(),
+            processing: HashSet::new(),
+            active_keys: HashMap::new(),
+            pending_tails: HashMap::new(),
             last_enqueue_time: SystemTime::UNIX_EPOCH,
         }
     }
+}
+
+fn create_keyed_batch(
+    queue: &mut Queue,
+    request: &KeyedEnqueueRequest,
+    reason: KeyedBatchCreateReason,
+) -> Result<KeyedEnqueueOutcome> {
+    let body = KeyedBatchBody {
+        schema_version: KEYED_BATCH_SCHEMA_VERSION,
+        dispatch_key: request.dispatch_key.clone(),
+        merge_signature: request.merge_signature.clone(),
+        contributions: vec![request.data.clone()],
+    };
+    let data = serialize_keyed_batch(&body)?;
+    if data.len() > MAX_KEYED_BATCH_BYTES {
+        return Err(Error::InvalidOperation(format!(
+            "keyed batch payload exceeds {MAX_KEYED_BATCH_BYTES} bytes"
+        )));
+    }
+    let mut message = Message::new(data);
+    message.dispatch_key = Some(request.dispatch_key.clone());
+    message.merge_signature = Some(request.merge_signature.clone());
+    let message_id = message.id.clone();
+    queue.messages.insert(message_id.clone(), message);
+    queue.pending.push_back(message_id.clone());
+    queue
+        .pending_tails
+        .insert(request.dispatch_key.clone(), message_id.clone());
+    Ok(KeyedEnqueueOutcome::Created { message_id, reason })
 }
 
 /// In-memory queue backend using HashMap
@@ -261,8 +423,58 @@ impl QueueBackend for MemoryBackend {
             .ok_or_else(|| Error::NotFound(format!("queue '{}' not found", queue_name)))?;
 
         queue.last_enqueue_time = SystemTime::now();
-        queue.messages.push_back(msg);
+        let msg_id = msg.id.clone();
+        queue.messages.insert(msg_id.clone(), msg);
+        queue.pending.push_back(msg_id);
         Ok(())
+    }
+
+    fn enqueue_keyed(
+        &mut self,
+        queue_name: &str,
+        request: KeyedEnqueueRequest,
+    ) -> Result<KeyedEnqueueOutcome> {
+        request.validate()?;
+        let queue = self
+            .queues
+            .get_mut(queue_name)
+            .ok_or_else(|| Error::NotFound(format!("queue '{}' not found", queue_name)))?;
+
+        let Some(tail_id) = queue.pending_tails.get(&request.dispatch_key).cloned() else {
+            let outcome = create_keyed_batch(queue, &request, KeyedBatchCreateReason::NoPending)?;
+            queue.last_enqueue_time = SystemTime::now();
+            return Ok(outcome);
+        };
+        let tail = queue.messages.get_mut(&tail_id).ok_or_else(|| {
+            Error::internal(format!("keyed pending tail '{}' is missing", tail_id))
+        })?;
+        let mut body = deserialize_keyed_batch(&tail.data)?;
+        let reason = if body.merge_signature != request.merge_signature {
+            Some(KeyedBatchCreateReason::Signature)
+        } else if body.contributions.len() >= MAX_KEYED_BATCH_CONTRIBUTIONS {
+            Some(KeyedBatchCreateReason::Count)
+        } else {
+            body.contributions.push(request.data.clone());
+            let candidate = serialize_keyed_batch(&body)?;
+            if candidate.len() > MAX_KEYED_BATCH_BYTES {
+                Some(KeyedBatchCreateReason::Bytes)
+            } else {
+                tail.data = candidate;
+                queue.last_enqueue_time = SystemTime::now();
+                return Ok(KeyedEnqueueOutcome::Merged {
+                    message_id: tail_id,
+                    contribution_count: body.contributions.len(),
+                });
+            }
+        };
+
+        let outcome = create_keyed_batch(
+            queue,
+            &request,
+            reason.expect("keyed batch reason is assigned"),
+        )?;
+        queue.last_enqueue_time = SystemTime::now();
+        Ok(outcome)
     }
 
     fn dequeue(&mut self, queue_name: &str) -> Result<Option<Message>> {
@@ -271,7 +483,36 @@ impl QueueBackend for MemoryBackend {
             .get_mut(queue_name)
             .ok_or_else(|| Error::NotFound(format!("queue '{}' not found", queue_name)))?;
 
-        Ok(queue.messages.pop_front())
+        let position = queue.pending.iter().position(|message_id| {
+            let message = queue
+                .messages
+                .get(message_id)
+                .expect("pending queue message payload is present");
+            message
+                .dispatch_key
+                .as_ref()
+                .is_none_or(|key| !queue.active_keys.contains_key(key))
+        });
+        let Some(position) = position else {
+            return Ok(None);
+        };
+        let message_id = queue
+            .pending
+            .remove(position)
+            .expect("dispatchable pending queue message is present");
+        let message = queue
+            .messages
+            .get(&message_id)
+            .cloned()
+            .expect("pending queue message payload is present");
+        queue.processing.insert(message_id.clone());
+        if let Some(key) = &message.dispatch_key {
+            queue.active_keys.insert(key.clone(), message_id.clone());
+            if queue.pending_tails.get(key) == Some(&message_id) {
+                queue.pending_tails.remove(key);
+            }
+        }
+        Ok(Some(message))
     }
 
     fn peek(&self, queue_name: &str) -> Result<Option<Message>> {
@@ -280,7 +521,19 @@ impl QueueBackend for MemoryBackend {
             .get(queue_name)
             .ok_or_else(|| Error::NotFound(format!("queue '{}' not found", queue_name)))?;
 
-        Ok(queue.messages.front().cloned())
+        let Some(message_id) = queue.pending.iter().find(|message_id| {
+            let message = queue
+                .messages
+                .get(*message_id)
+                .expect("pending queue message payload is present");
+            message
+                .dispatch_key
+                .as_ref()
+                .is_none_or(|key| !queue.active_keys.contains_key(key))
+        }) else {
+            return Ok(None);
+        };
+        Ok(queue.messages.get(message_id).cloned())
     }
 
     fn size(&self, queue_name: &str) -> Result<usize> {
@@ -289,7 +542,7 @@ impl QueueBackend for MemoryBackend {
             .get(queue_name)
             .ok_or_else(|| Error::NotFound(format!("queue '{}' not found", queue_name)))?;
 
-        Ok(queue.messages.len())
+        Ok(queue.pending.len())
     }
 
     fn list_unacked(&self, queue_name: &str) -> Result<Vec<Message>> {
@@ -297,7 +550,12 @@ impl QueueBackend for MemoryBackend {
             .queues
             .get(queue_name)
             .ok_or_else(|| Error::NotFound(format!("queue '{}' not found", queue_name)))?;
-        Ok(queue.messages.iter().cloned().collect())
+        Ok(queue
+            .pending
+            .iter()
+            .chain(queue.processing.iter())
+            .filter_map(|message_id| queue.messages.get(message_id).cloned())
+            .collect())
     }
 
     fn clear(&mut self, queue_name: &str) -> Result<()> {
@@ -306,7 +564,11 @@ impl QueueBackend for MemoryBackend {
             .get_mut(queue_name)
             .ok_or_else(|| Error::NotFound(format!("queue '{}' not found", queue_name)))?;
 
+        queue.pending.clear();
         queue.messages.clear();
+        queue.processing.clear();
+        queue.active_keys.clear();
+        queue.pending_tails.clear();
         Ok(())
     }
 
@@ -325,10 +587,45 @@ impl QueueBackend for MemoryBackend {
             .get_mut(queue_name)
             .ok_or_else(|| Error::NotFound(format!("queue '{}' not found", queue_name)))?;
 
-        // Find and remove message by ID
-        let original_len = queue.messages.len();
-        queue.messages.retain(|msg| msg.id != msg_id);
-        Ok(queue.messages.len() != original_len)
+        if !queue.processing.contains(msg_id) {
+            return Ok(false);
+        }
+        let message = queue.messages.get(msg_id).cloned().ok_or_else(|| {
+            Error::internal(format!("processing queue message '{}' is missing", msg_id))
+        })?;
+        queue.processing.remove(msg_id);
+        queue.messages.remove(msg_id);
+        if let Some(key) = message.dispatch_key {
+            if queue.active_keys.get(&key) == Some(&message.id) {
+                queue.active_keys.remove(&key);
+            }
+        }
+        Ok(true)
+    }
+
+    fn requeue(&mut self, queue_name: &str, msg_id: &str) -> Result<bool> {
+        let queue = self
+            .queues
+            .get_mut(queue_name)
+            .ok_or_else(|| Error::NotFound(format!("queue '{}' not found", queue_name)))?;
+        if !queue.processing.contains(msg_id) {
+            return Ok(false);
+        }
+        let message = queue.messages.get(msg_id).cloned().ok_or_else(|| {
+            Error::internal(format!("processing queue message '{}' is missing", msg_id))
+        })?;
+        queue.processing.remove(msg_id);
+        if let Some(key) = message.dispatch_key {
+            if queue.active_keys.get(&key) == Some(&message.id) {
+                queue.active_keys.remove(&key);
+            }
+            queue
+                .pending_tails
+                .entry(key)
+                .or_insert_with(|| msg_id.to_string());
+        }
+        queue.pending.push_front(msg_id.to_string());
+        Ok(true)
     }
 }
 
@@ -793,8 +1090,32 @@ impl QueueBackend for SQLiteQueueBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use tempfile::tempdir;
     use tempfile::TempDir;
+
+    fn keyed_request(key: &str, signature: &str, data: &str) -> KeyedEnqueueRequest {
+        KeyedEnqueueRequest {
+            dispatch_key: key.to_string(),
+            merge_signature: signature.to_string(),
+            data: data.to_string(),
+        }
+    }
+
+    fn decode_batch(message: &Message) -> KeyedBatchBody {
+        serde_json::from_slice::<KeyedBatchEnvelope>(&message.data)
+            .unwrap()
+            ._queuefs_keyed_batch
+    }
+
+    fn pending_batches_for_key(backend: &MemoryBackend, queue: &str, key: &str) -> usize {
+        backend
+            .list_unacked(queue)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.dispatch_key.as_deref() == Some(key))
+            .count()
+    }
 
     /// Create an in-memory backend with a test queue.
     fn memory_backend_with_queue(queue: &str) -> MemoryBackend {
@@ -823,6 +1144,122 @@ mod tests {
         // Creating duplicate should fail
         let result = backend.create_queue("test");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn memory_keyed_enqueue_merges_pending_and_serializes_processing_key() {
+        let mut backend = MemoryBackend::new();
+        backend.create_queue("Semantic").unwrap();
+        backend
+            .enqueue_keyed("Semantic", keyed_request("k", "s", "one"))
+            .unwrap();
+        backend
+            .enqueue_keyed("Semantic", keyed_request("k", "s", "two"))
+            .unwrap();
+        assert_eq!(backend.size("Semantic").unwrap(), 1);
+
+        let active = backend.dequeue("Semantic").unwrap().unwrap();
+        assert_eq!(decode_batch(&active).contributions, vec!["one", "two"]);
+        backend
+            .enqueue_keyed("Semantic", keyed_request("k", "s", "three"))
+            .unwrap();
+        assert!(backend.dequeue("Semantic").unwrap().is_none());
+
+        backend
+            .enqueue_keyed("Semantic", keyed_request("other", "s", "four"))
+            .unwrap();
+        assert_eq!(
+            backend
+                .dequeue("Semantic")
+                .unwrap()
+                .unwrap()
+                .dispatch_key
+                .as_deref(),
+            Some("other")
+        );
+        assert!(backend.ack("Semantic", &active.id).unwrap());
+        assert_eq!(
+            backend
+                .dequeue("Semantic")
+                .unwrap()
+                .unwrap()
+                .dispatch_key
+                .as_deref(),
+            Some("k")
+        );
+    }
+
+    #[test]
+    fn memory_requeue_preserves_payload_and_precedes_successor() {
+        let mut backend = MemoryBackend::new();
+        backend.create_queue("Semantic").unwrap();
+        backend
+            .enqueue_keyed("Semantic", keyed_request("k", "s", "one"))
+            .unwrap();
+        let active = backend.dequeue("Semantic").unwrap().unwrap();
+        backend
+            .enqueue_keyed("Semantic", keyed_request("k", "s", "two"))
+            .unwrap();
+        assert!(backend.requeue("Semantic", &active.id).unwrap());
+        let retried = backend.dequeue("Semantic").unwrap().unwrap();
+        assert_eq!(retried.id, active.id);
+        assert_eq!(decode_batch(&retried).contributions, vec!["one"]);
+        assert!(backend.dequeue("Semantic").unwrap().is_none());
+        backend.ack("Semantic", &retried.id).unwrap();
+        assert_eq!(
+            decode_batch(&backend.dequeue("Semantic").unwrap().unwrap()).contributions,
+            vec!["two"],
+        );
+    }
+
+    #[test]
+    fn memory_keyed_batches_split_on_signature_count_and_bytes() {
+        let mut backend = MemoryBackend::new();
+        backend.create_queue("Semantic").unwrap();
+        backend
+            .enqueue_keyed("Semantic", keyed_request("signature", "s1", "one"))
+            .unwrap();
+        backend
+            .enqueue_keyed("Semantic", keyed_request("signature", "s2", "two"))
+            .unwrap();
+        assert_eq!(backend.size("Semantic").unwrap(), 2);
+
+        for index in 0..=MAX_KEYED_BATCH_CONTRIBUTIONS {
+            backend
+                .enqueue_keyed("Semantic", keyed_request("count", "s", &index.to_string()))
+                .unwrap();
+        }
+        assert_eq!(pending_batches_for_key(&backend, "Semantic", "count"), 2);
+
+        let half_limit = "x".repeat(MAX_KEYED_BATCH_BYTES / 2);
+        backend
+            .enqueue_keyed("Semantic", keyed_request("bytes", "s", &half_limit))
+            .unwrap();
+        backend
+            .enqueue_keyed("Semantic", keyed_request("bytes", "s", &half_limit))
+            .unwrap();
+        assert_eq!(pending_batches_for_key(&backend, "Semantic", "bytes"), 2);
+    }
+
+    #[test]
+    fn memory_list_unacked_contains_pending_and_processing() {
+        let mut backend = MemoryBackend::new();
+        backend.create_queue("Semantic").unwrap();
+        backend
+            .enqueue("Semantic", Message::new(b"one".to_vec()))
+            .unwrap();
+        backend
+            .enqueue("Semantic", Message::new(b"two".to_vec()))
+            .unwrap();
+        let active = backend.dequeue("Semantic").unwrap().unwrap();
+        let ids = backend
+            .list_unacked("Semantic")
+            .unwrap()
+            .into_iter()
+            .map(|message| message.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&active.id));
     }
 
     #[test]
@@ -866,9 +1303,11 @@ mod tests {
 
         let dequeued1 = backend.dequeue("test").unwrap().unwrap();
         assert_eq!(dequeued1.data, b"message 1");
+        assert!(backend.ack("test", &dequeued1.id).unwrap());
 
         let dequeued2 = backend.dequeue("test").unwrap().unwrap();
         assert_eq!(dequeued2.data, b"message 2");
+        assert!(backend.ack("test", &dequeued2.id).unwrap());
 
         assert_eq!(backend.size("test").unwrap(), 0);
         assert!(backend.dequeue("test").unwrap().is_none());
@@ -926,6 +1365,7 @@ mod tests {
 
         let msg1 = backend.dequeue("queue1").unwrap().unwrap();
         assert_eq!(msg1.data, b"msg1");
+        assert!(backend.ack("queue1", &msg1.id).unwrap());
 
         // queue2 should be unaffected
         assert_eq!(backend.size("queue2").unwrap(), 1);
