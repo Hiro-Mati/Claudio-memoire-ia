@@ -137,13 +137,13 @@ def semantic_batch_route(msg: SemanticMsg, *, task_owned: bool) -> Optional[Sema
         return None
     if msg.lock_handoff is not None:
         return None
-    if msg.context_type == "memory":
+    if msg.context_type not in {"resource", "skill"}:
         return None
     if msg.recursive:
         return None
     if not _has_changes(msg):
         return None
-    if msg.target_uri:
+    if msg.target_uri and msg.target_uri.rstrip("/") != msg.uri.rstrip("/"):
         return None
     if not msg.aggregate_directory:
         return None
@@ -160,31 +160,57 @@ def semantic_batch_route(msg: SemanticMsg, *, task_owned: bool) -> Optional[Sema
 def merge_semantic_changes(
     contributions: Sequence[SemanticMsg],
 ) -> tuple[dict[str, list[str]], dict[str, tuple[SemanticMsg, ...]]]:
-    """Fold changes by path while retaining the contribution that is current.
+    """Fold per-path transitions and retain every owner of the final live file.
 
-    A path's last observed state wins.  Path order follows first observation so
-    folding does not make otherwise identical batches fluctuate in ordering.
+    Path order follows first observation so folding does not make otherwise
+    identical batches fluctuate in ordering.  A delete clears live ownership;
+    the first following live event starts a new ownership boundary.
     """
 
-    state: dict[str, tuple[str, SemanticMsg]] = {}
+    state: dict[str, str] = {}
+    live_owners: dict[str, list[SemanticMsg]] = {}
     path_order: list[str] = []
+    seen_paths: set[str] = set()
+    priority = {"modified": 1, "added": 2, "deleted": 3}
     for msg in contributions:
         changes = msg.changes
         if not isinstance(changes, Mapping):
             continue
+        incoming: dict[str, str] = {}
         for kind in ("added", "modified", "deleted"):
             paths = changes.get(kind) or ()
             for path in paths:
-                if path not in state:
+                if path not in seen_paths:
                     path_order.append(path)
-                state[path] = (kind, msg)
+                    seen_paths.add(path)
+                current = incoming.get(path)
+                if current is None or priority[kind] > priority[current]:
+                    incoming[path] = kind
+
+        for path, kind in incoming.items():
+            previous = state.get(path)
+            if kind == "deleted":
+                state[path] = "deleted"
+                live_owners[path] = []
+                continue
+
+            if kind == "added":
+                state[path] = "added"
+            else:
+                state[path] = "added" if previous == "added" else "modified"
+
+            if previous == "deleted" or previous is None:
+                live_owners[path] = [msg]
+            else:
+                live_owners.setdefault(path, []).append(msg)
 
     merged: dict[str, list[str]] = {}
     live: dict[str, tuple[SemanticMsg, ...]] = {}
     for path in path_order:
-        kind, msg = state[path]
+        kind = state[path]
         merged.setdefault(kind, []).append(path)
-        live[path] = (msg,)
+        if kind != "deleted":
+            live[path] = tuple(live_owners[path])
     return merged, live
 
 

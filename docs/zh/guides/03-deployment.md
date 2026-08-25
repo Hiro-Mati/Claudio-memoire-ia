@@ -325,6 +325,18 @@ docker compose up -d
 
 这个变体适用于多个实例共享同一个 `workspace`，但 QueueFS 和 usage audit 的 SQLite 文件仍然放在各实例本地路径的场景。
 
+#### Semantic QueueFS 正确性边界
+
+Semantic keyed 合并只在单个 QueueFS backend namespace 内保证原子性。Memory backend 是进程本地的。SQLite 的原子合并和单飞调度要求每个 SQLite 文件只能由一个活跃消费者进程或 namespace 使用。不要让多个活跃消费者打开同一个文件：一个消费者的启动恢复可能重置另一个消费者正在处理的行。每实例本地 SQLite 只做实例内合并，不同实例仍可能同时处理同一个 semantic 目录。跨副本全局单飞需要所有副本共享同一 Redis QueueFS `key_prefix`。不要通过不受支持的网络文件系统共享 SQLite 数据库；实例本地 SQLite 仍是本地部署的推荐方式。
+
+发布时必须先上线实现 `/enqueue_keyed` 的 Rust QueueFS 服务，再上线 Python semantic producer。Python producer 请求旧 QueueFS 时，缺少 `/enqueue_keyed` 控制文件必须硬失败，不能回退到 `/enqueue`，否则会丢失原子合并和单飞保证。
+
+回滚 Python 前，先停止产生新的 semantic 工作，再用兼容 keyed wrapper 的 Python 消费者排空全部 keyed 积压；确认 keyed 行清空后才能停止该消费者。如果无法排空，必须保留至少一个兼容消费者，并且不能让回滚后的消费者接入这个 QueueFS namespace。旧版 Python 消费者无法解析 keyed wrapper，绝不能让它领取 keyed 行。
+
+`wait=true` 采用 wait 方案 A：每个请求只等待自己的文件 embedding 和已登记的 semantic root。共享目录 L0/L1 embedding 不归属于任何单一请求，可以随后完成；文件 embedding 和 semantic DAG 完成后，请求不会被尚未完成的目录 embedding 阻塞。
+
+CI 必须编译 ignored Redis contract tests；提供 `QUEUEFS_REDIS_TEST_URL` 时，还必须让两个实例使用相同 `key_prefix` 运行 standalone Redis 双实例测试。真实 Redis 校验由环境变量控制；没有该 URL 时，本地 SQLite 验收仍是发布必需门禁，但不能据此宣称具备跨副本保证。
+
 如需公网 HTTPS 访问，请参考 [公网访问指南](12-public-access.md)。
 
 如需自行构建镜像，请显式传入 OpenViking 版本：

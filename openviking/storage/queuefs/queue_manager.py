@@ -16,6 +16,7 @@ from openviking.service.task_work_index import TaskWorkIndex
 from openviking_cli.utils.logger import get_logger
 
 from .embedding_queue import EmbeddingQueue
+from .keyed_diagnostics import diagnostic_from_queue_data
 from .named_queue import (
     DequeueHandlerBase,
     EnqueueHookBase,
@@ -276,16 +277,50 @@ class QueueManager:
                 try:
                     await queue.process_dequeued(data)
                 except QueueMessageRetry as retry:
-                    await queue.settle_retry(msg_id, retry)
+                    await queue.settle_retry(msg_id, retry, data)
                     return
+                except asyncio.CancelledError:
+                    queue._discard_status_events()
+                    raise
                 except Exception as e:
                     # Handler did not call report_error; decrement in_progress manually.
                     # Do NOT ack — let RecoverStale re-queue on next startup.
+                    queue._discard_status_events()
                     queue._on_process_error(str(e), data)
-                    logger.error(f"[QueueManager] Concurrent worker error for {queue.name}: {e}")
+                    diagnostic = diagnostic_from_queue_data(data)
+                    if diagnostic is not None:
+                        logger.error(
+                            "[QueueManager] Concurrent keyed worker error",
+                            extra=diagnostic.as_dict(e),
+                        )
+                    else:
+                        logger.error(
+                            f"[QueueManager] Concurrent worker error for {queue.name}: {e}"
+                        )
                 else:
                     # Ack after successful processing (delete from persistent storage).
-                    await queue.ack(msg_id, data)
+                    await queue.settle_success(msg_id, data)
+
+        def consume_task_result(task: asyncio.Task, data: Dict[str, Any]) -> None:
+            """Observe failures from detached concurrent settlement tasks."""
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception as error:
+                diagnostic = diagnostic_from_queue_data(data)
+                if diagnostic is not None:
+                    logger.error(
+                        "[QueueManager] Concurrent keyed settlement failure",
+                        extra=diagnostic.as_dict(error),
+                    )
+                else:
+                    logger.error(
+                        "[QueueManager] Concurrent settlement failure for %s (%s): %s",
+                        queue.name,
+                        type(error).__name__,
+                        error,
+                    )
 
         while not stop_event.is_set():
             # Prune completed tasks
@@ -306,6 +341,9 @@ class QueueManager:
                 # size=0 and in_progress=0 between dequeue_raw() and task execution.
                 queue._on_dequeue_start()
                 task = asyncio.create_task(process_one(data))
+                task.add_done_callback(
+                    lambda finished, item=data: consume_task_result(finished, item)
+                )
                 active_tasks.add(task)
                 logger.debug(
                     f"[QueueManager] Dispatched concurrent task for {queue.name} "

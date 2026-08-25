@@ -4,6 +4,7 @@ import abc
 import asyncio
 import json
 import threading
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -19,6 +20,8 @@ from openviking.service.task_work_index import (
     prepare_task_payload,
 )
 from openviking_cli.utils.logger import get_logger
+
+from .keyed_diagnostics import bounded_error_class, diagnostic_from_queue_data
 
 logger = get_logger(__name__)
 
@@ -149,6 +152,9 @@ class NamedQueue:
         self._requeue_count = 0
         self._error_count = 0
         self._errors: List[QueueError] = []
+        self._pending_status_events: ContextVar[Optional[List[tuple[str, str, Any]]]] = ContextVar(
+            f"queue_status_events_{id(self)}", default=None
+        )
 
         # Inject callbacks to handler
         if self._dequeue_handler:
@@ -170,21 +176,46 @@ class NamedQueue:
 
     def _on_process_success(self) -> None:
         """Called on processing success."""
+        pending = self._pending_status_events.get()
+        if pending is not None:
+            pending.append(("success", "", None))
+            return
+        self._apply_process_success()
+
+    def _apply_process_success(self) -> None:
         with self._lock:
             self._in_progress -= 1
             self._processed += 1
 
     def _on_process_requeue(self) -> None:
         """Called when a dequeued message is re-enqueued for later retry."""
+        pending = self._pending_status_events.get()
+        if pending is not None:
+            pending.append(("requeue", "", None))
+            return
+        self._apply_process_requeue()
+
+    def _apply_process_requeue(self) -> None:
         with self._lock:
             self._requeue_count += 1
 
     def _on_process_error(self, error_msg: str, data: Optional[Dict[str, Any]] = None) -> None:
         """Called on processing failure."""
+        diagnostic = diagnostic_from_queue_data(data)
+        if diagnostic is not None:
+            error_msg = bounded_error_class(error_msg)
+            data = diagnostic.as_dict(error_msg)
         if self._task_work_index is not None and data is not None:
             metadata = extract_task_metadata(data)
             if metadata is not None:
                 self._task_work_index.record_failure(metadata.task_id, error_msg)
+        pending = self._pending_status_events.get()
+        if pending is not None:
+            pending.append(("error", error_msg, data))
+            return
+        self._apply_process_error(error_msg, data)
+
+    def _apply_process_error(self, error_msg: str, data: Optional[Dict[str, Any]] = None) -> None:
         with self._lock:
             self._in_progress -= 1
             self._error_count += 1
@@ -192,6 +223,44 @@ class NamedQueue:
                 QueueError(
                     timestamp=datetime.now(),
                     message=error_msg,
+                    data=data,
+                )
+            )
+            if len(self._errors) > self.MAX_ERRORS:
+                self._errors = self._errors[-self.MAX_ERRORS :]
+
+    def _commit_status_events(self) -> None:
+        """Publish handler accounting only after physical queue settlement."""
+        pending = self._pending_status_events.get()
+        self._pending_status_events.set(None)
+        for kind, error_msg, data in pending or []:
+            if kind == "success":
+                self._apply_process_success()
+            elif kind == "requeue":
+                self._apply_process_requeue()
+            else:
+                self._apply_process_error(error_msg, data)
+
+    def _discard_status_events(self) -> None:
+        self._pending_status_events.set(None)
+
+    def _record_settlement_failure(
+        self, error: Exception, data: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Record an observable failure without claiming the message left processing."""
+        self._discard_status_events()
+        diagnostic = diagnostic_from_queue_data(data)
+        if diagnostic is not None:
+            message = bounded_error_class(error)
+            data = diagnostic.as_dict(error)
+        else:
+            message = str(error)
+        with self._lock:
+            self._error_count += 1
+            self._errors.append(
+                QueueError(
+                    timestamp=datetime.now(),
+                    message=message,
                     data=data,
                 )
             )
@@ -304,11 +373,36 @@ class NamedQueue:
             raise ValueError("cannot requeue an empty QueueFS message id")
         await self._async_agfs.write(f"{self.path}/requeue", msg_id.encode("utf-8"))
 
-    async def settle_retry(self, msg_id: str, retry: QueueMessageRetry) -> None:
+    async def settle_retry(
+        self,
+        msg_id: str,
+        retry: QueueMessageRetry,
+        message: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Delay then physically requeue the current processing message."""
         if retry.delay_seconds:
             await asyncio.sleep(retry.delay_seconds)
-        await self.requeue(msg_id)
+        try:
+            await self.requeue(msg_id)
+        except asyncio.CancelledError:
+            self._discard_status_events()
+            raise
+        except Exception as error:
+            self._record_settlement_failure(error, message)
+            raise
+        self._commit_status_events()
+
+    async def settle_success(self, msg_id: str, message: Optional[Dict[str, Any]] = None) -> None:
+        """Physically acknowledge a message, then publish handler accounting."""
+        try:
+            await self.ack(msg_id, message)
+        except asyncio.CancelledError:
+            self._discard_status_events()
+            raise
+        except Exception as error:
+            self._record_settlement_failure(error, message)
+            raise
+        self._commit_status_events()
 
     async def ack(self, msg_id: str, message: Optional[Dict[str, Any]] = None) -> None:
         """Acknowledge successful processing of a message (deletes it from persistent storage).
@@ -334,7 +428,15 @@ class NamedQueue:
         except Exception as e:
             if self._task_work_index is not None and prepared is not None:
                 self._task_work_index.rollback_ack(self.name, prepared)
-            logger.warning(f"[NamedQueue] Ack failed for {self.name} msg_id={msg_id}: {e}")
+            diagnostic = diagnostic_from_queue_data(message)
+            if diagnostic is not None:
+                logger.warning(
+                    "[NamedQueue] Keyed ACK failed",
+                    extra=diagnostic.as_dict(e),
+                )
+            else:
+                logger.warning(f"[NamedQueue] Ack failed for {self.name} msg_id={msg_id}: {e}")
+            raise
 
     async def _read_queue_message(self) -> Optional[Dict[str, Any]]:
         """Read and remove one message from the AGFS queue; return parsed dict or None.
@@ -366,6 +468,8 @@ class NamedQueue:
         on the next startup resets the message back to 'pending' for retry.
         """
         await self._ensure_initialized()
+        msg_id = ""
+        raw_data = None
         try:
             data = await self._read_queue_message()
             if data is None:
@@ -379,13 +483,20 @@ class NamedQueue:
             # Ack unconditionally after handler returns (success or handled error).
             # If on_dequeue raises, the exception propagates and ack is skipped —
             # the message will be recovered on next startup.
-            await self.ack(msg_id, raw_data)
+            await self.settle_success(msg_id, raw_data)
             return data
         except QueueMessageRetry as retry:
-            await self.settle_retry(msg_id, retry)
+            await self.settle_retry(msg_id, retry, raw_data)
             return None
         except Exception as e:
-            logger.debug(f"[NamedQueue] Dequeue failed for {self.name}: {e}")
+            diagnostic = diagnostic_from_queue_data(raw_data)
+            if diagnostic is not None:
+                logger.debug(
+                    "[NamedQueue] Keyed dequeue settlement failed",
+                    extra=diagnostic.as_dict(e),
+                )
+            else:
+                logger.debug(f"[NamedQueue] Dequeue failed for {self.name}: {e}")
             return None
 
     async def dequeue_raw(self) -> Optional[Dict[str, Any]]:
@@ -405,6 +516,8 @@ class NamedQueue:
         """
         if self._dequeue_handler is None:
             return data
+
+        self._pending_status_events.set([])
 
         metadata = extract_task_metadata(data)
         if metadata is None or self._task_work_index is None:

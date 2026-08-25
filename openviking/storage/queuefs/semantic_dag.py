@@ -30,9 +30,15 @@ from openviking_cli.utils import VikingURI
 from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.logger import get_logger
 
+from .keyed_diagnostics import (
+    bind_keyed_batch_diagnostic,
+    get_keyed_batch_diagnostic,
+    install_keyed_batch_log_filter,
+)
 from .semantic_msg import SemanticMsg
 
 logger = get_logger(__name__)
+install_keyed_batch_log_filter(logger)
 
 # Session-internal files that should never be summarized by the semantic pipeline.
 # These are canonical archives (e.g. session transcripts) whose content provides
@@ -205,6 +211,7 @@ class SemanticDagExecutor:
         self._shared_directory_embedding = shared_directory_embedding
         self._task_context = get_task_context()
         self._telemetry = get_current_telemetry()
+        self._keyed_diagnostic = get_keyed_batch_diagnostic()
         self._stale = False
         self._changed_paths = {
             path for key in ("added", "modified", "deleted") for path in self._changes.get(key, [])
@@ -231,6 +238,8 @@ class SemanticDagExecutor:
 
     async def run(self, root_uri: str) -> None:
         """Run DAG execution starting from root_uri."""
+        if self._keyed_diagnostic is None:
+            self._keyed_diagnostic = get_keyed_batch_diagnostic()
         self._root_uri = root_uri
         self._root_done = asyncio.Event()
         self._scheduler = get_semantic_node_scheduler(self._node_concurrency)
@@ -338,7 +347,12 @@ class SemanticDagExecutor:
             if self._task_context is not None
             else nullcontext()
         )
-        with bind_telemetry(self._telemetry), task_context:
+        diagnostic_context = (
+            bind_keyed_batch_diagnostic(self._keyed_diagnostic)
+            if self._keyed_diagnostic is not None
+            else nullcontext()
+        )
+        with bind_telemetry(self._telemetry), task_context, diagnostic_context:
             await self._run_work_bound(work)
 
     async def _run_work_bound(self, work: DagWork) -> None:
@@ -691,6 +705,8 @@ class SemanticDagExecutor:
             # corrupted YAML into a later regeneration.
             raise
         except Exception as e:
+            if self._file_contributions is not None:
+                raise
             logger.warning(f"Failed to generate summary for {file_path}: {e}")
             summary_dict = {"name": file_name, "summary": ""}
         finally:
@@ -963,11 +979,15 @@ class SemanticDagExecutor:
                 except AbstractOverviewFormatError:
                     raise
                 except Exception:
+                    if self._file_contributions is not None:
+                        raise
                     logger.info(f"[SemanticDag] {dir_uri} write failed, skipping")
 
         except AbstractOverviewFormatError:
             raise
         except Exception as e:
+            if self._file_contributions is not None:
+                raise
             logger.error(f"Failed to generate overview for {dir_uri}: {e}", exc_info=True)
         else:
             if need_vectorize and not self._skip_vectorization:

@@ -5,9 +5,11 @@ from typing import Optional
 from openviking_cli.utils.logger import get_logger
 
 from .embedding_msg import EmbeddingMsg
+from .keyed_diagnostics import install_keyed_batch_log_filter
 from .named_queue import NamedQueue
 
 logger = get_logger(__name__)
+install_keyed_batch_log_filter(logger)
 
 
 class EmbeddingQueue(NamedQueue):

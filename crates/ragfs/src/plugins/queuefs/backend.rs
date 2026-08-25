@@ -126,6 +126,17 @@ pub enum KeyedBatchCreateReason {
     Bytes,
 }
 
+impl KeyedBatchCreateReason {
+    pub(crate) const fn split_label(self) -> Option<&'static str> {
+        match self {
+            Self::NoPending => None,
+            Self::Signature => Some("signature"),
+            Self::Count => Some("count"),
+            Self::Bytes => Some("bytes"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyedEnqueueOutcome {
     Created {
@@ -1352,6 +1363,17 @@ mod tests {
     use tempfile::tempdir;
     use tempfile::TempDir;
 
+    #[test]
+    fn keyed_split_reason_labels_are_stable_lowercase_values() {
+        assert_eq!(KeyedBatchCreateReason::NoPending.split_label(), None);
+        assert_eq!(
+            KeyedBatchCreateReason::Signature.split_label(),
+            Some("signature")
+        );
+        assert_eq!(KeyedBatchCreateReason::Count.split_label(), Some("count"));
+        assert_eq!(KeyedBatchCreateReason::Bytes.split_label(), Some("bytes"));
+    }
+
     fn keyed_request(key: &str, signature: &str, data: &str) -> KeyedEnqueueRequest {
         KeyedEnqueueRequest {
             dispatch_key: key.to_string(),
@@ -1531,6 +1553,83 @@ mod tests {
             .enqueue_keyed("Semantic", keyed_request("bytes", "s", &half_limit))
             .unwrap();
         assert_eq!(pending_batches_for_key(&backend, "Semantic", "bytes"), 2);
+    }
+
+    #[test]
+    fn keyed_enqueue_bounds_ten_thousand_contributions_and_keeps_cross_key_progress() {
+        let mut backend = MemoryBackend::new();
+        backend.create_queue("Semantic").unwrap();
+        for index in 0..10_000 {
+            backend
+                .enqueue_keyed(
+                    "Semantic",
+                    keyed_request("hot", "same", &format!(r#"{{"index":{index}}}"#)),
+                )
+                .unwrap();
+        }
+        assert_eq!(backend.size("Semantic").unwrap(), 10);
+
+        let hot = backend.dequeue("Semantic").unwrap().unwrap();
+        backend
+            .enqueue_keyed("Semantic", keyed_request("cold", "same", "cold-1"))
+            .unwrap();
+        let cold = backend.dequeue("Semantic").unwrap().unwrap();
+        assert_eq!(cold.dispatch_key.as_deref(), Some("cold"));
+        assert!(backend.dequeue("Semantic").unwrap().is_none());
+        backend.ack("Semantic", &hot.id).unwrap();
+        assert_eq!(
+            backend
+                .dequeue("Semantic")
+                .unwrap()
+                .unwrap()
+                .dispatch_key
+                .as_deref(),
+            Some("hot")
+        );
+    }
+
+    #[test]
+    fn keyed_enqueue_byte_cap_measures_complete_envelope_and_splits_at_one_byte_over() {
+        let first = "a";
+        let merged_overhead = serialize_keyed_batch(&KeyedBatchBody {
+            schema_version: KEYED_BATCH_SCHEMA_VERSION,
+            dispatch_key: "bytes".to_string(),
+            merge_signature: "same".to_string(),
+            contributions: vec![first.to_string(), String::new()],
+        })
+        .unwrap()
+        .len();
+        let second = "x".repeat(MAX_KEYED_BATCH_BYTES + 1 - merged_overhead);
+        let merged_bytes = serialize_keyed_batch(&KeyedBatchBody {
+            schema_version: KEYED_BATCH_SCHEMA_VERSION,
+            dispatch_key: "bytes".to_string(),
+            merge_signature: "same".to_string(),
+            contributions: vec![first.to_string(), second.clone()],
+        })
+        .unwrap()
+        .len();
+        assert_eq!(merged_bytes, MAX_KEYED_BATCH_BYTES + 1);
+
+        let mut backend = MemoryBackend::new();
+        backend.create_queue("Semantic").unwrap();
+        backend
+            .enqueue_keyed("Semantic", keyed_request("bytes", "same", first))
+            .unwrap();
+        let outcome = backend
+            .enqueue_keyed("Semantic", keyed_request("bytes", "same", &second))
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            KeyedEnqueueOutcome::Created {
+                reason: KeyedBatchCreateReason::Bytes,
+                ..
+            }
+        ));
+        assert_eq!(backend.size("Semantic").unwrap(), 2);
+        for message in backend.list_unacked("Semantic").unwrap() {
+            assert!(message.data.len() <= MAX_KEYED_BATCH_BYTES);
+        }
     }
 
     #[test]
@@ -1953,7 +2052,9 @@ mod tests {
         let (_dir, db_path, _backend) = sqlite_backend();
 
         let conn = Connection::open(db_path).unwrap();
-        let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0)).unwrap();
+        let auto_vacuum: i64 = conn
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(auto_vacuum, 1);
     }
 
@@ -1984,10 +2085,13 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let _backend = SQLiteQueueBackend::open(&db_path_str, SQLiteQueueOptions::default()).unwrap();
+        let _backend =
+            SQLiteQueueBackend::open(&db_path_str, SQLiteQueueOptions::default()).unwrap();
 
         let conn = Connection::open(&db_path_str).unwrap();
-        let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0)).unwrap();
+        let auto_vacuum: i64 = conn
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(auto_vacuum, 0);
     }
 

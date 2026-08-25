@@ -12,7 +12,8 @@ from unittest.mock import AsyncMock, MagicMock, Mock
 import pytest
 
 import openviking.storage.queuefs.named_queue as named_queue_module
-from openviking.storage.queuefs.named_queue import NamedQueue
+import openviking.storage.queuefs.queue_manager as queue_manager_module
+from openviking.storage.queuefs.named_queue import DequeueHandlerBase, NamedQueue
 from openviking.storage.queuefs.queue_manager import QueueManager
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 
@@ -25,6 +26,20 @@ def _legacy_semantic_message(*, coalesce_version: int) -> SemanticMsg:
         coalesce_key="resource|account|user|peer|viking://resources/bootstrap",
         coalesce_version=coalesce_version,
     )
+
+
+class _SuccessHandler(DequeueHandlerBase):
+    async def on_dequeue(self, data):
+        self.report_success()
+        return data
+
+
+class _RetryHandler(DequeueHandlerBase):
+    async def on_dequeue(self, data):
+        del data
+        self.report_requeue()
+        self.report_success()
+        raise named_queue_module.QueueMessageRetry(delay_seconds=0)
 
 
 def test_queuefs_package_imports_in_a_clean_process(tmp_path) -> None:
@@ -106,44 +121,133 @@ async def test_concurrent_worker_retries_same_id_without_ack() -> None:
 
 
 @pytest.mark.asyncio
-async def test_concurrent_retry_task_propagates_requeue_failure_without_ack(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_concurrent_success_accounting_waits_for_physical_ack() -> None:
     manager = QueueManager(agfs=MagicMock())
     queue = NamedQueue(MagicMock(), "/queue", "Semantic")
     queue._initialized = True
     queue._async_agfs = AsyncMock()
-    queue.set_dequeue_handler(MagicMock())
+    queue.set_dequeue_handler(_SuccessHandler())
     queue.size = AsyncMock(side_effect=[1, 0])
     queue.dequeue_raw = AsyncMock(return_value={"id": "physical-1", "data": "{}"})
-    queue.process_dequeued = AsyncMock(
-        side_effect=named_queue_module.QueueMessageRetry(delay_seconds=0)
-    )
-    queue.ack = AsyncMock()
     stop = threading.Event()
-    tasks = []
-    original_create_task = asyncio.create_task
+    observed_before_ack = []
 
-    async def fail_requeue(msg_id: str) -> None:
+    async def ack_and_stop(msg_id: str, data) -> None:
+        observed_before_ack.append((queue._processed, queue._in_progress))
         assert msg_id == "physical-1"
+        assert data["id"] == "physical-1"
         stop.set()
-        raise RuntimeError("QueueFS requeue failed")
 
-    def record_task(coro):
-        task = original_create_task(coro)
-        tasks.append(task)
-        return task
-
-    queue.requeue = AsyncMock(side_effect=fail_requeue)
-    monkeypatch.setattr(asyncio, "create_task", record_task)
+    queue.ack = AsyncMock(side_effect=ack_and_stop)
 
     await asyncio.wait_for(
         manager._worker_async_concurrent(queue, stop, max_concurrent=2),
         timeout=1,
     )
 
-    assert len(tasks) == 1
-    with pytest.raises(RuntimeError, match="QueueFS requeue failed"):
-        tasks[0].result()
+    assert observed_before_ack == [(0, 1)]
+    assert (queue._processed, queue._in_progress, queue._error_count) == (1, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_retry_accounting_waits_for_physical_requeue() -> None:
+    manager = QueueManager(agfs=MagicMock())
+    queue = NamedQueue(MagicMock(), "/queue", "Semantic")
+    queue._initialized = True
+    queue._async_agfs = AsyncMock()
+    queue.set_dequeue_handler(_RetryHandler())
+    queue.size = AsyncMock(side_effect=[1, 0])
+    queue.dequeue_raw = AsyncMock(return_value={"id": "physical-1", "data": "{}"})
+    queue.ack = AsyncMock()
+    stop = threading.Event()
+    observed_before_requeue = []
+
+    async def requeue_and_stop(msg_id: str) -> None:
+        observed_before_requeue.append((queue._processed, queue._requeue_count, queue._in_progress))
+        assert msg_id == "physical-1"
+        stop.set()
+
+    queue.requeue = AsyncMock(side_effect=requeue_and_stop)
+
+    await asyncio.wait_for(
+        manager._worker_async_concurrent(queue, stop, max_concurrent=2),
+        timeout=1,
+    )
+
+    assert observed_before_requeue == [(0, 0, 1)]
+    assert (queue._processed, queue._requeue_count, queue._in_progress) == (1, 1, 0)
+    queue.ack.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ack_failure_is_consumed_logged_and_not_counted_successfully(
+    caplog,
+) -> None:
+    manager = QueueManager(agfs=MagicMock())
+    queue = NamedQueue(MagicMock(), "/queue", "Semantic")
+    queue._initialized = True
+    queue._async_agfs = AsyncMock()
+    queue.set_dequeue_handler(_SuccessHandler())
+    queue.size = AsyncMock(side_effect=[1, 0])
+    queue.dequeue_raw = AsyncMock(return_value={"id": "physical-1", "data": "{}"})
+    stop = threading.Event()
+
+    async def fail_ack(msg_id: str, data) -> None:
+        del msg_id, data
+        stop.set()
+        raise RuntimeError("QueueFS ack failed")
+
+    queue.ack = AsyncMock(side_effect=fail_ack)
+
+    queue_manager_module.logger.addHandler(caplog.handler)
+    try:
+        await asyncio.wait_for(
+            manager._worker_async_concurrent(queue, stop, max_concurrent=2),
+            timeout=1,
+        )
+    finally:
+        queue_manager_module.logger.removeHandler(caplog.handler)
+
+    assert (queue._processed, queue._in_progress, queue._error_count) == (0, 1, 1)
+    assert queue._errors[-1].message == "QueueFS ack failed"
+    assert "Concurrent settlement failure" in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_concurrent_requeue_failure_is_consumed_logged_and_not_counted_successfully(
+    caplog,
+) -> None:
+    manager = QueueManager(agfs=MagicMock())
+    queue = NamedQueue(MagicMock(), "/queue", "Semantic")
+    queue._initialized = True
+    queue._async_agfs = AsyncMock()
+    queue.set_dequeue_handler(_RetryHandler())
+    queue.size = AsyncMock(side_effect=[1, 0])
+    queue.dequeue_raw = AsyncMock(return_value={"id": "physical-1", "data": "{}"})
+    queue.ack = AsyncMock()
+    stop = threading.Event()
+
+    async def fail_requeue(msg_id: str) -> None:
+        assert msg_id == "physical-1"
+        stop.set()
+        raise RuntimeError("QueueFS requeue failed")
+
+    queue.requeue = AsyncMock(side_effect=fail_requeue)
+
+    queue_manager_module.logger.addHandler(caplog.handler)
+    try:
+        await asyncio.wait_for(
+            manager._worker_async_concurrent(queue, stop, max_concurrent=2),
+            timeout=1,
+        )
+    finally:
+        queue_manager_module.logger.removeHandler(caplog.handler)
+
+    assert (queue._processed, queue._requeue_count, queue._in_progress) == (0, 0, 1)
+    assert queue._error_count == 1
+    assert queue._errors[-1].message == "QueueFS requeue failed"
+    assert "Concurrent settlement failure" in caplog.text
+    assert "RuntimeError" in caplog.text
     queue.requeue.assert_awaited_once_with("physical-1")
     queue.ack.assert_not_awaited()

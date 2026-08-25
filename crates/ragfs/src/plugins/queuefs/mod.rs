@@ -23,8 +23,8 @@ use crate::core::{
 };
 use async_trait::async_trait;
 use backend::{
-    KeyedEnqueueRequest, MemoryBackend, Message, QueueBackend, SQLiteQueueBackend,
-    SQLiteQueueOptions,
+    KeyedBatchCreateReason, KeyedEnqueueOutcome, KeyedEnqueueRequest, MemoryBackend, Message,
+    QueueBackend, SQLiteQueueBackend, SQLiteQueueOptions,
 };
 use redis_backend::RedisQueueBackend;
 use serde::{Deserialize, Serialize};
@@ -150,10 +150,7 @@ impl std::fmt::Debug for RedisQueueOptions {
             .field("command_timeout_ms", &self.command_timeout_ms)
             .field("key_prefix", &self.key_prefix)
             .field("tls_enabled", &self.tls_enabled)
-            .field(
-                "tls_insecure_skip_verify",
-                &self.tls_insecure_skip_verify,
-            )
+            .field("tls_insecure_skip_verify", &self.tls_insecure_skip_verify)
             .finish()
     }
 }
@@ -193,9 +190,13 @@ impl RedisQueueOptions {
                     "queuefs redis endpoints must use valid redis:// or rediss:// URLs".to_string(),
                 ));
             }
-            let info = redis::IntoConnectionInfo::into_connection_info(value.as_str()).map_err(|_| {
-                Error::config("queuefs redis endpoints must use valid redis:// or rediss:// URLs".to_string())
-            })?;
+            let info =
+                redis::IntoConnectionInfo::into_connection_info(value.as_str()).map_err(|_| {
+                    Error::config(
+                        "queuefs redis endpoints must use valid redis:// or rediss:// URLs"
+                            .to_string(),
+                    )
+                })?;
             let endpoint = value
                 .split_once("://")
                 .map(|(_, endpoint)| endpoint)
@@ -214,7 +215,9 @@ impl RedisQueueOptions {
                 info.addr(),
                 redis::ConnectionAddr::Tcp(_, 0) | redis::ConnectionAddr::TcpTls { port: 0, .. }
             ) {
-                return Err(Error::config("queuefs redis endpoint port is invalid".to_string()));
+                return Err(Error::config(
+                    "queuefs redis endpoint port is invalid".to_string(),
+                ));
             }
         }
         if self.mode == RedisMode::Singleton && self.endpoints.len() != 1 {
@@ -416,6 +419,12 @@ impl FileSystem for QueueFileSystem {
         match operation.as_str() {
             "dequeue" => {
                 let Some(msg) = backend.dequeue(&queue_name)? else {
+                    if backend.size(&queue_name)? > 0 {
+                        tracing::debug!(
+                            event = "queuefs.keyed_dispatch_blocked",
+                            queue = queue_name,
+                        );
+                    }
                     return Ok(b"{}".to_vec());
                 };
                 // Return in Go libagfsbinding format: {"id": "...", "data": "..."}
@@ -485,7 +494,31 @@ impl FileSystem for QueueFileSystem {
                         Error::InvalidOperation(format!("invalid keyed enqueue request: {error}"))
                     })?;
                 request.validate()?;
-                backend.enqueue_keyed(&queue_name, request)?;
+                let outcome = backend.enqueue_keyed(&queue_name, request)?;
+                match &outcome {
+                    KeyedEnqueueOutcome::Merged {
+                        contribution_count, ..
+                    } => tracing::debug!(
+                        event = "queuefs.keyed_batch_merged",
+                        queue = queue_name,
+                        contribution_count,
+                    ),
+                    KeyedEnqueueOutcome::Created {
+                        reason: KeyedBatchCreateReason::NoPending,
+                        ..
+                    } => tracing::debug!(
+                        event = "queuefs.keyed_batch_created",
+                        queue = queue_name,
+                        reason = ?KeyedBatchCreateReason::NoPending,
+                    ),
+                    KeyedEnqueueOutcome::Created { reason, .. } => tracing::debug!(
+                        event = "queuefs.keyed_batch_split",
+                        queue = queue_name,
+                        reason = reason
+                            .split_label()
+                            .expect("split outcomes always have a split reason"),
+                    ),
+                }
                 Ok(data.len() as u64)
             }
             "clear" => {
@@ -499,7 +532,13 @@ impl FileSystem for QueueFileSystem {
             }
             "requeue" => {
                 let msg_id = String::from_utf8_lossy(data).trim().to_string();
-                backend.requeue(&queue_name, &msg_id)?;
+                if backend.requeue(&queue_name, &msg_id)? {
+                    tracing::debug!(
+                        event = "queuefs.message_requeued",
+                        queue = queue_name,
+                        reason = "explicit_retry",
+                    );
+                }
                 Ok(0)
             }
             _ => Err(Error::InvalidOperation(format!(
@@ -885,13 +924,11 @@ impl ServicePlugin for QueueFSPlugin {
                     .expect("sqlite db_path is validated"),
                 parsed.sqlite_options,
             )?),
-            BackendKind::Redis => {
-                Box::new(RedisQueueBackend::open(
-                    parsed
-                        .redis_options
-                        .expect("redis options are validated for redis backend"),
-                )?)
-            }
+            BackendKind::Redis => Box::new(RedisQueueBackend::open(
+                parsed
+                    .redis_options
+                    .expect("redis options are validated for redis backend"),
+            )?),
         };
 
         Ok(Box::new(QueueFileSystem::with_backend(backend)))
@@ -903,8 +940,76 @@ impl ServicePlugin for QueueFSPlugin {
 }
 
 #[cfg(test)]
+mod tracing_test_support {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    #[derive(Clone, Default)]
+    pub(super) struct EventCapture {
+        events: Arc<Mutex<Vec<HashMap<String, String>>>>,
+    }
+
+    impl EventCapture {
+        pub(super) fn events(&self) -> Vec<HashMap<String, String>> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    struct FieldVisitor<'a> {
+        fields: &'a mut HashMap<String, String>,
+    }
+
+    impl Visit for FieldVisitor<'_> {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl Subscriber for EventCapture {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = HashMap::new();
+            event.record(&mut FieldVisitor {
+                fields: &mut fields,
+            });
+            self.events.lock().unwrap().push(fields);
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::backend::KeyedBatchEnvelope;
+    use super::tracing_test_support::EventCapture;
     use super::*;
     use serde::Deserialize;
 
@@ -1172,23 +1277,21 @@ mod tests {
 
     #[test]
     fn test_parse_redis_backend_config() {
-        let parsed = QueueFSPlugin::parse_backend_config(&redis_plugin_config(
-            serde_json::json!({
-                "mode": "singleton",
-                "endpoints": ["redis://127.0.0.1:6379"],
-                "master_name": null,
-                "username": "queue-user",
-                "password": "secret",
-                "sentinel_username": null,
-                "sentinel_password": null,
-                "db": 2,
-                "connect_timeout_ms": 1500,
-                "command_timeout_ms": 2500,
-                "key_prefix": "tenant-a",
-                "tls_enabled": false,
-                "tls_insecure_skip_verify": false
-            }),
-        ))
+        let parsed = QueueFSPlugin::parse_backend_config(&redis_plugin_config(serde_json::json!({
+            "mode": "singleton",
+            "endpoints": ["redis://127.0.0.1:6379"],
+            "master_name": null,
+            "username": "queue-user",
+            "password": "secret",
+            "sentinel_username": null,
+            "sentinel_password": null,
+            "db": 2,
+            "connect_timeout_ms": 1500,
+            "command_timeout_ms": 2500,
+            "key_prefix": "tenant-a",
+            "tls_enabled": false,
+            "tls_insecure_skip_verify": false
+        })))
         .unwrap();
 
         assert!(matches!(parsed.kind, BackendKind::Redis));
@@ -1205,22 +1308,20 @@ mod tests {
     #[test]
     /// Accept valid Cluster and Sentinel topology configurations.
     fn test_parse_redis_backend_config_accepts_high_availability_modes() {
-        let cluster = QueueFSPlugin::parse_backend_config(&redis_plugin_config(
-            serde_json::json!({
+        let cluster =
+            QueueFSPlugin::parse_backend_config(&redis_plugin_config(serde_json::json!({
                 "mode": "cluster",
                 "endpoints": ["redis://cluster-1:6379", "redis://cluster-2:6379"],
                 "db": 0
-            }),
-        ));
+            })));
         assert!(cluster.is_ok());
 
-        let sentinel = QueueFSPlugin::parse_backend_config(&redis_plugin_config(
-            serde_json::json!({
+        let sentinel =
+            QueueFSPlugin::parse_backend_config(&redis_plugin_config(serde_json::json!({
                 "mode": "sentinel",
                 "endpoints": ["redis://sentinel-1:26379", "redis://sentinel-2:26379"],
                 "master_name": "mymaster"
-            }),
-        ));
+            })));
         assert!(sentinel.is_ok());
     }
 
@@ -1483,6 +1584,83 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(dequeue_msg(&fs, "Semantic").await.id, active.id);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn keyed_control_emits_bounded_structured_lifecycle_events() {
+        let capture = EventCapture::default();
+        let dispatch = tracing::Dispatch::new(capture.clone());
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let fs = QueueFileSystem::new();
+        fs.mkdir("/Semantic", 0o755).await.unwrap();
+
+        for (signature, data) in [
+            ("signature-1", "sensitive contribution one"),
+            ("signature-1", "sensitive contribution two"),
+            ("signature-2", "sensitive contribution three"),
+        ] {
+            let request = serde_json::json!({
+                "dispatch_key": "sensitive-dispatch-key",
+                "merge_signature": signature,
+                "data": data,
+            });
+            fs.write(
+                "/Semantic/enqueue_keyed",
+                request.to_string().as_bytes(),
+                0,
+                WriteFlag::None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let active = dequeue_msg(&fs, "Semantic").await;
+        assert_eq!(fs.read("/Semantic/dequeue", 0, 0).await.unwrap(), b"{}");
+        fs.write(
+            "/Semantic/requeue",
+            active.id.as_bytes(),
+            0,
+            WriteFlag::None,
+        )
+        .await
+        .unwrap();
+
+        let events = capture.events();
+        let event_names = events
+            .iter()
+            .filter_map(|fields| fields.get("event").map(String::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_names,
+            [
+                "queuefs.keyed_batch_created",
+                "queuefs.keyed_batch_merged",
+                "queuefs.keyed_batch_split",
+                "queuefs.keyed_dispatch_blocked",
+                "queuefs.message_requeued",
+            ]
+        );
+        assert_eq!(
+            events[0].get("reason").map(String::as_str),
+            Some("NoPending")
+        );
+        assert_eq!(
+            events[1].get("contribution_count").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            events[2].get("reason").map(String::as_str),
+            Some("signature")
+        );
+        let rendered = format!("{events:?}");
+        for sensitive in [
+            "sensitive-dispatch-key",
+            "sensitive contribution one",
+            "sensitive contribution two",
+            "sensitive contribution three",
+        ] {
+            assert!(!rendered.contains(sensitive));
+        }
     }
 
     #[tokio::test]

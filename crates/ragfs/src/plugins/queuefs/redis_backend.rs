@@ -884,14 +884,7 @@ impl RedisQueueBackend {
     /// `pool` provides Redis connections and `key_prefix` selects the queue namespace.
     /// Returns no value; recovery results are emitted through logs.
     fn run_startup_recovery_sweep(pool: &RedisPool, key_prefix: &str) {
-        match Self::recover_stale(pool, key_prefix) {
-            Ok(recovered) => {
-                if recovered > 0 {
-                    tracing::info!("queuefs redis recovered {recovered} stale message(s)");
-                }
-            }
-            Err(error) => tracing::warn!("queuefs redis startup recover_stale failed: {error}"),
-        }
+        trace_startup_recovery_result(Self::recover_stale(pool, key_prefix));
     }
 
     /// Recover processing messages whose owning instance heartbeat has expired.
@@ -945,6 +938,24 @@ impl RedisQueueBackend {
                 .arg(queue_name)
                 .query::<bool>(connection)
         })
+    }
+}
+
+fn trace_startup_recovery_result(result: Result<usize>) {
+    match result {
+        Ok(recovered) if recovered > 0 => tracing::info!(
+            event = "queuefs.message_requeued",
+            backend = "redis",
+            reason = "stale_recovery",
+            message_count = recovered,
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            event = "queuefs.recovery_failed",
+            backend = "redis",
+            reason = "stale_recovery",
+            error = %error,
+        ),
     }
 }
 
@@ -1436,6 +1447,7 @@ mod tests {
     use super::super::backend::{
         KeyedBatchBody, KeyedBatchEnvelope, KeyedEnqueueOutcome, KeyedEnqueueRequest,
     };
+    use super::super::tracing_test_support::EventCapture;
     use super::*;
     use std::collections::HashSet;
     use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -1459,6 +1471,31 @@ mod tests {
             KeyedEnqueueOutcome::Created { message_id, .. } => message_id,
             KeyedEnqueueOutcome::Merged { .. } => panic!("expected a new keyed batch"),
         }
+    }
+
+    #[test]
+    fn redis_recovery_emits_bounded_structured_requeue_event() {
+        let capture = EventCapture::default();
+        let dispatch = tracing::Dispatch::new(capture.clone());
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        trace_startup_recovery_result(Ok(3));
+
+        let events = capture.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].get("event").map(String::as_str),
+            Some("queuefs.message_requeued")
+        );
+        assert_eq!(
+            events[0].get("reason").map(String::as_str),
+            Some("stale_recovery")
+        );
+        assert_eq!(
+            events[0].get("message_count").map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(events[0].get("backend").map(String::as_str), Some("redis"));
     }
 
     /// Exercise one complete QueueFS message lifecycle.

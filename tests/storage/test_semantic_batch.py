@@ -76,10 +76,22 @@ def test_route_is_stable_and_excludes_unsafe_messages():
     )
 
 
+@pytest.mark.parametrize("context_type", ["resource", "skill"])
+def test_route_accepts_supported_contexts_with_normalized_matching_target(context_type):
+    msg = eligible_msg(
+        context_type=context_type,
+        uri="viking://resources/docs///",
+        target_uri="viking://resources/docs",
+    )
+
+    assert semantic_batch_route(msg, task_owned=False) is not None
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
         {"context_type": "memory"},
+        {"context_type": "session"},
         {"recursive": True},
         {"changes": {}},
         {"changes": {"modified": []}},
@@ -107,6 +119,61 @@ def test_change_fold_uses_last_state_and_keeps_live_contributions():
     assert [
         item.telemetry_id for item in batch.live_contributions["viking://resources/docs/a.md"]
     ] == ["tm-d"]
+
+
+@pytest.mark.parametrize(
+    ("kinds", "expected_changes", "expected_live"),
+    [
+        (
+            ("added", "modified"),
+            {"added": ["viking://resources/docs/a.md"]},
+            ["tm-0", "tm-1"],
+        ),
+        (
+            ("modified", "deleted"),
+            {"deleted": ["viking://resources/docs/a.md"]},
+            [],
+        ),
+        (
+            ("deleted", "modified"),
+            {"modified": ["viking://resources/docs/a.md"]},
+            ["tm-1"],
+        ),
+        (
+            ("deleted", "added", "modified"),
+            {"added": ["viking://resources/docs/a.md"]},
+            ["tm-1", "tm-2"],
+        ),
+    ],
+)
+def test_change_fold_applies_transitions_and_tracks_every_live_owner(
+    kinds, expected_changes, expected_live
+):
+    path = "viking://resources/docs/a.md"
+    contributions = [
+        eligible_msg(telemetry_id=f"tm-{index}", changes={kind: [path]})
+        for index, kind in enumerate(kinds)
+    ]
+
+    batch = SemanticBatch.from_contributions(contributions)
+
+    assert batch.changes == expected_changes
+    assert [
+        contribution.telemetry_id for contribution in batch.live_contributions.get(path, ())
+    ] == expected_live
+
+
+def test_change_fold_uses_deleted_priority_within_one_contribution():
+    path = "viking://resources/docs/a.md"
+    contribution = eligible_msg(
+        telemetry_id="tm-priority",
+        changes={"added": [path], "modified": [path], "deleted": [path]},
+    )
+
+    batch = SemanticBatch.from_contributions([contribution])
+
+    assert batch.changes == {"deleted": [path]}
+    assert path not in batch.live_contributions
 
 
 def test_change_fold_unions_distinct_paths_and_preserves_original_changes():

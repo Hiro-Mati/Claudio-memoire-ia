@@ -2,12 +2,18 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Batch embedding ownership tests for semantic DAG execution."""
 
+import logging
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+import openviking.storage.queuefs.semantic_dag as semantic_dag_module
 from openviking.server.identity import RequestContext, Role
+from openviking.storage.queuefs.keyed_diagnostics import (
+    KeyedBatchDiagnostic,
+    bind_keyed_batch_diagnostic,
+)
 from openviking.storage.queuefs.semantic_dag import SemanticDagExecutor
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.utils import embedding_utils
@@ -244,6 +250,67 @@ async def test_shared_directory_embedding_enqueue_failure_still_propagates(monke
 
 
 @pytest.mark.asyncio
+async def test_keyed_dag_vectorization_failure_log_uses_only_bounded_diagnostics(
+    monkeypatch, caplog
+):
+    message = eligible_msg(telemetry_id="sensitive-telemetry")
+    processor = FakeSemanticProcessor()
+    processor._vectorize_single_file = AsyncMock(
+        side_effect=RuntimeError(
+            "embedding failed for viking://resources/docs/a.md with sensitive payload"
+        )
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: FakeVikingFS()
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_openviking_config",
+        lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
+    )
+    executor = SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=2,
+        ctx=request_ctx(),
+        incremental_update=True,
+        target_uri=message.uri,
+        recursive=False,
+        changes=message.changes,
+        file_contributions={FILE_URI: (message,)},
+        shared_directory_embedding=True,
+    )
+    diagnostic = KeyedBatchDiagnostic(
+        physical_id="physical-1",
+        dispatch_hash_prefix="0123456789ab",
+        contribution_count=1,
+    )
+
+    semantic_dag_module.logger.addHandler(caplog.handler)
+    try:
+        with (
+            caplog.at_level(logging.ERROR, logger=semantic_dag_module.logger.name),
+            bind_keyed_batch_diagnostic(diagnostic),
+            pytest.raises(RuntimeError, match="embedding failed"),
+        ):
+            await executor.run(message.uri)
+    finally:
+        semantic_dag_module.logger.removeHandler(caplog.handler)
+
+    records = [
+        record for record in caplog.records if record.name == semantic_dag_module.logger.name
+    ]
+    assert records
+    for record in records:
+        assert record.physical_id == "physical-1"
+        assert record.dispatch_hash_prefix == "0123456789ab"
+        assert record.contribution_count == 1
+        rendered = f"{record.getMessage()} {record.__dict__!r}"
+        assert "viking://resources/docs/a.md" not in rendered
+        assert "sensitive payload" not in rendered
+        assert "sensitive-telemetry" not in rendered
+
+
+@pytest.mark.asyncio
 async def test_batch_dag_summarizes_file_once_and_fans_out_embeddings(monkeypatch):
     first = eligible_msg(telemetry_id="tm-1", ingest_options={"search_tags": ["one"]})
     second = eligible_msg(telemetry_id="tm-2", ingest_options={"search_tags": ["two"]})
@@ -281,3 +348,81 @@ async def test_batch_dag_summarizes_file_once_and_fans_out_embeddings(monkeypatc
         call.ingest_options is None and call.telemetry_id == "" and call.track_wait is False
         for call in processor.dir_vector_calls
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_stage", "error"),
+    [
+        ("file_summary", TimeoutError("summary service unavailable")),
+        ("overview", RuntimeError("overview generation failed")),
+        ("directory_write", PermissionError("directory sidecar denied")),
+    ],
+)
+async def test_keyed_real_dag_propagates_semantic_persistence_failures(
+    monkeypatch, failure_stage, error
+):
+    message = eligible_msg(telemetry_id="tm-failure")
+    processor = FakeSemanticProcessor()
+
+    class FailingWriteVikingFS(FakeVikingFS):
+        async def write_file(self, uri, content, ctx=None, lease_ref=None):
+            if failure_stage == "directory_write":
+                raise error
+            await super().write_file(uri, content, ctx=ctx, lease_ref=lease_ref)
+
+    fs = FailingWriteVikingFS()
+    if failure_stage == "file_summary":
+        processor._generate_single_file_summary = AsyncMock(side_effect=error)
+    if failure_stage == "overview":
+        processor._generate_overview = AsyncMock(side_effect=error)
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fs)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_openviking_config",
+        lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
+    )
+    executor = SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=2,
+        ctx=request_ctx(),
+        incremental_update=True,
+        target_uri=message.uri,
+        recursive=False,
+        changes=message.changes,
+        skip_vectorization=True,
+        file_contributions={FILE_URI: (message,)},
+        shared_directory_embedding=True,
+    )
+
+    with pytest.raises(type(error), match=str(error)):
+        await executor.run(message.uri)
+
+
+@pytest.mark.asyncio
+async def test_ordinary_real_dag_keeps_legacy_empty_summary_fallback(monkeypatch):
+    message = eligible_msg()
+    processor = FakeSemanticProcessor()
+    processor._generate_single_file_summary = AsyncMock(side_effect=RuntimeError("summary failed"))
+    fs = FakeVikingFS()
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: fs)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_openviking_config",
+        lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
+    )
+    executor = SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=2,
+        ctx=request_ctx(),
+        incremental_update=True,
+        target_uri=message.uri,
+        recursive=False,
+        changes=message.changes,
+        skip_vectorization=True,
+    )
+
+    await executor.run(message.uri)
+
+    assert fs.contents[f"{ROOT_URI}/.abstract.md"]
+    assert fs.contents[f"{ROOT_URI}/.overview.md"]

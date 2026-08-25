@@ -4,6 +4,7 @@
 
 import asyncio
 import copy
+import hashlib
 import json
 import re
 import threading
@@ -47,6 +48,15 @@ from openviking.storage.abstract_overview import (
     write_abstract_overview,
 )
 from openviking.storage.errors import LockAcquisitionError
+from openviking.storage.queuefs.keyed_diagnostics import (
+    MAX_DIAGNOSTIC_PATHS,
+    bounded_error_class,
+    diagnostic_from_queue_data,
+    get_keyed_batch_diagnostic,
+    install_keyed_batch_log_filter,
+    reset_keyed_batch_diagnostic,
+    set_keyed_batch_diagnostic,
+)
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase, QueueMessageRetry
 from openviking.storage.queuefs.semantic_batch import decode_keyed_batch_payload
 from openviking.storage.queuefs.semantic_dag import DagStats, SemanticDagExecutor
@@ -71,6 +81,7 @@ from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
+install_keyed_batch_log_filter(logger)
 
 
 class RequestQueueStats:
@@ -88,6 +99,7 @@ class SemanticWork:
     changes: Dict[str, List[str]]
     file_contributions: Optional[Dict[str, tuple[SemanticMsg, ...]]]
     is_keyed_batch: bool
+    dispatch_hash_prefix: str
 
 
 def _parse_semantic_work(data: Dict[str, Any]) -> SemanticWork:
@@ -104,6 +116,9 @@ def _parse_semantic_work(data: Dict[str, Any]) -> SemanticWork:
             changes=batch.changes,
             file_contributions=batch.live_contributions,
             is_keyed_batch=True,
+            dispatch_hash_prefix=hashlib.sha256(batch.dispatch_key.encode("utf-8")).hexdigest()[
+                :12
+            ],
         )
     msg = SemanticMsg.from_dict(payload)
     return SemanticWork(
@@ -112,6 +127,25 @@ def _parse_semantic_work(data: Dict[str, Any]) -> SemanticWork:
         changes=msg.changes or {},
         file_contributions=None,
         is_keyed_batch=False,
+        dispatch_hash_prefix="",
+    )
+
+
+def _log_keyed_batch_event(event: str, data: Dict[str, Any], work: SemanticWork) -> None:
+    diagnostic = get_keyed_batch_diagnostic() or diagnostic_from_queue_data(data)
+    if diagnostic is None:
+        return
+    logger.info(
+        "Semantic keyed batch lifecycle",
+        extra={
+            "event": event,
+            **diagnostic.as_dict(),
+            "merged_path_count": min(
+                sum(len(paths) for paths in work.changes.values()),
+                MAX_DIAGNOSTIC_PATHS,
+            ),
+            "keyed_batch_lifecycle": True,
+        },
     )
 
 
@@ -247,15 +281,36 @@ class SemanticProcessor(DequeueHandlerBase):
             tracker.mark_semantic_done(contribution.telemetry_id, contribution.id)
             self._merge_request_stats(contribution.telemetry_id, processed=1)
 
+    def _settle_work_success(self, work: SemanticWork) -> None:
+        self._mark_work_done(work)
+        self.report_success()
+
+    @staticmethod
+    def _log_work_completed(data: Dict[str, Any], work: SemanticWork) -> None:
+        if work.is_keyed_batch:
+            _log_keyed_batch_event("semantic.keyed_batch_completed", data, work)
+
     def _mark_work_failed(self, work: SemanticWork, error: Exception) -> None:
         tracker = get_request_wait_tracker()
+        message = bounded_error_class(error) if work.is_keyed_batch else str(error)
         for contribution in work.contributions:
             self._merge_request_stats(contribution.telemetry_id, error_count=1)
             tracker.mark_semantic_failed(
                 contribution.telemetry_id,
                 contribution.id,
-                str(error),
+                message,
             )
+
+    def _report_processing_error(
+        self,
+        error: Exception,
+        data: Optional[Dict[str, Any]],
+    ) -> None:
+        diagnostic = get_keyed_batch_diagnostic() or diagnostic_from_queue_data(data)
+        if diagnostic is not None:
+            self.report_error(bounded_error_class(error), diagnostic.as_dict(error))
+        else:
+            self.report_error(str(error), data)
 
     def _record_work_requeue(self, work: SemanticWork) -> None:
         tracker = get_request_wait_tracker()
@@ -348,16 +403,23 @@ class SemanticProcessor(DequeueHandlerBase):
         work: Optional[SemanticWork] = None
         msg: Optional[SemanticMsg] = None
         collector = None
+        diagnostic_token = None
         try:
             if not data:
                 return None
 
+            diagnostic = diagnostic_from_queue_data(data)
+            if diagnostic is not None:
+                diagnostic_token = set_keyed_batch_diagnostic(diagnostic)
+
             work = _parse_semantic_work(data)
             msg = work.representative
+            if work.is_keyed_batch:
+                _log_keyed_batch_event("semantic.keyed_batch_started", data, work)
             if VikingURI(msg.uri).parent is None:
                 logger.warning("Skipping semantic generation for root URI: %s", msg.uri)
-                self._mark_work_done(work)
-                self.report_success()
+                self._settle_work_success(work)
+                self._log_work_completed(data, work)
                 return None
             if not work.is_keyed_batch and is_semantic_msg_stale(msg):
                 live_file_changes = {
@@ -384,6 +446,7 @@ class SemanticProcessor(DequeueHandlerBase):
                         changes=live_file_changes,
                         file_contributions=None,
                         is_keyed_batch=False,
+                        dispatch_hash_prefix="",
                     )
                 else:
                     logger.info(
@@ -391,8 +454,7 @@ class SemanticProcessor(DequeueHandlerBase):
                         msg.uri,
                         msg.coalesce_version,
                     )
-                    self._mark_work_done(work)
-                    self.report_success()
+                    self._settle_work_success(work)
                     return None
             # Circuit breaker: if API is known-broken, retry the physical message.
             try:
@@ -406,19 +468,24 @@ class SemanticProcessor(DequeueHandlerBase):
                 root_attrs = create_root_span_attributes(
                     http_method="QUEUE",
                     http_route=msg.context_type or "/queuefs/semantic",
-                    request_id=msg.telemetry_id or msg.id,
-                    url_path=msg.uri,
+                    request_id=(
+                        diagnostic.physical_id
+                        if work.is_keyed_batch
+                        else msg.telemetry_id or msg.id
+                    ),
+                    url_path="" if work.is_keyed_batch else msg.uri,
                 )
-                root_attrs.account_id = msg.account_id
-                root_attrs.user_id = msg.user_id
+                root_attrs.account_id = "" if work.is_keyed_batch else msg.account_id
+                root_attrs.user_id = "" if work.is_keyed_batch else msg.user_id
                 root_context_token = bind_root_observability_context(root_attrs)
                 try:
                     current_ctx = self._ctx_from_semantic_msg(msg)
-                    logger.info(
-                        f"Processing semantic generation for: {msg.uri} (recursive={msg.recursive})"
-                    )
-
-                    logger.info(f"Processing semantic generation for: {msg})")
+                    if not work.is_keyed_batch:
+                        logger.info(
+                            f"Processing semantic generation for: {msg.uri} "
+                            f"(recursive={msg.recursive})"
+                        )
+                        logger.info(f"Processing semantic generation for: {msg})")
 
                     semantic_lock = await SemanticLockScope.resolve(
                         msg.lock_handoff,
@@ -478,9 +545,10 @@ class SemanticProcessor(DequeueHandlerBase):
                             elif msg.changes:
                                 is_incremental = True
                                 target_uri = msg.uri
-                                logger.info(
-                                    f"Using direct incremental semantic update for: {msg.uri}"
-                                )
+                                if not work.is_keyed_batch:
+                                    logger.info(
+                                        f"Using direct incremental semantic update for: {msg.uri}"
+                                    )
 
                             executor = SemanticDagExecutor(
                                 processor=self,
@@ -526,13 +594,14 @@ class SemanticProcessor(DequeueHandlerBase):
                                 )
                     finally:
                         await semantic_lock.close()
-                    self._mark_work_done(work)
-                    logger.info(f"Completed semantic generation for: {msg.uri}")
-                    self.report_success()
+                    if not work.is_keyed_batch:
+                        logger.info(f"Completed semantic generation for: {msg.uri}")
+                    self._settle_work_success(work)
                     self._circuit_breaker.record_success()
-                    return None
                 finally:
                     reset_root_observability_context(root_context_token)
+            self._log_work_completed(data, work)
+            return None
 
         except QueueMessageRetry:
             raise
@@ -547,7 +616,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 if work is not None:
                     self._request_work_retry(work)
                 else:
-                    self.report_error(str(e), data)
+                    self._report_processing_error(e, data)
                 return None
 
             error_class = classify_api_error(e)
@@ -558,7 +627,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 )
                 if work is not None:
                     self._mark_work_failed(work, e)
-                self.report_error(str(e), data)
+                self._report_processing_error(e, data)
             elif error_class == ERROR_CLASS_PERMANENT:
                 logger.critical(
                     f"Permanent API error processing semantic message, dropping: {e}",
@@ -567,7 +636,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 self._circuit_breaker.record_failure(e)
                 if work is not None:
                     self._mark_work_failed(work, e)
-                self.report_error(str(e), data)
+                self._report_processing_error(e, data)
             else:
                 # Transient or unknown — retry the same physical queue message.
                 logger.warning(
@@ -578,8 +647,11 @@ class SemanticProcessor(DequeueHandlerBase):
                 if work is not None:
                     self._request_work_retry(work)
                 else:
-                    self.report_error(str(e), data)
+                    self._report_processing_error(e, data)
             return None
+        finally:
+            if diagnostic_token is not None:
+                reset_keyed_batch_diagnostic(diagnostic_token)
 
     async def on_cancelled(self, data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Release a queued semantic lock before cancelled work is ACKed."""

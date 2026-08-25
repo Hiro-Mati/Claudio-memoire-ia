@@ -327,6 +327,18 @@ Example with explicit local SQLite paths for QueueFS and usage audit:
 
 This variant is useful when multiple instances share the same `workspace`, but QueueFS and usage audit SQLite files still need per-instance local paths.
 
+#### Semantic QueueFS correctness boundary
+
+Semantic keyed coalescing is atomic within one QueueFS backend namespace. The Memory backend is process-local. SQLite atomic coalescing and single-flight dispatch require one active consumer process or namespace per SQLite file. Do not let multiple active consumers open the same file: startup recovery in one consumer can reset processing rows owned by another. Per-instance SQLite paths coalesce independently and may each process one batch for the same semantic directory. To guarantee one active batch per semantic directory across replicas, configure all replicas to use the same Redis QueueFS `key_prefix`. Do not share a SQLite database over an unsupported network filesystem. Per-instance local SQLite remains the recommended local deployment.
+
+Roll out the Rust QueueFS service that implements `/enqueue_keyed` before rolling out Python semantic producers. A Python producer reaching an older QueueFS must treat the missing `/enqueue_keyed` control file as a hard failure; it must not fall back to `/enqueue`, because fallback would discard the atomic coalescing and single-flight guarantee.
+
+Before rolling Python back, stop new semantic producers and drain every keyed backlog with a compatible Python consumer; stop that consumer only after the keyed rows are gone. If the backlog cannot be drained, retain at least one compatible consumer and do not start rolled-back consumers on that QueueFS namespace. Older Python consumers cannot parse the keyed wrapper and must never claim keyed rows.
+
+`wait=true` uses wait option A: each request waits for its own file embeddings and registered semantic roots. Shared directory L0/L1 embedding work is not attached to an individual request and may finish later, so it does not delay that request after its file embeddings and semantic DAG are complete.
+
+CI must compile the ignored Redis contract tests and, when `QUEUEFS_REDIS_TEST_URL` is available, run the two-instance standalone Redis test with both instances using the same `key_prefix`. The real-Redis check is environment-gated; without that URL, the required local SQLite acceptance remains the rollout gate and no cross-replica guarantee should be inferred from it.
+
 For public HTTPS access, see the [Public Access Guide](12-public-access.md).
 
 To build the image yourself, pass an explicit OpenViking version:
