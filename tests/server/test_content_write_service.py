@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from openviking.server.identity import RequestContext, Role
+from openviking.service.fs_service import FSService
 from openviking.session.memory.dataclass import MemoryFile
 from openviking.session.memory.utils import MemoryFileUtils
 from openviking.session.memory.utils.content_visibility import visible_content
@@ -241,7 +242,9 @@ async def test_memory_write_linkifies_resource_uri_marker_with_readable_anchor(s
     refs = mf.extra_fields["resource_refs"]
     assert refs[0]["resource_uri"] == resource_uri
     assert refs[0]["source"] == "content.write"
-    assert refs[0]["match_text"] == "2026-06-12，用户保存了粉丝创作的越前龙马动漫插画资源，资源URI为"
+    assert (
+        refs[0]["match_text"] == "2026-06-12，用户保存了粉丝创作的越前龙马动漫插画资源，资源URI为"
+    )
     assert mf.links == []
 
 
@@ -460,6 +463,59 @@ async def test_resource_write_semantic_refresh_uses_coalesce_key(monkeypatch):
         "resource|default|default|default|viking://resources/demo"
     )
     assert queue.messages[0].lock_handoff is None
+
+
+@pytest.mark.asyncio
+async def test_content_write_and_delete_use_same_semantic_key_for_same_identity(monkeypatch):
+    """Content writes must carry the same peer identity as deletes."""
+    root_uri = "viking://resources/docs/"
+    write_uri = "viking://resources/docs/a.md"
+    delete_uri = "viking://resources/docs/b.md"
+    ctx = RequestContext(user=UserIdentifier("account-a", "user-a"), role=Role.USER)
+    queue = _FakeSemanticQueue()
+    coordinator = ContentWriteCoordinator(
+        viking_fs=_FakeVikingFS(file_uri=write_uri, root_uri=root_uri)
+    )
+    fs_service = FSService(viking_fs=coordinator._viking_fs)
+    refresh_now = SimpleNamespace(action=FreshnessAction.REFRESH_NOW)
+
+    monkeypatch.setattr(
+        "openviking.storage.content_write.plan_abstract_overview_refresh",
+        AsyncMock(return_value=refresh_now),
+    )
+    monkeypatch.setattr(
+        "openviking.service.fs_service.plan_abstract_overview_refresh",
+        AsyncMock(return_value=refresh_now),
+    )
+    monkeypatch.setattr(
+        "openviking.storage.content_write.get_queue_manager",
+        lambda: _FakeQueueManager(queue),
+    )
+    monkeypatch.setattr(
+        "openviking.service.fs_service.get_queue_manager",
+        lambda: _FakeQueueManager(queue),
+    )
+
+    await coordinator._enqueue_semantic_refresh_changes(
+        root_uri=root_uri,
+        context_type="resource",
+        changes={"modified": [write_uri]},
+        ctx=ctx,
+        force_refresh=True,
+    )
+    await fs_service._enqueue_delete_refresh(
+        root_uri=root_uri,
+        deleted_uri=delete_uri,
+        context_type="resource",
+        ctx=ctx,
+        force_refresh=True,
+    )
+
+    assert [message.peer_id for message in queue.messages] == ["user-a", "user-a"]
+    assert queue.messages[0].coalesce_key == queue.messages[1].coalesce_key
+    assert queue.messages[0].coalesce_key == (
+        "resource|account-a|user-a|user-a|viking://resources/docs"
+    )
 
 
 @pytest.mark.asyncio

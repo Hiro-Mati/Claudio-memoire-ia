@@ -148,9 +148,7 @@ class ContentWriteCoordinator:
             )
 
         context_type = context_type_for_uri(normalized_uri)
-        root_uri = await self._resolve_root_uri(
-            normalized_uri, ctx=ctx, anchor_to_parent=True
-        )
+        root_uri = await self._resolve_root_uri(normalized_uri, ctx=ctx, anchor_to_parent=True)
         written_bytes = len(content.encode("utf-8"))
         telemetry_id = get_current_telemetry().telemetry_id
 
@@ -588,6 +586,7 @@ class ContentWriteCoordinator:
             recursive=recursive,
             account_id=ctx.account_id,
             user_id=ctx.user.user_id,
+            peer_id=ctx.user.user_id,
             role=str(ctx.role),
             skip_vectorization=False,
             telemetry_id=telemetry.telemetry_id,
@@ -597,6 +596,7 @@ class ContentWriteCoordinator:
                     uri=root_uri,
                     account_id=ctx.account_id,
                     user_id=ctx.user.user_id,
+                    peer_id=ctx.user.user_id,
                 )
                 if aggregate_directory and context_type in {"resource", "skill"}
                 else ""
@@ -844,9 +844,7 @@ class ContentWriteCoordinator:
             elif refresh_action is FreshnessAction.MARK_PENDING:
                 # Changed-file semantic/vector work may still be queued, while
                 # the directory aggregation itself is intentionally deferred.
-                _, vector_status = self._refresh_statuses(
-                    wait=wait, queue_status=queue_status
-                )
+                _, vector_status = self._refresh_statuses(wait=wait, queue_status=queue_status)
                 result_kwargs = {
                     "semantic_status": "deferred",
                     "vector_status": vector_status,

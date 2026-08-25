@@ -10,6 +10,8 @@ import pytest
 from openviking.server.identity import RequestContext, Role
 from openviking.service.resource_service import ResourceService
 from openviking.storage.content_write import ContentWriteCoordinator
+from openviking.storage.queuefs.semantic_dag import SemanticDagExecutor
+from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.telemetry.context import bind_telemetry
 from openviking.telemetry.operation import OperationTelemetry
 from openviking.telemetry.request_wait_tracker import RequestWaitTracker
@@ -52,6 +54,120 @@ class _RecordingEmbeddingQueue:
     async def enqueue(self, message):
         self.messages.append(message)
         return message.id
+
+
+class _BatchWaitVikingFS:
+    root_uri = "viking://resources/docs"
+
+    def __init__(self):
+        self.contents = {
+            f"{self.root_uri}/0.md": "zero",
+            f"{self.root_uri}/1.md": "one",
+            f"{self.root_uri}/2.md": "two",
+        }
+        self._async_agfs = self
+
+    async def ls(self, uri, node_limit=None, ctx=None):
+        del node_limit, ctx
+        if uri == self.root_uri:
+            return [
+                {"name": "0.md", "isDir": False},
+                {"name": "1.md", "isDir": False},
+                {"name": "2.md", "isDir": False},
+            ]
+        return []
+
+    async def stat(self, uri, ctx=None):
+        del ctx
+        return {"size": len(self.contents.get(uri, ""))}
+
+    async def read_file(self, uri, ctx=None):
+        del ctx
+        return self.contents.get(uri, "")
+
+    async def write_file(self, uri, content, ctx=None, lease_ref=None):
+        del ctx, lease_ref
+        self.contents[uri] = content
+
+    async def pathlock_acquire_exact_batch(self, paths):
+        return {"paths": paths}
+
+    async def pathlock_release(self, lease):
+        del lease
+
+    def _uri_to_path(self, uri, ctx=None):
+        del ctx
+        return uri
+
+
+class _BatchWaitProcessor:
+    def __init__(self, tracker):
+        self.tracker = tracker
+        self.file_embeddings = []
+        self.directory_embeddings = []
+
+    async def _generate_single_file_summary(self, file_path, llm_sem=None, ctx=None):
+        del llm_sem, ctx
+        return {"name": file_path.rsplit("/", 1)[-1], "summary": "summary"}
+
+    async def _generate_overview(self, dir_uri, file_summaries, children_abstracts, **kwargs):
+        del dir_uri, file_summaries, children_abstracts, kwargs
+        return "overview"
+
+    def _normalize_overview_generation(self, overview):
+        return overview, "abstract"
+
+    async def _vectorize_single_file(
+        self,
+        parent_uri,
+        context_type,
+        file_path,
+        summary_dict,
+        ctx=None,
+        use_summary=False,
+        preserve_existing_created_at=False,
+        ingest_options=None,
+        *,
+        telemetry_id=None,
+        track_wait=True,
+    ):
+        del (
+            parent_uri,
+            context_type,
+            summary_dict,
+            ctx,
+            use_summary,
+            preserve_existing_created_at,
+            ingest_options,
+        )
+        embedding = SimpleNamespace(
+            id=f"file-{telemetry_id}-{file_path.rsplit('/', 1)[-1]}",
+            telemetry_id=telemetry_id,
+            track_wait=track_wait,
+        )
+        self.file_embeddings.append(embedding)
+        if track_wait:
+            self.tracker.register_embedding_root(embedding.telemetry_id, embedding.id)
+
+    async def _vectorize_directory(
+        self,
+        uri,
+        context_type,
+        abstract,
+        overview,
+        ctx=None,
+        ingest_options=None,
+        *,
+        telemetry_id=None,
+        track_wait=True,
+    ):
+        del uri, context_type, abstract, overview, ctx, ingest_options
+        self.directory_embeddings.extend(
+            [
+                SimpleNamespace(telemetry_id=telemetry_id, track_wait=track_wait),
+                SimpleNamespace(telemetry_id=telemetry_id, track_wait=track_wait),
+            ]
+        )
 
 
 class _FakeVikingFS:
@@ -335,6 +451,79 @@ async def test_keyed_write_wait_excludes_detached_directory_embeddings(monkeypat
         ]
     finally:
         tracker.cleanup(telemetry_id)
+
+
+@pytest.mark.asyncio
+async def test_three_coalesced_requests_wait_for_their_own_file_embeddings(monkeypatch):
+    root_uri = _BatchWaitVikingFS.root_uri
+    tracker = RequestWaitTracker()
+    messages = [
+        SemanticMsg(
+            uri=root_uri,
+            context_type="resource",
+            recursive=False,
+            account_id="account",
+            user_id="user",
+            peer_id="user",
+            changes={"modified": [f"{root_uri}/{index}.md"]},
+            aggregate_directory=True,
+            telemetry_id=f"tm-{index}",
+        )
+        for index in range(3)
+    ]
+    for message in messages:
+        tracker.cleanup(message.telemetry_id)
+        tracker.register_request(message.telemetry_id)
+        tracker.register_semantic_root(message.telemetry_id, message.id)
+
+    processor = _BatchWaitProcessor(tracker)
+    viking_fs = _BatchWaitVikingFS()
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_dag.get_viking_fs", lambda: viking_fs)
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_dag.get_openviking_config",
+        lambda: SimpleNamespace(semantic=SimpleNamespace(overview_sample_limit=32)),
+    )
+    executor = SemanticDagExecutor(
+        processor=processor,
+        context_type="resource",
+        max_concurrent_llm=2,
+        ctx=RequestContext(user=UserIdentifier("account", "user"), role=Role.USER),
+        incremental_update=True,
+        target_uri=root_uri,
+        recursive=False,
+        changes={"modified": [f"{root_uri}/{index}.md" for index in range(3)]},
+        file_contributions={
+            f"{root_uri}/{index}.md": (message,) for index, message in enumerate(messages)
+        },
+        shared_directory_embedding=True,
+    )
+
+    try:
+        await executor.run(root_uri)
+
+        assert len(processor.directory_embeddings) == 2
+        assert all(embedding.telemetry_id == "" for embedding in processor.directory_embeddings)
+        assert all(embedding.track_wait is False for embedding in processor.directory_embeddings)
+        assert [embedding.telemetry_id for embedding in processor.file_embeddings] == [
+            "tm-0",
+            "tm-1",
+            "tm-2",
+        ]
+
+        for message in messages:
+            tracker.mark_semantic_done(message.telemetry_id, message.id)
+        assert all(not tracker.is_complete(message.telemetry_id) for message in messages)
+
+        for embedding in processor.file_embeddings:
+            tracker.mark_embedding_done(
+                embedding.telemetry_id,
+                embedding.id,
+                vector_written=True,
+            )
+        assert all(tracker.is_complete(message.telemetry_id) for message in messages)
+    finally:
+        for message in messages:
+            tracker.cleanup(message.telemetry_id)
 
 
 async def _return_true(handle, path):

@@ -114,6 +114,19 @@ async def test_task_owned_semantic_message_keeps_normal_enqueue(monkeypatch):
     keyed.assert_not_awaited()
 
 
+def test_same_identity_writes_share_one_keyed_dispatch_route():
+    first = eligible_msg(changes={"modified": ["viking://resources/docs/a.md"]})
+    second = eligible_msg(changes={"modified": ["viking://resources/docs/b.md"]})
+
+    first_route = semantic_batch_route(first, task_owned=False)
+    second_route = semantic_batch_route(second, task_owned=False)
+
+    assert first_route is not None
+    assert second_route is not None
+    assert first_route.dispatch_key == second_route.dispatch_key
+    assert first_route.merge_signature == second_route.merge_signature
+
+
 def test_bootstrap_legacy_versions_reads_single_and_batch_contributions():
     queue = semantic_queue_fixture()
     coalesce_key = "resource|account|user|peer|viking://resources/bootstrap"
