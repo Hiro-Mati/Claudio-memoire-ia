@@ -15,6 +15,7 @@ from openviking.service.task_work_index import (
     TaskWorkRejected,
     bind_task_context,
     extract_task_metadata,
+    get_task_context,
     prepare_task_payload,
 )
 from openviking_cli.utils.logger import get_logger
@@ -49,6 +50,14 @@ class QueueStatus:
     @property
     def is_complete(self) -> bool:
         return self.pending == 0 and self.in_progress == 0
+
+
+class QueueMessageRetry(Exception):
+    """Signal that the current physical QueueFS message must be retried."""
+
+    def __init__(self, *, delay_seconds: float = 0.0) -> None:
+        super().__init__("queue message requested retry")
+        self.delay_seconds = max(float(delay_seconds), 0.0)
 
 
 class EnqueueHookBase(abc.ABC):
@@ -261,6 +270,46 @@ class NamedQueue:
             raise
         return msg_id if isinstance(msg_id, str) else str(msg_id)
 
+    async def enqueue_keyed(
+        self,
+        data: Dict[str, Any],
+        *,
+        dispatch_key: str,
+        merge_signature: str,
+    ) -> str:
+        """Atomically add a canonical contribution to a keyed QueueFS batch."""
+        await self._ensure_initialized()
+        if get_task_context() is not None:
+            raise ValueError("task-owned messages cannot use enqueue_keyed")
+        if self._enqueue_hook:
+            data = await self._enqueue_hook.on_enqueue(data)
+
+        contribution = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        request = json.dumps(
+            {
+                "dispatch_key": dispatch_key,
+                "merge_signature": merge_signature,
+                "data": contribution,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        result = await self._async_agfs.write(f"{self.path}/enqueue_keyed", request.encode("utf-8"))
+        return str(result)
+
+    async def requeue(self, msg_id: str) -> None:
+        """Return a processing QueueFS message to pending without changing its ID."""
+        if not msg_id:
+            raise ValueError("cannot requeue an empty QueueFS message id")
+        await self._async_agfs.write(f"{self.path}/requeue", msg_id.encode("utf-8"))
+
+    async def settle_retry(self, msg_id: str, retry: QueueMessageRetry) -> None:
+        """Delay then physically requeue the current processing message."""
+        if retry.delay_seconds:
+            await asyncio.sleep(retry.delay_seconds)
+        await self.requeue(msg_id)
+
     async def ack(self, msg_id: str, message: Optional[Dict[str, Any]] = None) -> None:
         """Acknowledge successful processing of a message (deletes it from persistent storage).
 
@@ -326,7 +375,11 @@ class NamedQueue:
             raw_data = data
             if self._dequeue_handler:
                 self._on_dequeue_start()
-                data = await self.process_dequeued(data)
+                try:
+                    data = await self.process_dequeued(data)
+                except QueueMessageRetry as retry:
+                    await self.settle_retry(msg_id, retry)
+                    return None
             # Ack unconditionally after handler returns (success or handled error).
             # If on_dequeue raises, the exception propagates and ack is skipped —
             # the message will be recovered on next startup.

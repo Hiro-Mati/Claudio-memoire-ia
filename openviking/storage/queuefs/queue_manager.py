@@ -16,7 +16,13 @@ from openviking.service.task_work_index import TaskWorkIndex
 from openviking_cli.utils.logger import get_logger
 
 from .embedding_queue import EmbeddingQueue
-from .named_queue import DequeueHandlerBase, EnqueueHookBase, NamedQueue, QueueStatus
+from .named_queue import (
+    DequeueHandlerBase,
+    EnqueueHookBase,
+    NamedQueue,
+    QueueMessageRetry,
+    QueueStatus,
+)
 from .semantic_queue import SemanticQueue
 
 logger = get_logger(__name__)
@@ -266,13 +272,24 @@ class QueueManager:
                 msg_id = data.get("id", "") if isinstance(data, dict) else ""
                 try:
                     await queue.process_dequeued(data)
-                    # Ack after successful processing (delete from persistent storage).
-                    await queue.ack(msg_id, data)
+                except QueueMessageRetry as retry:
+                    try:
+                        await queue.settle_retry(msg_id, retry)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.error(
+                            f"[QueueManager] Concurrent retry failed for {queue.name}: {e}"
+                        )
+                    return
                 except Exception as e:
                     # Handler did not call report_error; decrement in_progress manually.
                     # Do NOT ack — let RecoverStale re-queue on next startup.
                     queue._on_process_error(str(e), data)
                     logger.error(f"[QueueManager] Concurrent worker error for {queue.name}: {e}")
+                else:
+                    # Ack after successful processing (delete from persistent storage).
+                    await queue.ack(msg_id, data)
 
         while not stop_event.is_set():
             # Prune completed tasks
