@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from openviking.storage.queuefs.named_queue import QueueMessageRetry
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 
@@ -143,12 +144,12 @@ async def test_memory_ls_error_reports_error():
 
 @pytest.mark.asyncio
 async def test_memory_ls_transient_error_requeues():
-    """Transient errors during ls() re-enqueue the msg and increment requeue count.
+    """Transient errors request a retry of the same physical queue message.
 
     A 500-class error wrapped by the processor's `raise RuntimeError(...) from e`
-    is classified as `transient`. The outer on_dequeue() path must call
-    _reenqueue_semantic_msg(), bump requeue_count, and fire both report_requeue()
-    and report_success() — not report_error().
+    is classified as `transient`. The outer on_dequeue() path must raise the
+    worker retry signal, bump requeue_count, and fire both report_requeue() and
+    report_success() — not report_error() or enqueue a replacement message.
     """
     processor = SemanticProcessor()
 
@@ -176,7 +177,11 @@ async def test_memory_ls_transient_error_requeues():
 
     processor.set_callbacks(on_success, on_requeue, on_error)
 
-    reenqueue_mock = AsyncMock()
+    replacement_enqueue = AsyncMock()
+    queue_manager = SimpleNamespace(
+        SEMANTIC="semantic",
+        get_queue=lambda queue_name: SimpleNamespace(enqueue=replacement_enqueue),
+    )
 
     with (
         patch(
@@ -187,14 +192,15 @@ async def test_memory_ls_transient_error_requeues():
             "openviking.storage.queuefs.semantic_processor.resolve_telemetry",
             return_value=None,
         ),
-        patch.object(processor, "_reenqueue_semantic_msg", new=reenqueue_mock),
+        patch("openviking.storage.queuefs.get_queue_manager", return_value=queue_manager),
     ):
-        await processor.on_dequeue(data)
+        with pytest.raises(QueueMessageRetry):
+            await processor.on_dequeue(data)
 
     assert requeue_called, "report_requeue() must fire for transient errors"
-    assert success_called, "report_success() must fire after successful re-enqueue"
+    assert success_called, "report_success() must fire before physical retry"
     assert not error_called, "report_error() must NOT fire for transient errors"
-    reenqueue_mock.assert_awaited_once()
+    replacement_enqueue.assert_not_awaited()
 
 
 @pytest.mark.asyncio
