@@ -5,7 +5,9 @@
 
 use crate::core::errors::{Error, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, types::ValueRef, Connection, Row};
+use rusqlite::{
+    params, types::ValueRef, Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
@@ -239,6 +241,17 @@ fn read_sqlite_text(row: &Row<'_>, idx: usize) -> rusqlite::Result<String> {
             other.data_type(),
         )),
     }
+}
+
+fn decode_sqlite_message(
+    raw_data: &str,
+    dispatch_key: Option<String>,
+    merge_signature: Option<String>,
+) -> Result<Message> {
+    let mut message: Message = serde_json::from_str::<StoredMessage>(raw_data)?.into_message();
+    message.dispatch_key = dispatch_key;
+    message.merge_signature = merge_signature;
+    Ok(message)
 }
 
 /// Queue backend trait for pluggable storage implementations
@@ -634,6 +647,49 @@ pub struct SQLiteQueueBackend {
     conn: Mutex<Connection>,
 }
 
+fn insert_sqlite_keyed_batch(
+    tx: &Transaction<'_>,
+    queue_name: &str,
+    request: &KeyedEnqueueRequest,
+    reason: KeyedBatchCreateReason,
+) -> Result<KeyedEnqueueOutcome> {
+    let body = KeyedBatchBody {
+        schema_version: KEYED_BATCH_SCHEMA_VERSION,
+        dispatch_key: request.dispatch_key.clone(),
+        merge_signature: request.merge_signature.clone(),
+        contributions: vec![request.data.clone()],
+    };
+    let data = serialize_keyed_batch(&body)?;
+    if data.len() > MAX_KEYED_BATCH_BYTES {
+        return Err(Error::InvalidOperation(format!(
+            "keyed batch payload exceeds {MAX_KEYED_BATCH_BYTES} bytes"
+        )));
+    }
+
+    let mut message = Message::new(data);
+    message.dispatch_key = Some(request.dispatch_key.clone());
+    message.merge_signature = Some(request.merge_signature.clone());
+    let message_id = message.id.clone();
+    let stored = serde_json::to_string(&StoredMessage::from_message(&message))?;
+    tx.execute(
+        "INSERT INTO queue_messages
+         (queue_name, message_id, data, timestamp, status, dispatch_key, merge_signature, batch_count, batch_bytes)
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, 1, ?7)",
+        params![
+            queue_name,
+            message_id,
+            stored,
+            unix_secs(message.timestamp),
+            request.dispatch_key,
+            request.merge_signature,
+            message.data.len() as i64,
+        ],
+    )
+    .map_err(|e| Error::internal(format!("sqlite keyed enqueue insert error: {e}")))?;
+
+    Ok(KeyedEnqueueOutcome::Created { message_id, reason })
+}
+
 impl SQLiteQueueBackend {
     pub fn open(db_path: &str, options: SQLiteQueueOptions) -> Result<Self> {
         let conn = Connection::open(db_path)
@@ -678,6 +734,10 @@ impl SQLiteQueueBackend {
                 timestamp INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 processing_started_at INTEGER,
+                dispatch_key TEXT,
+                merge_signature TEXT,
+                batch_count INTEGER NOT NULL DEFAULT 0,
+                batch_bytes INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER DEFAULT (strftime('%s', 'now'))
             );
 
@@ -713,8 +773,13 @@ impl SQLiteQueueBackend {
         for stmt in [
             "ALTER TABLE queue_messages ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'",
             "ALTER TABLE queue_messages ADD COLUMN processing_started_at INTEGER",
+            "ALTER TABLE queue_messages ADD COLUMN dispatch_key TEXT",
+            "ALTER TABLE queue_messages ADD COLUMN merge_signature TEXT",
+            "ALTER TABLE queue_messages ADD COLUMN batch_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE queue_messages ADD COLUMN batch_bytes INTEGER NOT NULL DEFAULT 0",
             "CREATE INDEX IF NOT EXISTS idx_queue_status ON queue_messages(queue_name, status, id)",
             "CREATE INDEX IF NOT EXISTS idx_queue_message_id ON queue_messages(queue_name, message_id)",
+            "CREATE INDEX IF NOT EXISTS idx_queue_dispatch_pending ON queue_messages(queue_name, dispatch_key, status, id)",
         ] {
             if let Err(err) = conn.execute(stmt, []) {
                 let text = err.to_string();
@@ -901,12 +966,143 @@ impl QueueBackend for SQLiteQueueBackend {
         Self::require_queue_exists(&conn, queue_name)?;
         let stored = serde_json::to_string(&StoredMessage::from_message(&msg))?;
         conn.execute(
-            "INSERT INTO queue_messages (queue_name, message_id, data, timestamp, status)
-             VALUES (?1, ?2, ?3, ?4, 'pending')",
-            params![queue_name, msg.id, stored, unix_secs(msg.timestamp)],
+            "INSERT INTO queue_messages
+             (queue_name, message_id, data, timestamp, status, dispatch_key, merge_signature)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
+            params![
+                queue_name,
+                msg.id,
+                stored,
+                unix_secs(msg.timestamp),
+                msg.dispatch_key,
+                msg.merge_signature,
+            ],
         )
         .map_err(|e| Error::internal(format!("sqlite enqueue error: {}", e)))?;
         Ok(())
+    }
+
+    fn enqueue_keyed(
+        &mut self,
+        queue_name: &str,
+        request: KeyedEnqueueRequest,
+    ) -> Result<KeyedEnqueueOutcome> {
+        request.validate()?;
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::internal(format!("sqlite mutex poisoned: {e}")))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| {
+                Error::internal(format!("sqlite keyed enqueue transaction begin error: {e}"))
+            })?;
+        Self::require_queue_exists(&tx, queue_name)?;
+
+        let tail = tx
+            .query_row(
+                "SELECT id, data, merge_signature, batch_count, batch_bytes
+                 FROM queue_messages
+                 WHERE queue_name = ?1 AND status = 'pending' AND dispatch_key = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![queue_name, request.dispatch_key],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        read_sqlite_text(row, 1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| Error::internal(format!("sqlite keyed enqueue tail query error: {e}")))?;
+
+        let outcome = match tail {
+            None => insert_sqlite_keyed_batch(
+                &tx,
+                queue_name,
+                &request,
+                KeyedBatchCreateReason::NoPending,
+            )?,
+            Some((_id, _raw_data, merge_signature, _batch_count, _batch_bytes))
+                if merge_signature.as_deref() != Some(request.merge_signature.as_str()) =>
+            {
+                insert_sqlite_keyed_batch(
+                    &tx,
+                    queue_name,
+                    &request,
+                    KeyedBatchCreateReason::Signature,
+                )?
+            }
+            Some((id, raw_data, _merge_signature, batch_count, batch_bytes)) => {
+                let mut stored: StoredMessage = serde_json::from_str(&raw_data)?;
+                let mut body = deserialize_keyed_batch(&stored.data)?;
+                let stored_count = usize::try_from(batch_count).map_err(|_| {
+                    Error::internal(format!(
+                        "sqlite keyed batch {id} has invalid batch_count {batch_count}"
+                    ))
+                })?;
+                let stored_bytes = usize::try_from(batch_bytes).map_err(|_| {
+                    Error::internal(format!(
+                        "sqlite keyed batch {id} has invalid batch_bytes {batch_bytes}"
+                    ))
+                })?;
+                if stored_count != body.contributions.len() || stored_bytes != stored.data.len() {
+                    return Err(Error::internal(format!(
+                        "sqlite keyed batch {id} metadata does not match its payload"
+                    )));
+                }
+
+                body.contributions.push(request.data.clone());
+                let candidate = serialize_keyed_batch(&body)?;
+                if body.contributions.len() > MAX_KEYED_BATCH_CONTRIBUTIONS {
+                    insert_sqlite_keyed_batch(
+                        &tx,
+                        queue_name,
+                        &request,
+                        KeyedBatchCreateReason::Count,
+                    )?
+                } else if candidate.len() > MAX_KEYED_BATCH_BYTES {
+                    insert_sqlite_keyed_batch(
+                        &tx,
+                        queue_name,
+                        &request,
+                        KeyedBatchCreateReason::Bytes,
+                    )?
+                } else {
+                    let candidate_bytes = candidate.len();
+                    stored.data = candidate;
+                    let stored_candidate = serde_json::to_string(&stored)?;
+                    tx.execute(
+                        "UPDATE queue_messages
+                         SET data = ?1, batch_count = ?2, batch_bytes = ?3
+                         WHERE id = ?4 AND status = 'pending'",
+                        params![
+                            stored_candidate,
+                            body.contributions.len() as i64,
+                            candidate_bytes as i64,
+                            id
+                        ],
+                    )
+                    .map_err(|e| {
+                        Error::internal(format!("sqlite keyed enqueue merge update error: {e}"))
+                    })?;
+                    KeyedEnqueueOutcome::Merged {
+                        message_id: stored.id,
+                        contribution_count: body.contributions.len(),
+                    }
+                }
+            }
+        };
+
+        tx.commit().map_err(|e| {
+            Error::internal(format!(
+                "sqlite keyed enqueue transaction commit error: {e}"
+            ))
+        })?;
+        Ok(outcome)
     }
 
     fn dequeue(&mut self, queue_name: &str) -> Result<Option<Message>> {
@@ -915,21 +1111,39 @@ impl QueueBackend for SQLiteQueueBackend {
             .lock()
             .map_err(|e| Error::internal(format!("sqlite mutex poisoned: {}", e)))?;
 
-        Self::require_queue_exists(&conn, queue_name)?;
-
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| Error::internal(format!("sqlite transaction begin error: {}", e)))?;
+        Self::require_queue_exists(&tx, queue_name)?;
 
         let row = tx.query_row(
-            "SELECT id, data FROM queue_messages
-             WHERE queue_name = ?1 AND status = 'pending'
-             ORDER BY id LIMIT 1",
+            "SELECT candidate.id, candidate.data, candidate.dispatch_key, candidate.merge_signature
+             FROM queue_messages AS candidate
+             WHERE candidate.queue_name = ?1
+               AND candidate.status = 'pending'
+               AND (
+                 candidate.dispatch_key IS NULL
+                 OR NOT EXISTS (
+                   SELECT 1
+                   FROM queue_messages AS processing
+                   WHERE processing.queue_name = candidate.queue_name
+                     AND processing.status = 'processing'
+                     AND processing.dispatch_key = candidate.dispatch_key
+                 )
+               )
+             ORDER BY candidate.id LIMIT 1",
             params![queue_name],
-            |row| Ok((row.get::<_, i64>(0)?, read_sqlite_text(row, 1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    read_sqlite_text(row, 1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
         );
 
-        let (id, raw_data) = match row {
+        let (id, raw_data, dispatch_key, merge_signature) = match row {
             Ok(row) => row,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
             Err(e) => {
@@ -951,9 +1165,11 @@ impl QueueBackend for SQLiteQueueBackend {
         tx.commit()
             .map_err(|e| Error::internal(format!("sqlite transaction commit error: {}", e)))?;
 
-        let stored: StoredMessage =
-            serde_json::from_str(&raw_data).map_err(|e| Error::Serialization(e.to_string()))?;
-        Ok(Some(stored.into_message()))
+        Ok(Some(decode_sqlite_message(
+            &raw_data,
+            dispatch_key,
+            merge_signature,
+        )?))
     }
 
     fn peek(&self, queue_name: &str) -> Result<Option<Message>> {
@@ -964,20 +1180,37 @@ impl QueueBackend for SQLiteQueueBackend {
 
         Self::require_queue_exists(&conn, queue_name)?;
 
-        let raw_data = match conn.query_row(
-            "SELECT data FROM queue_messages
-             WHERE queue_name = ?1 AND status = 'pending'
-             ORDER BY id LIMIT 1",
+        let row = match conn.query_row(
+            "SELECT candidate.data, candidate.dispatch_key, candidate.merge_signature
+             FROM queue_messages AS candidate
+             WHERE candidate.queue_name = ?1
+               AND candidate.status = 'pending'
+               AND (
+                 candidate.dispatch_key IS NULL
+                 OR NOT EXISTS (
+                   SELECT 1
+                   FROM queue_messages AS processing
+                   WHERE processing.queue_name = candidate.queue_name
+                     AND processing.status = 'processing'
+                     AND processing.dispatch_key = candidate.dispatch_key
+                 )
+               )
+             ORDER BY candidate.id LIMIT 1",
             params![queue_name],
-            |row| read_sqlite_text(row, 0),
+            |row| {
+                Ok((
+                    read_sqlite_text(row, 0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         ) {
-            Ok(data) => data,
+            Ok(row) => row,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
             Err(e) => return Err(Error::internal(format!("sqlite peek query error: {}", e))),
         };
 
-        let stored: StoredMessage = serde_json::from_str(&raw_data)?;
-        Ok(Some(stored.into_message()))
+        Ok(Some(decode_sqlite_message(&row.0, row.1, row.2)?))
     }
 
     fn size(&self, queue_name: &str) -> Result<usize> {
@@ -1008,21 +1241,26 @@ impl QueueBackend for SQLiteQueueBackend {
         Self::require_queue_exists(&conn, queue_name)?;
         let mut stmt = conn
             .prepare(
-                "SELECT data FROM queue_messages
+                "SELECT data, dispatch_key, merge_signature FROM queue_messages
                  WHERE queue_name = ?1 AND status IN ('pending', 'processing')
                  ORDER BY id",
             )
             .map_err(|e| Error::internal(format!("sqlite list unacked prepare error: {}", e)))?;
         let rows = stmt
-            .query_map(params![queue_name], |row| read_sqlite_text(row, 0))
+            .query_map(params![queue_name], |row| {
+                Ok((
+                    read_sqlite_text(row, 0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
             .map_err(|e| Error::internal(format!("sqlite list unacked query error: {}", e)))?;
 
         let mut messages = Vec::new();
         for row in rows {
             let raw_data =
                 row.map_err(|e| Error::internal(format!("sqlite list unacked row error: {}", e)))?;
-            let stored: StoredMessage = serde_json::from_str(&raw_data)?;
-            messages.push(stored.into_message());
+            messages.push(decode_sqlite_message(&raw_data.0, raw_data.1, raw_data.2)?);
         }
         Ok(messages)
     }
@@ -1085,12 +1323,32 @@ impl QueueBackend for SQLiteQueueBackend {
             .map_err(|e| Error::internal(format!("sqlite ack error: {}", e)))?;
         Ok(changed > 0)
     }
+
+    fn requeue(&mut self, queue_name: &str, msg_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::internal(format!("sqlite mutex poisoned: {e}")))?;
+
+        Self::require_queue_exists(&conn, queue_name)?;
+        let changed = conn
+            .execute(
+                "UPDATE queue_messages
+                 SET status = 'pending', processing_started_at = NULL
+                 WHERE queue_name = ?1 AND message_id = ?2 AND status = 'processing'",
+                params![queue_name, msg_id],
+            )
+            .map_err(|e| Error::internal(format!("sqlite requeue error: {e}")))?;
+        Ok(changed > 0)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use tempfile::tempdir;
     use tempfile::TempDir;
 
@@ -1132,6 +1390,40 @@ mod tests {
         let backend =
             SQLiteQueueBackend::open(&db_path_str, SQLiteQueueOptions::default()).unwrap();
         (dir, db_path_str, backend)
+    }
+
+    fn sqlite_options() -> SQLiteQueueOptions {
+        SQLiteQueueOptions {
+            busy_timeout_ms: 15_000,
+            ..SQLiteQueueOptions::default()
+        }
+    }
+
+    fn create_legacy_queue_db(db_path: &std::path::Path) {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE queue_metadata (
+                queue_name TEXT PRIMARY KEY,
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                last_updated INTEGER DEFAULT (strftime('%s', 'now'))
+            );
+            CREATE TABLE queue_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                queue_name TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                processing_started_at INTEGER,
+                created_at INTEGER DEFAULT (strftime('%s', 'now'))
+            );
+            INSERT INTO queue_metadata (queue_name) VALUES ('Semantic');
+            INSERT INTO queue_messages (queue_name, message_id, data, timestamp, status)
+            VALUES ('Semantic', 'legacy-id', '{"id":"legacy-id","data":"legacy"}', 1776411459, 'pending');
+            "#,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1239,6 +1531,130 @@ mod tests {
             .enqueue_keyed("Semantic", keyed_request("bytes", "s", &half_limit))
             .unwrap();
         assert_eq!(pending_batches_for_key(&backend, "Semantic", "bytes"), 2);
+    }
+
+    #[test]
+    fn sqlite_migrates_legacy_schema_and_merges_only_pending_tail() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("queue.db");
+        create_legacy_queue_db(&db);
+        let mut backend =
+            SQLiteQueueBackend::open(db.to_str().unwrap(), SQLiteQueueOptions::default()).unwrap();
+
+        let legacy = backend.dequeue("Semantic").unwrap().unwrap();
+        assert_eq!(legacy.id, "legacy-id");
+        assert_eq!(legacy.data, b"legacy");
+        backend.ack("Semantic", &legacy.id).unwrap();
+
+        backend
+            .enqueue_keyed("Semantic", keyed_request("k", "s", "one"))
+            .unwrap();
+        let active = backend.dequeue("Semantic").unwrap().unwrap();
+        backend
+            .enqueue_keyed("Semantic", keyed_request("k", "s", "two"))
+            .unwrap();
+
+        assert_eq!(decode_batch(&active).contributions, vec!["one"]);
+        assert_eq!(backend.size("Semantic").unwrap(), 1);
+        assert!(backend.dequeue("Semantic").unwrap().is_none());
+        backend.ack("Semantic", &active.id).unwrap();
+        assert_eq!(
+            decode_batch(&backend.dequeue("Semantic").unwrap().unwrap()).contributions,
+            vec!["two"]
+        );
+    }
+
+    #[test]
+    fn sqlite_two_connections_do_not_lose_keyed_contributions_or_double_claim() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("queue.db");
+        let db_path = db.to_str().unwrap().to_string();
+        let mut owner = SQLiteQueueBackend::open(&db_path, sqlite_options()).unwrap();
+        owner.create_queue("Semantic").unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let handles = (0..2)
+            .map(|worker| {
+                let db_path = db_path.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    let mut backend = SQLiteQueueBackend::open(&db_path, sqlite_options()).unwrap();
+                    barrier.wait();
+                    for index in 0..100 {
+                        backend
+                            .enqueue_keyed(
+                                "Semantic",
+                                keyed_request("k", "s", &format!("{worker}-{index}")),
+                            )
+                            .unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let batch = decode_batch(&owner.dequeue("Semantic").unwrap().unwrap());
+        assert_eq!(batch.contributions.len(), 200);
+        assert!(owner.dequeue("Semantic").unwrap().is_none());
+    }
+
+    #[test]
+    fn sqlite_two_open_connections_cannot_claim_two_batches_for_one_key() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("queue.db");
+        let db_path = db.to_str().unwrap().to_string();
+        let mut first = SQLiteQueueBackend::open(&db_path, sqlite_options()).unwrap();
+        first.create_queue("Semantic").unwrap();
+        let mut second = SQLiteQueueBackend::open(&db_path, sqlite_options()).unwrap();
+        for index in 0..=MAX_KEYED_BATCH_CONTRIBUTIONS {
+            first
+                .enqueue_keyed("Semantic", keyed_request("k", "s", &index.to_string()))
+                .unwrap();
+        }
+        let barrier = Arc::new(Barrier::new(3));
+        let first_barrier = barrier.clone();
+        let second_barrier = barrier.clone();
+        let first_claim = thread::spawn(move || {
+            first_barrier.wait();
+            first.dequeue("Semantic").unwrap()
+        });
+        let second_claim = thread::spawn(move || {
+            second_barrier.wait();
+            second.dequeue("Semantic").unwrap()
+        });
+        barrier.wait();
+        let claims = [first_claim.join().unwrap(), second_claim.join().unwrap()];
+        assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
+    }
+
+    #[test]
+    fn sqlite_recovery_claims_old_processing_before_successor() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("queue.db");
+        let db_path = db.to_str().unwrap().to_string();
+        let mut backend = SQLiteQueueBackend::open(&db_path, sqlite_options()).unwrap();
+        backend.create_queue("Semantic").unwrap();
+        backend
+            .enqueue_keyed("Semantic", keyed_request("k", "s", "old"))
+            .unwrap();
+        let old = backend.dequeue("Semantic").unwrap().unwrap();
+        backend
+            .enqueue_keyed("Semantic", keyed_request("k", "s", "new"))
+            .unwrap();
+        drop(backend);
+
+        let mut recovered = SQLiteQueueBackend::open(&db_path, sqlite_options()).unwrap();
+        let first = recovered.dequeue("Semantic").unwrap().unwrap();
+        assert_eq!(first.id, old.id);
+        assert!(recovered.dequeue("Semantic").unwrap().is_none());
+        recovered.ack("Semantic", &first.id).unwrap();
+        assert_eq!(
+            decode_batch(&recovered.dequeue("Semantic").unwrap().unwrap()).contributions,
+            vec!["new"]
+        );
     }
 
     #[test]
