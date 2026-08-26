@@ -15,6 +15,9 @@ from openviking.storage.abstract_overview import (
 )
 from openviking.storage.content_write import ContentWriteCoordinator
 from openviking.storage.queuefs.semantic_ops.freshness_policy import FreshnessAction
+from openviking.service.task_tracker import TaskStatus
+from openviking.service.task_work_index import get_task_context
+from openviking_cli.exceptions import OpenVikingError
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -41,6 +44,28 @@ class _FakeVikingFS:
 
     def _uri_to_path(self, uri, ctx=None):
         return f"/fake/{uri}"
+
+
+class _FakeTaskTracker:
+    def __init__(self, status=TaskStatus.COMPLETED, error=None):
+        self.status = status
+        self.error = error
+        self.create = AsyncMock(return_value=SimpleNamespace(task_id="content-write-1"))
+        self.start = AsyncMock()
+        self.complete = AsyncMock()
+        self.fail = AsyncMock()
+        self.wait = AsyncMock(return_value=SimpleNamespace(status=status, error=error))
+
+
+class _FakeRequestWaitTracker:
+    def __init__(self, queue_status):
+        self.queue_status = queue_status
+        self.register_request = AsyncMock()
+        self.cleanup = AsyncMock()
+
+    def build_queue_status(self, telemetry_id):
+        del telemetry_id
+        return self.queue_status
 
 
 def _sidecar(level=ContextLevel.ABSTRACT, body="Original body."):
@@ -145,11 +170,21 @@ async def test_vectors_only_write_wait_reports_embedding_status(monkeypatch, ctx
         "Embedding": {"processed": 1, "error_count": 0, "errors": []},
         "Semantic": {"processed": 0, "error_count": 0, "errors": []},
     }
+    task_tracker = _FakeTaskTracker()
+    request_wait_tracker = _FakeRequestWaitTracker(queue_status)
     monkeypatch.setattr(
         content_write_module, "vectorize_file", AsyncMock(return_value=True), raising=False
     )
+    monkeypatch.setattr(content_write_module, "get_task_tracker", lambda: task_tracker)
+    monkeypatch.setattr(
+        content_write_module,
+        "get_request_wait_tracker",
+        lambda: request_wait_tracker,
+    )
     coordinator = ContentWriteCoordinator(viking_fs=fake_fs)
-    coordinator._wait_for_request = AsyncMock(return_value=queue_status)
+    coordinator._wait_for_request = AsyncMock(
+        side_effect=AssertionError("content_write task must own synchronous waiting")
+    )
 
     result = await coordinator._write_direct_with_refresh(
         uri="viking://resources/demo.md",
@@ -168,16 +203,35 @@ async def test_vectors_only_write_wait_reports_embedding_status(monkeypatch, ctx
     assert result["queue_status"] == queue_status
     assert result["semantic_status"] == "skipped"
     assert result["vector_status"] == "complete"
+    task_tracker.create.assert_awaited_once()
+    assert task_tracker.create.await_args.args[:2] == ("content_write",)
+    assert task_tracker.create.await_args.kwargs["resource_id"] == "viking://resources/demo.md"
+    task_tracker.start.assert_awaited_once()
+    task_tracker.complete.assert_awaited_once()
+    task_tracker.wait.assert_awaited_once_with(
+        "content-write-1",
+        account_id="account-1",
+        user_id="user-1",
+        timeout=3.0,
+    )
+    coordinator._wait_for_request.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_vectors_only_write_wait_reports_skipped_when_nothing_enqueued(monkeypatch, ctx):
     fake_fs = _FakeVikingFS()
+    task_tracker = _FakeTaskTracker()
+    request_wait_tracker = _FakeRequestWaitTracker(None)
     monkeypatch.setattr(
         content_write_module, "vectorize_file", AsyncMock(return_value=False), raising=False
     )
+    monkeypatch.setattr(content_write_module, "get_task_tracker", lambda: task_tracker)
+    monkeypatch.setattr(
+        content_write_module,
+        "get_request_wait_tracker",
+        lambda: request_wait_tracker,
+    )
     coordinator = ContentWriteCoordinator(viking_fs=fake_fs)
-    coordinator._wait_for_request = AsyncMock(return_value=None)
 
     result = await coordinator._write_direct_with_refresh(
         uri="viking://resources/obsolete.md",
@@ -195,6 +249,117 @@ async def test_vectors_only_write_wait_reports_skipped_when_nothing_enqueued(mon
 
     assert result["semantic_status"] == "skipped"
     assert result["vector_status"] == "skipped"
+    task_tracker.complete.assert_awaited_once()
+    task_tracker.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_direct_write_wait_binds_content_write_task_to_enqueued_work(monkeypatch, ctx):
+    fake_fs = _FakeVikingFS()
+    task_tracker = _FakeTaskTracker()
+    request_wait_tracker = _FakeRequestWaitTracker(None)
+    observed_task_context = []
+
+    async def enqueue_semantic_refresh(**kwargs):
+        del kwargs
+        observed_task_context.append(get_task_context())
+        return FreshnessAction.REFRESH
+
+    monkeypatch.setattr(content_write_module, "get_task_tracker", lambda: task_tracker)
+    monkeypatch.setattr(
+        content_write_module,
+        "get_request_wait_tracker",
+        lambda: request_wait_tracker,
+    )
+    coordinator = ContentWriteCoordinator(viking_fs=fake_fs)
+    coordinator._enqueue_semantic_refresh = enqueue_semantic_refresh
+
+    await coordinator._write_direct_with_refresh(
+        uri="viking://resources/demo.md",
+        root_uri="viking://resources",
+        content="updated",
+        mode="replace",
+        context_type="resource",
+        wait=True,
+        timeout=3.0,
+        ctx=ctx,
+        written_bytes=7,
+        telemetry_id="tm-test",
+    )
+
+    assert len(observed_task_context) == 1
+    task_context = observed_task_context[0]
+    assert task_context is not None
+    assert task_context.task_id == "content-write-1"
+    assert task_context.account_id == "account-1"
+    assert task_context.user_id == "user-1"
+
+
+@pytest.mark.asyncio
+async def test_direct_write_without_wait_does_not_create_content_write_task(monkeypatch, ctx):
+    fake_fs = _FakeVikingFS()
+    get_task_tracker = AsyncMock(side_effect=AssertionError("task must not be created"))
+    monkeypatch.setattr(content_write_module, "get_task_tracker", get_task_tracker)
+    coordinator = ContentWriteCoordinator(viking_fs=fake_fs)
+    coordinator._enqueue_semantic_refresh = AsyncMock(return_value=FreshnessAction.REFRESH)
+
+    await coordinator._write_direct_with_refresh(
+        uri="viking://resources/demo.md",
+        root_uri="viking://resources",
+        content="updated",
+        mode="replace",
+        context_type="resource",
+        wait=False,
+        timeout=None,
+        ctx=ctx,
+        written_bytes=7,
+        telemetry_id="",
+    )
+
+    get_task_tracker.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_direct_write_wait_raises_when_content_write_task_fails(monkeypatch, ctx):
+    fake_fs = _FakeVikingFS()
+    task_tracker = _FakeTaskTracker(
+        status=TaskStatus.FAILED,
+        error="embedding delivery failed",
+    )
+    request_wait_tracker = _FakeRequestWaitTracker(
+        {"Embedding": {"error_count": 1, "errors": [{"message": "failed"}]}}
+    )
+    monkeypatch.setattr(content_write_module, "get_task_tracker", lambda: task_tracker)
+    monkeypatch.setattr(
+        content_write_module,
+        "get_request_wait_tracker",
+        lambda: request_wait_tracker,
+    )
+    monkeypatch.setattr(
+        content_write_module,
+        "vectorize_file",
+        AsyncMock(return_value=True),
+        raising=False,
+    )
+    coordinator = ContentWriteCoordinator(viking_fs=fake_fs)
+
+    with pytest.raises(OpenVikingError, match="embedding delivery failed") as exc_info:
+        await coordinator._write_direct_with_refresh(
+            uri="viking://resources/demo.md",
+            root_uri="viking://resources",
+            content="updated",
+            mode="replace",
+            context_type="resource",
+            wait=True,
+            timeout=3.0,
+            ctx=ctx,
+            written_bytes=7,
+            telemetry_id="tm-test",
+            processing_mode="vectors_only",
+        )
+
+    assert exc_info.value.details["queue_status"] == request_wait_tracker.queue_status
+    task_tracker.complete.assert_awaited_once()
 
 
 @pytest.mark.asyncio

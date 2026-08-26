@@ -25,6 +25,8 @@ from openviking.resource.processing_mode import (
 )
 from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
+from openviking.service.task_tracker import TaskStatus, get_task_tracker
+from openviking.service.task_work_index import bind_task_context
 from openviking.session.memory.memory_updater import MemoryUpdater
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.memory.utils.resource_refs import (
@@ -772,10 +774,40 @@ class ContentWriteCoordinator:
         telemetry_id: str,
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
     ) -> Dict[str, Any]:
+        task_tracker = get_task_tracker() if wait else None
+        task_id: Optional[str] = None
+        task_outcome_recorded = False
+        if task_tracker is not None:
+            task = await task_tracker.create(
+                "content_write",
+                resource_id=uri,
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
+                meta={
+                    "uri": uri,
+                    "telemetry_id": telemetry_id,
+                    "processing_mode": processing_mode,
+                    "write_mode": mode,
+                },
+            )
+            task_id = task.task_id
+            await task_tracker.start(
+                task_id,
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
+            )
+
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
         try:
             lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(lock_path)
         except LockAcquisitionError as exc:
+            if task_tracker is not None and task_id is not None:
+                await task_tracker.fail(
+                    task_id,
+                    str(exc),
+                    account_id=ctx.account_id,
+                    user_id=ctx.user.user_id,
+                )
             raise ResourceBusyError(
                 f"resource is busy and cannot be written now: {uri}",
                 uri=uri,
@@ -796,42 +828,77 @@ class ContentWriteCoordinator:
                 )
             if wait and telemetry_id:
                 get_request_wait_tracker().register_request(telemetry_id)
-            await self._write_in_place(
-                uri,
-                content,
-                mode=mode,
-                ctx=ctx,
-                lease_ref=lease,
-                existing_raw=previous_content,
-            )
-            content_written = True
-            if is_abstract_overview_uri(uri):
-                vector_enqueued = await self._vectorize_abstract_overview(uri=uri, ctx=ctx)
-                post_process_started = True
-            elif processing_mode == VECTORS_ONLY:
-                vector_enqueued = await self._vectorize_written_file(
-                    uri=uri,
-                    context_type=context_type,
+
+            async def write_and_enqueue() -> None:
+                nonlocal content_written, post_process_started, refresh_action, vector_enqueued
+                await self._write_in_place(
+                    uri,
+                    content,
+                    mode=mode,
                     ctx=ctx,
+                    lease_ref=lease,
+                    existing_raw=previous_content,
                 )
-                post_process_started = True
+                content_written = True
+                if is_abstract_overview_uri(uri):
+                    vector_enqueued = await self._vectorize_abstract_overview(uri=uri, ctx=ctx)
+                    post_process_started = True
+                elif processing_mode == VECTORS_ONLY:
+                    vector_enqueued = await self._vectorize_written_file(
+                        uri=uri,
+                        context_type=context_type,
+                        ctx=ctx,
+                    )
+                    post_process_started = True
+                else:
+                    refresh_action = await self._enqueue_semantic_refresh(
+                        root_uri=root_uri,
+                        changed_uri=uri,
+                        context_type=context_type,
+                        ctx=ctx,
+                        change_type="added" if mode == "create" else "modified",
+                        force_refresh=wait,
+                    )
+                    post_process_started = True
+
+            if task_id is None:
+                await write_and_enqueue()
             else:
-                refresh_action = await self._enqueue_semantic_refresh(
-                    root_uri=root_uri,
-                    changed_uri=uri,
-                    context_type=context_type,
-                    ctx=ctx,
-                    change_type="added" if mode == "create" else "modified",
-                    force_refresh=wait,
+                with bind_task_context(task_id, ctx.account_id, ctx.user.user_id):
+                    await write_and_enqueue()
+                await task_tracker.complete(
+                    task_id,
+                    {"uri": uri},
+                    account_id=ctx.account_id,
+                    user_id=ctx.user.user_id,
+                    resource_id=uri,
                 )
-                post_process_started = True
+                task_outcome_recorded = True
             await self._viking_fs._async_agfs.pathlock_release(lease)
             lock_released = True
-            queue_status = (
-                await self._wait_for_request(telemetry_id=telemetry_id, timeout=timeout)
-                if wait
-                else None
-            )
+            if task_tracker is not None and task_id is not None:
+                try:
+                    completed_task = await task_tracker.wait(
+                        task_id,
+                        account_id=ctx.account_id,
+                        user_id=ctx.user.user_id,
+                        timeout=timeout,
+                    )
+                except TimeoutError as exc:
+                    raise DeadlineExceededError("content write task", timeout) from exc
+                queue_status = (
+                    get_request_wait_tracker().build_queue_status(telemetry_id)
+                    if telemetry_id
+                    else None
+                )
+                if completed_task.status != TaskStatus.COMPLETED:
+                    raise OpenVikingError(
+                        completed_task.error or "content write task did not complete",
+                        code="INTERNAL",
+                        details={"queue_status": queue_status},
+                    )
+            else:
+                queue_status = None
             result_kwargs = {}
             if is_abstract_overview_uri(uri):
                 _, vector_status = (
@@ -875,7 +942,14 @@ class ContentWriteCoordinator:
                 queue_status=queue_status,
                 **result_kwargs,
             )
-        except Exception:
+        except Exception as exc:
+            if task_tracker is not None and task_id is not None and not task_outcome_recorded:
+                await task_tracker.fail(
+                    task_id,
+                    str(exc),
+                    account_id=ctx.account_id,
+                    user_id=ctx.user.user_id,
+                )
             if not post_process_started and content_written:
                 await self._rollback_direct_write(
                     uri=uri,
