@@ -33,6 +33,7 @@ from openviking.session.memory.memory_updater import MemoryUpdateResult
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.train import (
     Case,
+    Experience,
     ExperienceSet,
     PolicyApplyResult,
     PolicyPlanItem,
@@ -2055,6 +2056,160 @@ async def test_v3_training_links_case_to_trajectory_and_experience_via_trajector
             "ctx": _ctx(),
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_case_link_writer_rechecks_archived_experience_under_endpoint_lock():
+    case_uri = "viking://user/u/memories/cases/duplicate_booking.md"
+    trajectory_uri = "viking://user/u/memories/trajectories/duplicate_booking.md"
+    experience_uri = "viking://user/u/memories/experiences/retired_rule.md"
+    lease = {"lease_ref": "endpoint-lease"}
+
+    class PathLock:
+        def __init__(self):
+            self.acquired = []
+            self.released = []
+
+        async def pathlock_acquire_exact_batch(self, paths):
+            self.acquired.append(list(paths))
+            return lease
+
+        async def pathlock_release(self, released_lease):
+            self.released.append(released_lease)
+
+    class FakeFS:
+        def __init__(self):
+            self._async_agfs = PathLock()
+            self.files = {
+                case_uri: MemoryFileUtils.write(
+                    MemoryFile(
+                        uri=case_uri,
+                        content="case body",
+                        memory_type="cases",
+                        extra_fields={
+                            "memory_type": "cases",
+                            "case_name": "duplicate_booking",
+                            "task_signature": "handle duplicate booking",
+                            "input": "{}",
+                            "rubric": "{}",
+                            "case_status": "promoted",
+                        },
+                    )
+                ),
+                trajectory_uri: MemoryFileUtils.write(
+                    MemoryFile(
+                        uri=trajectory_uri,
+                        content="trajectory body",
+                        memory_type="trajectories",
+                        extra_fields={"memory_type": "trajectories"},
+                    )
+                ),
+                experience_uri: MemoryFileUtils.write(
+                    MemoryFile(
+                        uri=experience_uri,
+                        content="archived body",
+                        memory_type="experiences",
+                        extra_fields={
+                            "memory_type": "experiences",
+                            "experience_name": "retired_rule",
+                            "status": "archived",
+                            "version": 8,
+                        },
+                    )
+                ),
+            }
+            self.read_counts = {}
+            self.write_order = []
+
+        def _uri_to_path(self, uri, ctx=None):
+            del ctx
+            return "/" + uri.removeprefix("viking://")
+
+        async def read_file(self, uri, ctx=None):
+            del ctx
+            self.read_counts[uri] = self.read_counts.get(uri, 0) + 1
+            return self.files[uri]
+
+        async def write_file(self, uri, content, ctx=None, lease_ref=None):
+            del ctx
+            assert lease_ref is lease
+            self.write_order.append(uri)
+            self.files[uri] = content
+
+    fs = FakeFS()
+    analysis = RolloutAnalysis(
+        evaluation=RubricEvaluation(
+            passed=True,
+            score=1.0,
+            criterion_results=[],
+        ),
+        trajectories=[
+            Trajectory(
+                name="duplicate_booking",
+                uri=trajectory_uri,
+                content="trajectory body",
+                outcome="success",
+                retrieval_anchor="",
+            )
+        ],
+        gradients=[],
+    )
+    plan = PolicyUpdatePlan(
+        items=[
+            PolicyPlanItem(
+                kind="upsert",
+                memory_type="experiences",
+                target_name="retired_rule",
+                target_uri=experience_uri,
+                before_content="old",
+                after_content="new",
+                links=[
+                    StoredLink(
+                        from_uri=experience_uri,
+                        to_uri=trajectory_uri,
+                        link_type="derived_from",
+                        weight=1.0,
+                    )
+                ],
+            )
+        ]
+    )
+    # This apply result is deliberately stale: the archive committed between
+    # policy apply and Case provenance linking.
+    apply_result = PolicyApplyResult(
+        updated_policy_set=ExperienceSet(
+            root_uri="viking://user/u/memories/experiences",
+            policies=[
+                Experience(
+                    name="retired_rule",
+                    uri=experience_uri,
+                    version=7,
+                    status="promoted",
+                    content="old",
+                )
+            ],
+        ),
+        written_uris=[experience_uri],
+    )
+
+    await SessionCompressorV3(vikingdb=None)._link_case_to_training_outputs(
+        analysis=analysis,
+        case_uri=case_uri,
+        plan=plan,
+        apply_result=apply_result,
+        ctx=_ctx(),
+        viking_fs=fs,
+    )
+
+    case_file = MemoryFileUtils.read(fs.files[case_uri], uri=case_uri)
+    assert [link["to_uri"] for link in case_file.links] == [trajectory_uri]
+    archived_file = MemoryFileUtils.read(fs.files[experience_uri], uri=experience_uri)
+    assert archived_file.backlinks == []
+    trajectory_file = MemoryFileUtils.read(fs.files[trajectory_uri], uri=trajectory_uri)
+    assert [link["from_uri"] for link in trajectory_file.backlinks] == [case_uri]
+    assert fs.read_counts == {experience_uri: 1, case_uri: 1, trajectory_uri: 1}
+    assert fs.write_order == [trajectory_uri, case_uri]
+    assert fs._async_agfs.released == [lease]
 
 
 def test_training_messages_after_case_spec_preserves_all_remaining_messages_in_order():

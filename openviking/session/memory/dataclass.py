@@ -314,6 +314,24 @@ class ResolvedOperation(BaseModel):
     # operation's memories in the vector index. None means "no tags"; used by
     # event-memory auto-tagging. Not persisted in the memory file content.
     search_tags: Optional[List[str]] = None
+    # Optimistic-concurrency preconditions.  These fields are execution-only
+    # and must never be serialized into MEMORY_FIELDS.
+    expected_version: Optional[int] = Field(default=None, exclude=True, repr=False)
+    expected_absent: bool = Field(default=False, exclude=True, repr=False)
+    lifecycle_action: Optional[str] = Field(default=None, exclude=True, repr=False)
+    archive_replacement_uri: Optional[str] = Field(default=None, exclude=True, repr=False)
+    # Policy updates validate all targets while holding one exact-batch lease.
+    # Reuse those reads during apply so CAS does not double downstream file QPS.
+    precondition_files: Dict[str, Optional[MemoryFile]] = Field(
+        default_factory=dict,
+        exclude=True,
+        repr=False,
+    )
+    archive_case_uris_by_uri: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        exclude=True,
+        repr=False,
+    )
 
     def is_edit(self):
         return self.old_memory_file_content is not None

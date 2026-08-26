@@ -31,6 +31,43 @@ def experience_is_agent_visible(value: Any) -> bool:
     return normalize_experience_status(value) == "promoted"
 
 
+def is_experience_memory_uri(uri: Any) -> bool:
+    """Return whether ``uri`` identifies a concrete Experience memory file."""
+
+    source_uri = str(uri or "").split("#", 1)[0].rstrip("/")
+    return (
+        "/memories/experiences/" in source_uri
+        and source_uri.endswith(".md")
+        and not source_uri.endswith(("/.abstract.md", "/.overview.md"))
+    )
+
+
+def experience_file_is_archived(memory_file: Any, *, uri: Any = None) -> bool:
+    """Return whether one concrete Experience file is archived."""
+
+    memory_type = str(getattr(memory_file, "memory_type", None) or "")
+    if memory_type != "experiences" and not is_experience_memory_uri(
+        uri or getattr(memory_file, "uri", None)
+    ):
+        return False
+    fields = dict(getattr(memory_file, "extra_fields", {}) or {})
+    return normalize_experience_status(fields.get("status")) == "archived"
+
+
+def experience_case_link_uris(links: Iterable[Any], *, experience_uri: str) -> set[str]:
+    """Return Case URIs connected to one Experience by persisted StoredLinks."""
+
+    result: set[str] = set()
+    for link in links or []:
+        from_uri = _link_value(link, "from_uri")
+        to_uri = _link_value(link, "to_uri")
+        if to_uri != experience_uri or "/memories/cases/" not in from_uri:
+            continue
+        if from_uri.endswith(".md"):
+            result.add(from_uri)
+    return result
+
+
 def experience_lifecycle_fields(
     *,
     existing_policy: Any | None,
@@ -46,9 +83,7 @@ def experience_lifecycle_fields(
     """
 
     existing_metadata = (
-        dict(getattr(existing_policy, "metadata", {}) or {})
-        if existing_policy is not None
-        else {}
+        dict(getattr(existing_policy, "metadata", {}) or {}) if existing_policy is not None else {}
     )
     existing_status = normalize_experience_status(
         existing_metadata.get("status") or getattr(existing_policy, "status", None),

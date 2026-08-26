@@ -53,6 +53,11 @@ from openviking.session.memory.dataclass import (
     ResolvedOperations,
     StoredLink,
 )
+from openviking.session.memory.experience_lifecycle import (
+    experience_case_link_uris,
+    experience_file_is_archived,
+    normalize_experience_status,
+)
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 from openviking.session.memory.memory_type_registry import (
     MemoryTypeRegistry,
@@ -704,18 +709,20 @@ class StreamingMemoryUpdater:
         isolation_handler = _make_isolation_handler(request, extract_context)
         async with self._apply_lock:
             viking_fs = safe_get_viking_fs()
+            MemoryUpdater._convert_experience_deletes_to_archives(operations)
             lease = await _acquire_stable_operation_lease(
                 operations,
                 viking_fs,
                 request.ctx,
             )
+            updater = MemoryUpdater(
+                registry=self.registry,
+                vikingdb=self.vikingdb,
+                transaction_handle=lease,
+                defer_archived_vector_cleanup=True,
+            )
             try:
-                updater = MemoryUpdater(
-                    registry=self.registry,
-                    vikingdb=self.vikingdb,
-                    transaction_handle=lease,
-                )
-                return await updater.apply_operations(
+                apply_result = await updater.apply_operations(
                     operations,
                     request.ctx,
                     extract_context=extract_context,
@@ -724,6 +731,8 @@ class StreamingMemoryUpdater:
             finally:
                 if lease is not None:
                     await viking_fs._async_agfs.pathlock_release(lease)
+            await updater._remove_archived_vectors(apply_result, request.ctx)
+            return apply_result
 
     async def _merge_requests(self, requests: list[MemoryUpdateRequest]) -> ResolvedOperations:
         all_ops = _combine_resolved_operations(request.operations for request in requests)
@@ -2927,33 +2936,62 @@ async def filter_valid_links(
 
     if not links:
         return []
-    upsert_uris = {uri for op in upsert_operations for uri in (op.uris or []) if uri}
+    upsert_by_uri = {uri: op for op in upsert_operations for uri in (op.uris or []) if uri}
+    upsert_uris = set(upsert_by_uri)
     deleted_uris = {file.uri for file in delete_file_contents if getattr(file, "uri", None)}
     viking_fs = safe_get_viking_fs()
-    endpoint_exists_cache: dict[str, bool] = {}
+    endpoint_content_cache: dict[str, str | None] = {}
 
     async def _endpoint_exists(uri: str) -> bool:
         if not uri or uri in deleted_uris:
             return False
         if uri in upsert_uris:
             return True
-        if uri in endpoint_exists_cache:
-            return endpoint_exists_cache[uri]
+        if uri in endpoint_content_cache:
+            return endpoint_content_cache[uri] is not None
         if viking_fs is None:
-            endpoint_exists_cache[uri] = False
+            endpoint_content_cache[uri] = None
             return False
         try:
             content = await viking_fs.read_file(uri, ctx=ctx)
-            exists = bool(content)
+            endpoint_content_cache[uri] = content if content else None
         except Exception:
-            exists = False
-        endpoint_exists_cache[uri] = exists
-        return exists
+            endpoint_content_cache[uri] = None
+        return endpoint_content_cache[uri] is not None
+
+    async def _case_experience_link_targets_archive(link: StoredLink) -> bool:
+        if "/memories/cases/" not in str(
+            link.from_uri or ""
+        ) or "/memories/experiences/" not in str(link.to_uri or ""):
+            return False
+        operation = upsert_by_uri.get(link.to_uri)
+        if operation is not None:
+            if operation.lifecycle_action == "archive":
+                return True
+            return (
+                normalize_experience_status(
+                    operation.memory_fields.get("status"),
+                    default="promoted",
+                )
+                == "archived"
+            )
+        if not await _endpoint_exists(link.to_uri):
+            return False
+        raw = endpoint_content_cache.get(link.to_uri)
+        try:
+            memory_file = MemoryFileUtils.read(raw or "", uri=link.to_uri)
+        except Exception:
+            return False
+        return experience_file_is_archived(memory_file, uri=link.to_uri)
 
     valid_links: list[StoredLink] = []
     dropped = 0
     for link in merge_link_lists(links):
-        if await _endpoint_exists(link.from_uri) and await _endpoint_exists(link.to_uri):
+        if (
+            await _endpoint_exists(link.from_uri)
+            and await _endpoint_exists(link.to_uri)
+            and not await _case_experience_link_targets_archive(link)
+        ):
             valid_links.append(link)
         else:
             dropped += 1
@@ -3425,6 +3463,23 @@ def _operation_lock_paths(
             uris.add(str(deleted_uri))
         if replacement_uri:
             uris.add(str(replacement_uri))
+    for operation in operations.upsert_operations:
+        if operation.lifecycle_action != "archive":
+            continue
+        for experience_uri in operation.uris:
+            old_file = operation.old_memory_file_content
+            if old_file is not None:
+                uris.update(
+                    experience_case_link_uris(
+                        old_file.backlinks,
+                        experience_uri=experience_uri,
+                    )
+                )
+                archived_case_uris = old_file.extra_fields.get("archived_case_uris", [])
+                if isinstance(archived_case_uris, (list, tuple, set)):
+                    uris.update(str(case_uri) for case_uri in archived_case_uris if case_uri)
+            if operation.archive_replacement_uri:
+                uris.add(operation.archive_replacement_uri)
     for memory_file in operations.delete_file_contents or []:
         for link in list(memory_file.links or []) + list(memory_file.backlinks or []):
             if isinstance(link, dict):
@@ -3440,20 +3495,46 @@ def _operation_lock_paths(
     return _uri_lock_paths(uris, viking_fs, ctx)
 
 
-async def _persisted_replacement_relation_uris(
+async def _persisted_operation_relation_uris(
     operations: ResolvedOperations,
     viking_fs: Any,
     ctx: RequestContext,
 ) -> set[str]:
     uris: set[str] = set()
-    for deleted_uri in dict(operations.delete_replacements or {}):
+    archive_operations_by_uri = {
+        uri: operation
+        for operation in operations.upsert_operations
+        if operation.lifecycle_action == "archive"
+        for uri in operation.uris
+    }
+    inspected_uris = set(operations.delete_replacements or {}) | set(archive_operations_by_uri)
+    for deleted_uri in inspected_uris:
         try:
             content = await viking_fs.read_file(deleted_uri, ctx=ctx)
         except (FileNotFoundError, NotFoundError):
+            operation = archive_operations_by_uri.get(deleted_uri)
+            if operation is not None:
+                operation.precondition_files[deleted_uri] = None
             continue
         if not content:
+            operation = archive_operations_by_uri.get(deleted_uri)
+            if operation is not None:
+                operation.precondition_files[deleted_uri] = None
             continue
         memory_file = MemoryFileUtils.read(content, uri=deleted_uri)
+        operation = archive_operations_by_uri.get(deleted_uri)
+        if operation is not None:
+            operation.precondition_files[deleted_uri] = memory_file
+            uris.update(
+                experience_case_link_uris(
+                    memory_file.backlinks,
+                    experience_uri=deleted_uri,
+                )
+            )
+            archived_case_uris = memory_file.extra_fields.get("archived_case_uris", [])
+            if isinstance(archived_case_uris, (list, tuple, set)):
+                uris.update(str(case_uri) for case_uri in archived_case_uris if case_uri)
+            continue
         for link in list(memory_file.links or []) + list(memory_file.backlinks or []):
             if isinstance(link, dict):
                 from_uri = link.get("from_uri")
@@ -3484,7 +3565,7 @@ async def _acquire_stable_operation_lease(
             timeout_secs=_MEMORY_APPLY_LOCK_TIMEOUT_SECONDS,
         )
         try:
-            relation_uris = await _persisted_replacement_relation_uris(
+            relation_uris = await _persisted_operation_relation_uris(
                 operations,
                 viking_fs,
                 ctx,

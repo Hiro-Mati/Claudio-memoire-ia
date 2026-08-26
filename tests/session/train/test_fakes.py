@@ -17,7 +17,12 @@ class AsyncPathLockFake:
         self._next_id += 1
         return {"lease_ref": f"tree-{self._next_id}", "path": path}
 
-    async def pathlock_acquire_exact_batch(self, paths: list[str]):
+    async def pathlock_acquire_exact_batch(
+        self,
+        paths: list[str],
+        timeout_secs: float | None = None,
+    ):
+        del timeout_secs
         self._next_id += 1
         return {"lease_ref": f"exact-{self._next_id}", "paths": list(paths)}
 

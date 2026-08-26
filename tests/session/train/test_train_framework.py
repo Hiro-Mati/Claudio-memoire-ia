@@ -7,6 +7,7 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -35,6 +36,7 @@ from openviking.session.train import (
     Trajectory,
 )
 from openviking.session.train.components.reporter import ConsolePipelineReporter
+from openviking.session.train.engine import PolicyTrainingEngine
 from openviking.session.train.gates import GateReport
 from openviking.session.train.gradients import PatchSemanticGradient
 
@@ -369,6 +371,128 @@ async def test_default_policy_optimization_pipeline_runs_one_batch():
     assert len(result.epochs) == 1
     assert result.epochs[0].epoch == 0
     assert result.epochs[0].policy_snapshot_ids == ["snapshot-1"]
+
+
+@pytest.mark.asyncio
+async def test_training_engine_replans_once_from_latest_version_after_cas_conflict():
+    class VersionRecordingOptimizer:
+        def __init__(self):
+            self.versions = []
+
+        async def plan(self, gradients, policy_set, context):
+            del gradients, context
+            version = policy_set.policies[0].version
+            self.versions.append(version)
+            return PolicyUpdatePlan(metadata={"planned_from_version": version})
+
+    class ConflictThenSuccessUpdater:
+        def __init__(self, fs):
+            self.fs = fs
+            self.versions = []
+            self.transaction_handles = []
+
+        async def apply(
+            self,
+            plan,
+            policy_set,
+            context,
+            *,
+            transaction_handle=None,
+        ):
+            del plan, context
+            version = policy_set.policies[0].version
+            self.versions.append(version)
+            self.transaction_handles.append(transaction_handle)
+            if len(self.versions) == 1:
+                self.fs.version = 8
+                return PolicyApplyResult(
+                    updated_policy_set=policy_set,
+                    errors=["memory version conflict"],
+                    metadata={"version_conflict": True},
+                )
+            updated = ExperienceSet(
+                root_uri=policy_set.root_uri,
+                policies=[
+                    Experience(
+                        name=policy_set.policies[0].name,
+                        uri=policy_set.policies[0].uri,
+                        version=version + 1,
+                        status=policy_set.policies[0].status,
+                        content=policy_set.policies[0].content,
+                    )
+                ],
+                viking_fs=policy_set.viking_fs,
+                request_context=policy_set.request_context,
+            )
+            return PolicyApplyResult(
+                updated_policy_set=updated,
+                written_uris=[updated.policies[0].uri],
+            )
+
+    fs = DummyVikingFS()
+    fs.version = 7
+    policy_set = _policy_set(version=7, viking_fs=fs)
+    optimizer = VersionRecordingOptimizer()
+    updater = ConflictThenSuccessUpdater(fs)
+    engine = PolicyTrainingEngine(
+        rollout_analyzer=DummyAnalyzer(),
+        gradient_estimator=DummyEstimator(),
+        policy_optimizer=optimizer,
+        policy_updater=updater,
+    )
+
+    plan, apply_result = await engine.plan_and_apply(
+        gradients=[],
+        policy_set=policy_set,
+        ctx=PipelineContext(),
+    )
+
+    assert optimizer.versions == [7, 8]
+    assert updater.versions == [7, 8]
+    assert fs.reloads == 2
+    assert plan.metadata == {
+        "planned_from_version": 8,
+        "version_conflict_replan": 1,
+    }
+    assert apply_result.errors == []
+    assert apply_result.updated_policy_set.policies[0].version == 9
+    assert updater.transaction_handles[0] is updater.transaction_handles[1]
+
+
+@pytest.mark.asyncio
+async def test_policy_set_optimizer_lock_is_exact_and_does_not_lock_experience_tree():
+    class RecordingPathLock:
+        def __init__(self):
+            self.calls = []
+            self.released = []
+
+        async def pathlock_acquire_exact_batch(self, paths, timeout_secs=None):
+            self.calls.append((list(paths), timeout_secs))
+            return {"lease_ref": "optimizer"}
+
+        async def pathlock_acquire_tree(self, *args, **kwargs):
+            raise AssertionError("optimizer planning must not hold a tree lock")
+
+        async def pathlock_release(self, lease):
+            self.released.append(lease)
+
+    pathlock = RecordingPathLock()
+    viking_fs = SimpleNamespace(
+        _async_agfs=pathlock,
+        _uri_to_path=lambda uri, ctx=None: "/" + uri.removeprefix("viking://"),
+    )
+    policy_set = ExperienceSet(
+        root_uri="viking://user/u/memories/experiences",
+        policies=[],
+        viking_fs=viking_fs,
+        request_context=fake_request_context(),
+    )
+
+    async with policy_set.lock() as lease:
+        assert lease == {"lease_ref": "optimizer"}
+
+    assert pathlock.calls == [(["/user/u/memories/experiences/.policy-optimizer.lock"], 300.0)]
+    assert pathlock.released == [{"lease_ref": "optimizer"}]
 
 
 @pytest.mark.asyncio

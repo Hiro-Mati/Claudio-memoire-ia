@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from openviking.server.error_mapping import is_not_found_error
 from openviking.session.memory.dataclass import (
     MemoryFile,
     MemoryTypeSchema,
@@ -16,12 +17,22 @@ from openviking.session.memory.dataclass import (
     ResolvedOperations,
     StoredLink,
 )
-from openviking.session.memory.experience_lifecycle import normalize_experience_status
+from openviking.session.memory.experience_lifecycle import (
+    experience_case_link_uris,
+    normalize_experience_status,
+)
 from openviking.session.memory.memory_type_registry import (
     MemoryTypeRegistry,
     create_default_registry,
 )
-from openviking.session.memory.memory_updater import MemoryUpdater, resolve_memory_fields
+from openviking.session.memory.memory_updater import (
+    MemoryUpdater,
+    MemoryVersionConflictError,
+    resolve_memory_fields,
+)
+from openviking.session.memory.utils.memory_file_utils import (
+    MemoryFileUtils,
+)
 from openviking.session.train.domain import (
     Policy,
     PolicyApplyResult,
@@ -33,6 +44,8 @@ from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import tracer
 
 _EXPERIENCE_NAME_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
+_POLICY_APPLY_LOCK_TIMEOUT_SECONDS = 300.0
+_POLICY_APPLY_LOCK_MAX_ACQUISITIONS = 3
 
 
 @dataclass(slots=True)
@@ -118,23 +131,145 @@ class MemoryFilePolicyUpdater:
             updated_policy_set=updated_policy_set,
             registry=registry,
         )
-        updater = MemoryUpdater(
-            registry=registry,
-            vikingdb=self.vikingdb,
-            transaction_handle=transaction_handle,
-        )
-        updater._viking_fs = viking_fs
+        if preflight_errors:
+            return PolicyApplyResult(
+                updated_policy_set=policy_set,
+                errors=preflight_errors,
+                metadata={
+                    "dry_run": False,
+                    "item_count": len(plan.items),
+                    "preflight_failed": True,
+                },
+            )
 
-        apply_result = await updater.apply_operations(
-            operations,
-            context,
-            extract_context=None,
-            isolation_handler=None,
+        apply_lease = transaction_handle
+        owns_apply_lease = False
+        pathlock_client = getattr(viking_fs, "_async_agfs", None)
+        allow_unlocked_test_fallback = bool(
+            getattr(viking_fs, "_allow_policy_snapshot_fallback", False)
         )
+        has_mutations = bool(
+            operations.upsert_operations
+            or operations.delete_file_contents
+            or operations.resolved_links
+        )
+        if (
+            has_mutations
+            and not allow_unlocked_test_fallback
+            and (pathlock_client is None or getattr(viking_fs, "_uri_to_path", None) is None)
+        ):
+            raise RuntimeError(
+                "MemoryFilePolicyUpdater requires exact-batch path locking for mutations"
+            )
+        lock_paths = _policy_apply_lock_paths(
+            operations,
+            viking_fs,
+            context,
+            registry=registry,
+        )
+        version_conflicts: list[MemoryVersionConflictError] = []
+        try:
+            if lock_paths and pathlock_client is not None:
+                required_paths = set(lock_paths)
+                for acquisition in range(1, _POLICY_APPLY_LOCK_MAX_ACQUISITIONS + 1):
+                    apply_lease = await pathlock_client.pathlock_acquire_exact_batch(
+                        sorted(required_paths),
+                        timeout_secs=_POLICY_APPLY_LOCK_TIMEOUT_SECONDS,
+                    )
+                    owns_apply_lease = True
+                    version_conflicts = await _preflight_operation_versions(
+                        operations,
+                        viking_fs=viking_fs,
+                        ctx=context,
+                        allow_snapshot_fallback=allow_unlocked_test_fallback,
+                    )
+                    if version_conflicts:
+                        break
+                    expanded_paths = required_paths | set(
+                        _policy_preflight_relation_lock_paths(
+                            operations,
+                            viking_fs=viking_fs,
+                            ctx=context,
+                        )
+                    )
+                    if expanded_paths == required_paths:
+                        break
+                    await pathlock_client.pathlock_release(apply_lease)
+                    owns_apply_lease = False
+                    apply_lease = transaction_handle
+                    required_paths = expanded_paths
+                    _clear_operation_precondition_files(operations)
+                    if acquisition == _POLICY_APPLY_LOCK_MAX_ACQUISITIONS:
+                        raise RuntimeError(
+                            "Unable to stabilize policy apply lock coverage after "
+                            f"{_POLICY_APPLY_LOCK_MAX_ACQUISITIONS} acquisitions"
+                        )
+                lock_paths = sorted(required_paths)
+            else:
+                version_conflicts = await _preflight_operation_versions(
+                    operations,
+                    viking_fs=viking_fs,
+                    ctx=context,
+                    allow_snapshot_fallback=allow_unlocked_test_fallback,
+                )
+            if version_conflicts:
+                return PolicyApplyResult(
+                    updated_policy_set=policy_set,
+                    errors=[str(conflict) for conflict in version_conflicts],
+                    metadata={
+                        "dry_run": False,
+                        "item_count": len(plan.items),
+                        "version_conflict": True,
+                        "conflicts": [
+                            {
+                                "uri": conflict.uri,
+                                "expected_version": conflict.expected_version,
+                                "actual_version": conflict.actual_version,
+                                "expected_absent": conflict.expected_absent,
+                            }
+                            for conflict in version_conflicts
+                        ],
+                    },
+                )
+
+            updater = MemoryUpdater(
+                registry=registry,
+                vikingdb=self.vikingdb,
+                transaction_handle=apply_lease,
+                defer_archived_vector_cleanup=True,
+            )
+            updater._viking_fs = viking_fs
+            apply_result = await updater.apply_operations(
+                operations,
+                context,
+                extract_context=None,
+                isolation_handler=None,
+            )
+        finally:
+            if owns_apply_lease:
+                await pathlock_client.pathlock_release(apply_lease)
+
+        # Index cleanup does not participate in the file/CAS transaction.
+        # Run its single batched downstream call after releasing file locks;
+        # the archived status and Agent read guard are already authoritative.
+        await updater._remove_archived_vectors(apply_result, context)
+
         errors = [*preflight_errors, *[f"{uri}: {exc}" for uri, exc in apply_result.errors]]
+        operation_target_uris = {
+            uri for operation in operations.upsert_operations for uri in operation.uris
+        } | {memory_file.uri for memory_file in operations.delete_file_contents if memory_file.uri}
+        primary_write_errors = [
+            (uri, exc) for uri, exc in apply_result.errors if uri in operation_target_uris
+        ]
+        apply_conflicts = [
+            exc for _, exc in apply_result.errors if isinstance(exc, MemoryVersionConflictError)
+        ]
 
         return PolicyApplyResult(
-            updated_policy_set=updated_policy_set if not errors else policy_set,
+            # A Case backlink cleanup failure must not make callers believe a
+            # successfully archived Experience is still promoted.  Only a
+            # primary policy-file write failure invalidates the simulated set.
+            updated_policy_set=(updated_policy_set if not primary_write_errors else policy_set),
             written_uris=list(apply_result.written_uris + apply_result.edited_uris),
             deleted_uris=list(apply_result.deleted_uris),
             errors=errors,
@@ -143,8 +278,161 @@ class MemoryFilePolicyUpdater:
                 "item_count": len(plan.items),
                 "operation_upsert_count": len(operations.upsert_operations),
                 "operation_delete_count": len(operations.delete_file_contents),
+                "version_conflict": bool(apply_conflicts),
+                "apply_lock_path_count": len(lock_paths),
             },
         )
+
+
+def _policy_apply_lock_paths(
+    operations: ResolvedOperations,
+    viking_fs: Any,
+    ctx: Any,
+    *,
+    registry: MemoryTypeRegistry,
+) -> list[str]:
+    """Return one sorted exact-lock batch for all policy side effects."""
+
+    uri_to_path = getattr(viking_fs, "_uri_to_path", None)
+    if uri_to_path is None:
+        return []
+    uris: set[str] = set()
+    for op in operations.upsert_operations:
+        for uri in op.uris or []:
+            if not uri:
+                continue
+            uris.add(uri)
+            schema = registry.get(op.memory_type)
+            directory, separator, _ = uri.rstrip("/").rpartition("/")
+            if separator and schema is not None and schema.overview_template:
+                uris.add(f"{directory}/.overview.md")
+            if op.lifecycle_action == "archive":
+                old_file = op.old_memory_file_content
+                uris.update(_policy_archive_case_uris(old_file, experience_uri=uri))
+                if op.archive_replacement_uri:
+                    uris.add(op.archive_replacement_uri)
+    for memory_file in operations.delete_file_contents:
+        if memory_file.uri:
+            uris.add(memory_file.uri)
+            memory_type = str(
+                memory_file.memory_type
+                or memory_file.extra_fields.get("memory_type")
+                or MemoryUpdater.memory_type_from_uri(memory_file.uri)
+                or ""
+            )
+            schema = registry.get(memory_type)
+            directory, separator, _ = memory_file.uri.rstrip("/").rpartition("/")
+            if separator and schema is not None and schema.overview_template:
+                uris.add(f"{directory}/.overview.md")
+    for link in operations.resolved_links:
+        if link.from_uri:
+            uris.add(link.from_uri)
+        if link.to_uri:
+            uris.add(link.to_uri)
+    return sorted({uri_to_path(uri, ctx=ctx) for uri in uris})
+
+
+def _policy_preflight_relation_lock_paths(
+    operations: ResolvedOperations,
+    *,
+    viking_fs: Any,
+    ctx: Any,
+) -> list[str]:
+    """Expand archive locks from the files read under the current lease."""
+
+    uri_to_path = getattr(viking_fs, "_uri_to_path", None)
+    if uri_to_path is None:
+        return []
+    case_uris: set[str] = set()
+    for op in operations.upsert_operations:
+        if op.lifecycle_action != "archive":
+            continue
+        for experience_uri in op.uris:
+            case_uris.update(
+                _policy_archive_case_uris(
+                    op.precondition_files.get(experience_uri),
+                    experience_uri=experience_uri,
+                )
+            )
+    return sorted({uri_to_path(uri, ctx=ctx) for uri in case_uris})
+
+
+def _policy_archive_case_uris(
+    memory_file: MemoryFile | None,
+    *,
+    experience_uri: str,
+) -> set[str]:
+    if memory_file is None:
+        return set()
+    result = experience_case_link_uris(
+        memory_file.backlinks,
+        experience_uri=experience_uri,
+    )
+    archived_case_uris = memory_file.extra_fields.get("archived_case_uris", [])
+    if not isinstance(archived_case_uris, (list, tuple, set)):
+        return result
+    result.update(str(case_uri) for case_uri in archived_case_uris if str(case_uri))
+    return result
+
+
+def _clear_operation_precondition_files(operations: ResolvedOperations) -> None:
+    for op in operations.upsert_operations:
+        op.precondition_files.clear()
+
+
+async def _preflight_operation_versions(
+    operations: ResolvedOperations,
+    *,
+    viking_fs: Any,
+    ctx: Any,
+    allow_snapshot_fallback: bool = False,
+) -> list[MemoryVersionConflictError]:
+    """Validate the whole batch before its first write and cache each read."""
+
+    conflicts: list[MemoryVersionConflictError] = []
+    cache: dict[str, MemoryFile | None] = {}
+    preflighted_uris: set[str] = set()
+
+    async def _read(uri: str) -> MemoryFile | None:
+        if uri in cache:
+            return cache[uri]
+        try:
+            raw = await viking_fs.read_file(uri, ctx=ctx)
+        except Exception as exc:
+            if not is_not_found_error(exc) and not isinstance(exc, KeyError):
+                raise
+            cache[uri] = None
+            return None
+        cache[uri] = MemoryFileUtils.read(raw or "", uri=uri) if raw is not None else None
+        return cache[uri]
+
+    for op in operations.upsert_operations:
+        for uri in op.uris:
+            if uri in preflighted_uris:
+                # Preserve the existing ordered-plan behavior for repeated
+                # targets: the later operation reads the file produced by the
+                # earlier operation instead of being evaluated against the
+                # original snapshot a second time.
+                op.expected_version = None
+                op.expected_absent = False
+                op.precondition_files.pop(uri, None)
+                continue
+            preflighted_uris.add(uri)
+            current = await _read(uri)
+            if (
+                current is None
+                and allow_snapshot_fallback
+                and op.old_memory_file_content is not None
+            ):
+                current = op.old_memory_file_content.model_copy(deep=True)
+                cache[uri] = current
+            op.precondition_files[uri] = current
+            try:
+                MemoryUpdater._validate_operation_precondition(op, uri, current)
+            except MemoryVersionConflictError as conflict:
+                conflicts.append(conflict)
+
+    return conflicts
 
 
 def _policy_body_metadata(
@@ -185,6 +473,27 @@ async def _apply_items_to_snapshot(
                 uri=None,
                 name=item.target_name,
             )
+            if item.memory_type == "experiences" and existing is not None:
+                metadata = dict(existing.metadata)
+                metadata.update(
+                    {
+                        "status": "archived",
+                        "promotion_reason": "superseded_or_obsolete",
+                    }
+                )
+                archived = Policy(
+                    name=existing.name,
+                    uri=existing.uri,
+                    version=existing.version + 1,
+                    status="archived",
+                    content=existing.content,
+                    metadata=metadata,
+                    links=list(existing.links or []),
+                    backlinks=list(existing.backlinks or []),
+                )
+                result = [archived if policy.uri == existing.uri else policy for policy in result]
+                policies_by_uri[existing.uri] = archived
+                continue
             remove_uri = existing.uri if existing is not None else uri
             result = [
                 policy
@@ -352,6 +661,27 @@ def _plan_to_resolved_operations(
             continue
 
         if item.kind == "delete":
+            if item.memory_type == "experiences":
+                if current is None:
+                    errors.append(f"cannot archive missing Experience: {item.target_name}")
+                    continue
+                updated = _find_policy(updated_policy_set, uri=uri, name=item.target_name)
+                if updated is None:
+                    errors.append(
+                        f"planned archived policy not found after simulation: {item.target_name}"
+                    )
+                    continue
+                upserts.append(
+                    _resolved_policy_upsert(
+                        item=item,
+                        uri=uri,
+                        current=current,
+                        updated=updated,
+                        registry=registry,
+                        lifecycle_action="archive",
+                    )
+                )
+                continue
             deletes.append(_policy_or_plan_item_memory_file(item, uri=uri, current=current))
             continue
 
@@ -366,23 +696,21 @@ def _plan_to_resolved_operations(
             errors.append(f"planned policy not found after simulation: {item.target_name}")
             continue
 
+        lifecycle_action = str(item.metadata.get("lifecycle_action") or "") or None
+        if (
+            item.memory_type == "experiences"
+            and updated.status == "archived"
+            and (current is None or normalize_experience_status(current.status) != "archived")
+        ):
+            lifecycle_action = "archive"
         upserts.append(
-            ResolvedOperation(
-                old_memory_file_content=_policy_to_memory_file(current)
-                if current is not None
-                else None,
-                memory_fields={
-                    **dict(updated.metadata),
-                    **_policy_body_metadata(
-                        updated,
-                        schema=registry.get(item.memory_type or "experiences"),
-                    ),
-                    "memory_type": item.memory_type or "experiences",
-                    "experience_name": updated.name,
-                    "status": updated.status,
-                },
-                memory_type=item.memory_type or "experiences",
-                uris=[uri],
+            _resolved_policy_upsert(
+                item=item,
+                uri=uri,
+                current=current,
+                updated=updated,
+                registry=registry,
+                lifecycle_action=lifecycle_action,
             )
         )
         links.extend(_source_trajectory_links(exp_uri=uri, links=item.links))
@@ -395,6 +723,48 @@ def _plan_to_resolved_operations(
             resolved_links=links,
         ),
         errors,
+    )
+
+
+def _resolved_policy_upsert(
+    *,
+    item: PolicyPlanItem,
+    uri: str,
+    current: Policy | None,
+    updated: Policy,
+    registry: MemoryTypeRegistry,
+    lifecycle_action: str | None,
+) -> ResolvedOperation:
+    superseded_by = list(item.metadata.get("superseded_by") or [])
+    replacement_uris = [
+        str(candidate)
+        for candidate in superseded_by
+        if str(candidate).startswith("viking://") and str(candidate) != uri
+    ]
+    replacement_uri = replacement_uris[0] if len(replacement_uris) == 1 else None
+    memory_type = item.memory_type or "experiences"
+    return ResolvedOperation(
+        old_memory_file_content=(_policy_to_memory_file(current) if current is not None else None),
+        memory_fields={
+            **dict(updated.metadata),
+            **_policy_body_metadata(
+                updated,
+                schema=registry.get(memory_type),
+            ),
+            "memory_type": memory_type,
+            "experience_name": updated.name,
+            "status": updated.status,
+        },
+        memory_type=memory_type,
+        uris=[uri],
+        expected_version=(
+            item.base_version
+            if item.base_version is not None
+            else (current.version if current is not None else None)
+        ),
+        expected_absent=current is None,
+        lifecycle_action=lifecycle_action,
+        archive_replacement_uri=replacement_uri,
     )
 
 

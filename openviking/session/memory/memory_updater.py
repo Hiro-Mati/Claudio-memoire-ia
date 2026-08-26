@@ -13,7 +13,7 @@ import re
 import secrets
 import string
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
@@ -23,6 +23,7 @@ from openviking.core.context import ContextLevel
 from openviking.message import Message
 from openviking.message.part import TextPart
 from openviking.pyagfs.exceptions import AGFSNotFoundError
+from openviking.server.error_mapping import is_not_found_error
 from openviking.server.identity import RequestContext
 from openviking.session.memory.case_aggregation import (
     CASE_MEMORY_TYPE,
@@ -35,12 +36,17 @@ from openviking.session.memory.dataclass import (
     ResolvedOperations,
     StoredLink,
 )
+from openviking.session.memory.experience_lifecycle import (
+    experience_case_link_uris,
+    experience_file_is_archived,
+)
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.memory.merge_op import MergeOpFactory
 from openviking.session.memory.page_id_map import PageIdMap
 from openviking.session.memory.utils.memory_file_utils import (
     MemoryFileUtils,
     bump_memory_version,
+    memory_version_from_fields,
     next_memory_version,
 )
 from openviking.session.memory.utils.resource_refs import (
@@ -72,6 +78,26 @@ _RESOURCE_URI_MARKER_RE = re.compile(
     r"[，,；;：:\s]*(?:资源\s*URI\s*为|资源\s*URI|Resource\s+URI)\s*[:：为]?\s*",
     re.IGNORECASE,
 )
+
+
+class MemoryVersionConflictError(RuntimeError):
+    """A storage write was planned against a stale or unexpected version."""
+
+    def __init__(
+        self,
+        uri: str,
+        *,
+        expected_version: int | None,
+        actual_version: int | None,
+        expected_absent: bool = False,
+    ) -> None:
+        expected = "absent" if expected_absent else str(expected_version)
+        actual = "absent" if actual_version is None else str(actual_version)
+        super().__init__(f"memory version conflict for {uri}: expected={expected}, actual={actual}")
+        self.uri = uri
+        self.expected_version = expected_version
+        self.actual_version = actual_version
+        self.expected_absent = expected_absent
 
 
 @dataclass(frozen=True)
@@ -115,6 +141,7 @@ async def write_stored_links(
     viking_fs: Any,
     skip_uris: Optional[set] = None,
     lease_ref: Any = None,
+    prefetched_files: Optional[Dict[str, MemoryFile]] = None,
 ) -> List[str]:
     """Write StoredLinks to their endpoint files' links/backlinks fields.
 
@@ -140,10 +167,14 @@ async def write_stored_links(
     updated_uris: List[str] = []
     for uri, link_groups in file_links.items():
         try:
-            content = await viking_fs.read_file(uri, ctx=ctx)
-            if not content:
-                continue
-            mf = MemoryFileUtils.read(content, uri=uri)
+            prefetched = (prefetched_files or {}).get(uri)
+            if prefetched is not None:
+                mf = prefetched.model_copy(deep=True)
+            else:
+                content = await viking_fs.read_file(uri, ctx=ctx)
+                if not content:
+                    continue
+                mf = MemoryFileUtils.read(content, uri=uri)
             if link_groups["links"]:
                 mf.links = merge_links(mf.links, [l.model_dump() for l in link_groups["links"]])
             if link_groups["backlinks"]:
@@ -864,7 +895,11 @@ class MemoryUpdateResult:
         self.written_uris: List[str] = []
         self.edited_uris: List[str] = []
         self.deleted_uris: List[str] = []
+        self.archived_uris: List[str] = []
         self.errors: List[Tuple[str, Exception]] = []
+        # Parsed post-write files are execution-only.  Reuse them for resource
+        # ref sync and vectorization instead of reading the same file again.
+        self.files_by_uri: Dict[str, MemoryFile] = {}
 
     def add_written(self, uri: str) -> None:
         self.written_uris.append(uri)
@@ -874,6 +909,13 @@ class MemoryUpdateResult:
 
     def add_deleted(self, uri: str) -> None:
         self.deleted_uris.append(uri)
+
+    def add_archived(self, uri: str) -> None:
+        if uri not in self.archived_uris:
+            self.archived_uris.append(uri)
+
+    def cache_file(self, uri: str, memory_file: MemoryFile) -> None:
+        self.files_by_uri[uri] = memory_file
 
     def add_error(self, uri: str, error: Exception) -> None:
         self.errors.append((uri, error))
@@ -911,12 +953,14 @@ class MemoryUpdater:
         registry: Optional[MemoryTypeRegistry] = None,
         vikingdb=None,
         transaction_handle: Any = None,
+        defer_archived_vector_cleanup: bool = False,
     ):
         """Create a memory updater with an optional pathlock transaction handle."""
         self._viking_fs = None
         self._registry = registry
         self._vikingdb = vikingdb
         self._transaction_handle = transaction_handle
+        self._defer_archived_vector_cleanup = defer_archived_vector_cleanup
 
     def _get_viking_fs(self):
         """Get or create VikingFS instance."""
@@ -1024,6 +1068,8 @@ class MemoryUpdater:
                 result.add_error("unknown", ValueError(error))
             return result
 
+        self._convert_experience_deletes_to_archives(operations)
+
         await self._allocate_add_only_uris(
             operations,
             ctx,
@@ -1055,12 +1101,15 @@ class MemoryUpdater:
                 )
                 if allocation_error is not None:
                     raise allocation_error
-                await self._apply_upsert(
+                written_files = await self._apply_upsert(
                     resolved_op,
                     ctx,
                     extract_context=extract_context,
                     lease_ref=self._transaction_handle,
                 )
+                if self._transaction_handle is not None or resolved_op.precondition_files:
+                    for uri, memory_file in (written_files or {}).items():
+                        result.cache_file(uri, memory_file)
                 # Add all uris to result (uris is List[str])
                 if resolved_op.is_edit():
                     for uri in resolved_op.uris:
@@ -1068,6 +1117,9 @@ class MemoryUpdater:
                 else:
                     for uri in resolved_op.uris:
                         result.add_written(uri)
+                if resolved_op.lifecycle_action == "archive":
+                    for uri in resolved_op.uris:
+                        result.add_archived(uri)
             except Exception as e:
                 tracer.error(
                     f"Failed to apply operation: op_type={type(resolved_op).__name__}, uris={resolved_op.uris}",
@@ -1138,6 +1190,8 @@ class MemoryUpdater:
             uri_memory_type_map=uri_memory_type_map,
             search_tags_by_uri=effective_search_tags_by_uri,
         )
+        if not self._defer_archived_vector_cleanup:
+            await self._remove_archived_vectors(result, ctx)
 
         # Apply links to endpoint files not covered by upsert_operations
         if operations.resolved_links:
@@ -1148,6 +1202,13 @@ class MemoryUpdater:
                 deleted_uris=set(result.deleted_uris),
                 lease_ref=self._transaction_handle,
             )
+
+        await self._unlink_archived_experience_cases(
+            operations,
+            result,
+            ctx,
+            lease_ref=self._transaction_handle,
+        )
 
         tracer.info(f"Memory operations applied: {result.summary()}")
 
@@ -1177,6 +1238,59 @@ class MemoryUpdater:
 
         return result
 
+    @staticmethod
+    def _convert_experience_deletes_to_archives(operations: ResolvedOperations) -> None:
+        """Keep Experience files and turn physical deletes into archive upserts."""
+
+        upserted_uris = {
+            uri
+            for operation in operations.upsert_operations
+            for uri in (operation.uris or [])
+            if uri
+        }
+        remaining_deletes: list[MemoryFile] = []
+        for old_file in operations.delete_file_contents:
+            uri = str(old_file.uri or "")
+            memory_type = str(
+                old_file.memory_type
+                or old_file.extra_fields.get("memory_type")
+                or MemoryUpdater.memory_type_from_uri(uri)
+                or ""
+            )
+            if memory_type != "experiences" or not uri:
+                remaining_deletes.append(old_file)
+                continue
+
+            if uri in upserted_uris:
+                # The existing successful path treats this as "upsert wins".
+                # Drop the delete before execution so an upsert failure cannot
+                # make an Experience fall through to physical deletion.
+                operations.delete_replacements.pop(uri, None)
+                continue
+
+            replacement_uri = operations.delete_replacements.pop(uri, None)
+            archive_fields = dict(old_file.extra_fields or {})
+            archive_fields.update(
+                {
+                    "memory_type": "experiences",
+                    "status": "archived",
+                }
+            )
+            operations.upsert_operations.append(
+                ResolvedOperation(
+                    old_memory_file_content=old_file.model_copy(deep=True),
+                    memory_fields=archive_fields,
+                    memory_type="experiences",
+                    uris=[uri],
+                    expected_version=memory_version_from_fields(old_file.extra_fields),
+                    lifecycle_action="archive",
+                    archive_replacement_uri=replacement_uri,
+                )
+            )
+            upserted_uris.add(uri)
+
+        operations.delete_file_contents = remaining_deletes
+
     async def _sync_resource_refs_for_result(
         self,
         result: MemoryUpdateResult,
@@ -1194,19 +1308,27 @@ class MemoryUpdater:
             ):
                 continue
             try:
-                raw = await viking_fs.read_file(uri, ctx=ctx)
-                mf = MemoryFileUtils.read(raw, uri=uri)
+                had_cached_file = uri in result.files_by_uri
+                cached_file = result.files_by_uri.get(uri)
+                if cached_file is not None:
+                    mf = cached_file.model_copy(deep=True)
+                else:
+                    raw = await viking_fs.read_file(uri, ctx=ctx)
+                    mf = MemoryFileUtils.read(raw, uri=uri)
                 changed = sync_memory_resource_refs(
                     mf,
                     source=RESOURCE_REF_SOURCE_SESSION_COMMIT,
                 )
                 if changed:
+                    rendered = MemoryFileUtils.write(mf)
                     await viking_fs.write_file(
                         uri,
-                        MemoryFileUtils.write(mf),
+                        rendered,
                         ctx=ctx,
                         lease_ref=lease_ref,
                     )
+                    if had_cached_file:
+                        result.cache_file(uri, MemoryFileUtils.read(rendered, uri=uri))
             except Exception as exc:
                 logger.warning("Failed to sync resource refs for %s: %s", uri, exc)
 
@@ -1287,31 +1409,87 @@ class MemoryUpdater:
         ctx: RequestContext,
         extract_context: Any = None,
         lease_ref: Any = None,
-    ):
+    ) -> Dict[str, MemoryFile]:
         """Apply upsert operation from a flat model."""
         viking_fs = self._get_viking_fs()
+        written_files: Dict[str, MemoryFile] = {}
 
         memory_type = resolved_op.memory_type
         schema = self._registry.get(memory_type)
         # Process each URI independently
         for uri in resolved_op.uris:
-            # Always read from disk first to get the latest content,
-            # so consecutive patches to the same URI see each other's changes.
             old_content: Optional[MemoryFile] = None
             if schema.operation_mode != "add_only":
-                try:
-                    content = await viking_fs.read_file(uri, ctx=ctx)
-                    if content:
-                        old_content = MemoryFileUtils.read(content, uri=uri)
-                except Exception:
-                    # File doesn't exist yet, that's okay
-                    pass
-                # Fall back to pre-fetched content if disk read failed
-                if old_content is None:
+                if uri in resolved_op.precondition_files:
+                    # The policy updater read and validated this file while
+                    # holding the same exact-batch lease.  Reusing it avoids a
+                    # second downstream read without weakening CAS.
+                    old_content = resolved_op.precondition_files[uri]
+                else:
+                    try:
+                        content = await viking_fs.read_file(uri, ctx=ctx)
+                        if content is not None:
+                            old_content = MemoryFileUtils.read(content, uri=uri)
+                    except Exception as exc:
+                        strict_precondition_read = (
+                            resolved_op.expected_version is not None
+                            or resolved_op.expected_absent
+                            or resolved_op.lifecycle_action == "archive"
+                        )
+                        if strict_precondition_read and not is_not_found_error(exc):
+                            raise
+                if (
+                    old_content is None
+                    and resolved_op.expected_version is None
+                    and not resolved_op.expected_absent
+                ):
                     old_content = resolved_op.old_memory_file_content
 
+            self._validate_operation_precondition(resolved_op, uri, old_content)
+
+            incoming_fields = dict(resolved_op.memory_fields)
+            link_old_content = old_content
+            if schema.memory_type == "experiences":
+                if resolved_op.lifecycle_action == "archive":
+                    incoming_fields["status"] = "archived"
+                    archived_case_uris = (
+                        old_content.extra_fields.get("archived_case_uris")
+                        if old_content is not None
+                        else []
+                    )
+                    if not isinstance(archived_case_uris, (list, tuple, set)):
+                        archived_case_uris = []
+                    existing_case_uris = {
+                        str(case_uri) for case_uri in archived_case_uris if str(case_uri)
+                    }
+                    active_case_uris = experience_case_link_uris(
+                        old_content.backlinks if old_content is not None else [],
+                        experience_uri=uri,
+                    )
+                    archive_case_uris = sorted(existing_case_uris | active_case_uris)
+                    resolved_op.archive_case_uris_by_uri[uri] = archive_case_uris
+                    incoming_fields["archived_case_uris"] = archive_case_uris
+                    if old_content is None or not old_content.extra_fields.get("archived_at"):
+                        incoming_fields["archived_at"] = datetime.now(timezone.utc).isoformat()
+                    incoming_fields["archive_reason"] = str(
+                        incoming_fields.get("promotion_reason")
+                        or incoming_fields.get("archive_reason")
+                        or "superseded_or_obsolete"
+                    )
+                    if resolved_op.archive_replacement_uri:
+                        incoming_fields["archive_replacement_uri"] = (
+                            resolved_op.archive_replacement_uri
+                        )
+                    if old_content is not None:
+                        link_old_content = old_content.model_copy(deep=True)
+                        link_old_content.backlinks = [
+                            link
+                            for link in old_content.backlinks
+                            if str(link.get("from_uri") or "") not in active_case_uris
+                        ]
+
             metadata = await resolve_memory_fields(
-                dict(resolved_op.memory_fields),
+                incoming_fields,
                 schema=schema,
                 old_file=old_content,
                 uri=uri,
@@ -1336,17 +1514,17 @@ class MemoryUpdater:
             incoming_backlinks_by_uri = getattr(resolved_op, "_incoming_backlinks_by_uri", {})
             incoming_links = incoming_links_by_uri.get(uri, [])
             incoming_backlinks = incoming_backlinks_by_uri.get(uri, [])
-            has_existing_links = old_content is not None
+            has_existing_links = link_old_content is not None
             if (
                 incoming_links
                 or incoming_backlinks
-                or (has_existing_links and old_content.links)
-                or (has_existing_links and old_content.backlinks)
+                or (has_existing_links and link_old_content.links)
+                or (has_existing_links and link_old_content.backlinks)
             ):
                 from openviking.session.memory.merge_op.link_merge import merge_links
 
                 # Merge links
-                existing_links = old_content.links if has_existing_links else []
+                existing_links = link_old_content.links if has_existing_links else []
                 if incoming_links:
                     merged_links = merge_links(
                         existing_links,
@@ -1357,7 +1535,7 @@ class MemoryUpdater:
                     metadata["links"] = existing_links
 
                 # Merge backlinks
-                existing_backlinks = old_content.backlinks if has_existing_links else []
+                existing_backlinks = link_old_content.backlinks if has_existing_links else []
                 if incoming_backlinks:
                     merged_backlinks = merge_links(
                         existing_backlinks,
@@ -1379,6 +1557,37 @@ class MemoryUpdater:
                 new_full_content,
                 ctx=ctx,
                 lease_ref=lease_ref,
+            )
+            written_files[uri] = MemoryFileUtils.read(new_full_content, uri=uri)
+        return written_files
+
+    @staticmethod
+    def _validate_operation_precondition(
+        resolved_op: ResolvedOperation,
+        uri: str,
+        old_content: MemoryFile | None,
+    ) -> None:
+        if resolved_op.expected_absent:
+            if old_content is not None:
+                raise MemoryVersionConflictError(
+                    uri,
+                    expected_version=None,
+                    actual_version=memory_version_from_fields(old_content.extra_fields),
+                    expected_absent=True,
+                )
+            return
+        if resolved_op.expected_version is None:
+            return
+        actual_version = (
+            memory_version_from_fields(old_content.extra_fields)
+            if old_content is not None
+            else None
+        )
+        if actual_version != resolved_op.expected_version:
+            raise MemoryVersionConflictError(
+                uri,
+                expected_version=resolved_op.expected_version,
+                actual_version=actual_version,
             )
 
     def _distribute_links_to_operations(self, operations: ResolvedOperations) -> None:
@@ -1559,6 +1768,197 @@ class MemoryUpdater:
             tracer.error(f"Memory not found for delete: {uri}")
             # Idempotent - deleting non-existent file succeeds
 
+    async def _remove_archived_vectors(
+        self,
+        result: MemoryUpdateResult,
+        ctx: RequestContext,
+    ) -> None:
+        """Remove archived Experiences from recall in one batched index call."""
+
+        uris = list(dict.fromkeys(result.archived_uris))
+        if not uris:
+            return
+        delete_vectors = getattr(self._get_viking_fs(), "_delete_from_vector_store", None)
+        if delete_vectors is None:
+            return
+        try:
+            await delete_vectors(uris, ctx=ctx)
+        except Exception as exc:
+            # Storage status and Agent read guards remain authoritative.  Do
+            # not roll back a completed archive because index cleanup can be
+            # retried independently, but keep the failure observable.
+            tracer.error(f"Failed to remove archived Experience vectors: uris={uris}, error={exc}")
+            result.add_error("vector_index", exc)
+
+    async def _unlink_archived_experience_cases(
+        self,
+        operations: ResolvedOperations,
+        result: MemoryUpdateResult,
+        ctx: RequestContext,
+        *,
+        lease_ref: Any = None,
+    ) -> None:
+        """Remove or remap Case links after an Experience becomes archived.
+
+        The caller holds one exact-batch lease covering every archived
+        Experience, its persisted Case backlinks, and any replacement target.
+        Each Case is read at most once per apply batch.
+        """
+
+        viking_fs = self._get_viking_fs()
+        case_schema = self._registry.get(CASE_MEMORY_TYPE)
+        replacement_links: list[StoredLink] = []
+        cases_by_uri: dict[str, list[tuple[str, str | None]]] = {}
+        case_updates: dict[
+            str,
+            tuple[
+                MemoryFile,
+                list[dict[str, Any]],
+                list[dict[str, Any]],
+                list[dict[str, Any]],
+            ],
+        ] = {}
+
+        for op in operations.upsert_operations:
+            if op.lifecycle_action != "archive":
+                continue
+            for experience_uri in op.uris:
+                if experience_uri not in result.archived_uris:
+                    continue
+                replacement_uri = op.archive_replacement_uri
+                for case_uri in op.archive_case_uris_by_uri.get(experience_uri, []):
+                    cases_by_uri.setdefault(case_uri, []).append((experience_uri, replacement_uri))
+
+        for case_uri, archive_targets in cases_by_uri.items():
+            try:
+                raw = await viking_fs.read_file(case_uri, ctx=ctx)
+                case_file = MemoryFileUtils.read(raw or "", uri=case_uri)
+                original_links = list(case_file.links or [])
+                retained_links: list[dict[str, Any]] = []
+                replacement_candidates: list[dict[str, Any]] = []
+                for link in original_links:
+                    target_uri = str(link.get("to_uri") or "")
+                    match = next(
+                        (
+                            (archived_uri, replacement_uri)
+                            for archived_uri, replacement_uri in archive_targets
+                            if target_uri == archived_uri
+                        ),
+                        None,
+                    )
+                    if match is None:
+                        retained_links.append(link)
+                        continue
+                    _, replacement_uri = match
+                    if not replacement_uri:
+                        continue
+                    remapped = dict(link)
+                    remapped["to_uri"] = replacement_uri
+                    try:
+                        replacement_links.append(StoredLink(**remapped))
+                        replacement_candidates.append(remapped)
+                    except Exception:
+                        tracer.error(
+                            f"Failed to remap archived Experience link: case={case_uri}, "
+                            f"replacement={replacement_uri}"
+                        )
+
+                case_updates[case_uri] = (
+                    case_file,
+                    original_links,
+                    retained_links,
+                    replacement_candidates,
+                )
+            except Exception as exc:
+                result.add_error(case_uri, exc)
+                tracer.error(f"Failed to unlink archived Experience from Case {case_uri}: {exc}")
+
+        updated_replacement_uris: set[str] = set()
+        if replacement_links:
+            replacement_files: dict[str, MemoryFile] = {}
+            replacement_errors: set[str] = set()
+            for replacement_uri in {link.to_uri for link in replacement_links if link.to_uri}:
+                try:
+                    replacement_file = result.files_by_uri.get(replacement_uri)
+                    if replacement_file is None:
+                        raw = await viking_fs.read_file(replacement_uri, ctx=ctx)
+                        replacement_file = MemoryFileUtils.read(raw or "", uri=replacement_uri)
+                    if experience_file_is_archived(
+                        replacement_file,
+                        uri=replacement_uri,
+                    ):
+                        raise ValueError("archive replacement Experience is archived")
+                    replacement_files[replacement_uri] = replacement_file
+                except Exception as exc:
+                    replacement_errors.add(replacement_uri)
+                    result.add_error(replacement_uri, exc)
+            valid_replacement_links = [
+                link
+                for link in replacement_links
+                if link.to_uri and link.to_uri not in replacement_errors
+            ]
+            updated_uris = await write_stored_links(
+                valid_replacement_links,
+                ctx,
+                viking_fs,
+                skip_uris=set(cases_by_uri),
+                lease_ref=lease_ref,
+                prefetched_files=replacement_files,
+            )
+            updated_replacement_uris = set(updated_uris)
+            for uri in updated_uris:
+                if uri not in result.edited_uris:
+                    result.add_edited(uri)
+            expected_replacement_uris = {
+                link.to_uri for link in valid_replacement_links if link.to_uri
+            }
+            for uri in sorted(expected_replacement_uris - updated_replacement_uris):
+                result.add_error(
+                    uri,
+                    RuntimeError("archived Experience replacement backlink could not be persisted"),
+                )
+
+        # Only expose a replacement URI from a Case after the replacement's
+        # backlink is durable.  A failed replacement write degrades to simply
+        # removing the archived URI, which is safe and retryable.
+        from openviking.session.memory.merge_op.link_merge import merge_links
+
+        for case_uri, (
+            case_file,
+            original_links,
+            retained_links,
+            replacement_candidates,
+        ) in case_updates.items():
+            final_links = [
+                *retained_links,
+                *[
+                    link
+                    for link in replacement_candidates
+                    if str(link.get("to_uri") or "") in updated_replacement_uris
+                ],
+            ]
+            if final_links == original_links:
+                continue
+            try:
+                case_file.links = merge_links([], final_links)
+                bump_memory_version(case_file)
+                await viking_fs.write_file(
+                    case_uri,
+                    MemoryFileUtils.write(
+                        case_file,
+                        content_template=(
+                            case_schema.content_template if case_schema is not None else None
+                        ),
+                    ),
+                    ctx=ctx,
+                    lease_ref=lease_ref,
+                )
+                if case_uri not in result.edited_uris:
+                    result.add_edited(case_uri)
+            except Exception as exc:
+                result.add_error(case_uri, exc)
+                tracer.error(f"Failed to unlink archived Experience from Case {case_uri}: {exc}")
+
     async def _vectorize_memories(
         self,
         result: MemoryUpdateResult,
@@ -1590,8 +1990,14 @@ class MemoryUpdater:
         # Also skip URIs that were deleted in the same batch
         uris_to_vectorize = []
         deleted_set = set(result.deleted_uris)
+        archived_set = set(result.archived_uris)
         for uri in result.written_uris + result.edited_uris:
-            if uri in deleted_set:
+            cached_file = result.files_by_uri.get(uri)
+            if (
+                uri in deleted_set
+                or uri in archived_set
+                or (cached_file is not None and experience_file_is_archived(cached_file, uri=uri))
+            ):
                 continue
             if not uri.endswith("/.overview.md") and not uri.endswith("/.abstract.md"):
                 uris_to_vectorize.append(uri)
@@ -1602,10 +2008,12 @@ class MemoryUpdater:
 
         for uri in uris_to_vectorize:
             try:
-                # Read the memory file to get content
-                content = await viking_fs.read_file(uri, ctx=ctx) or ""
-
-                mf = MemoryFileUtils.read(content, uri=uri)
+                cached_file = result.files_by_uri.get(uri)
+                if cached_file is not None:
+                    mf = cached_file.model_copy(deep=True)
+                else:
+                    content = await viking_fs.read_file(uri, ctx=ctx) or ""
+                    mf = MemoryFileUtils.read(content, uri=uri)
                 from openviking.session.memory.utils.link_renderer import LinkRenderer
 
                 abstract = LinkRenderer.strip_all_links(mf.content or "")

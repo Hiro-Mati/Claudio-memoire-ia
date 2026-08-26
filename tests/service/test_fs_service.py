@@ -9,6 +9,7 @@ import pytest
 
 from openviking.server.identity import RequestContext, Role
 from openviking.service.fs_service import FSService
+from openviking_cli.exceptions import NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -181,6 +182,38 @@ async def test_read_visible_preserves_non_memory_content(request_context):
         )
         == '<!-- MEMORY_FIELDS {"example":true} -->'
     )
+
+
+@pytest.mark.asyncio
+async def test_read_visible_rejects_archived_experience_without_second_read(
+    request_context,
+):
+    uri = "viking://user/ryoma/memories/experiences/retired.md"
+    raw = (
+        'archived body\n\n<!-- MEMORY_FIELDS {"memory_type":"experiences","status":"archived"} -->'
+    )
+    read_file = AsyncMock(return_value=raw)
+    service = FSService(viking_fs=SimpleNamespace(read_file=read_file))
+
+    with pytest.raises(NotFoundError, match="unavailable for Agent use"):
+        await service.read_visible(uri, ctx=request_context)
+
+    read_file.assert_awaited_once_with(uri, ctx=request_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["draft", "degraded"])
+async def test_read_visible_keeps_non_archived_experience_behavior(request_context, status):
+    uri = f"viking://user/ryoma/memories/experiences/{status}.md"
+    raw = (
+        f"{status} body\n\n<!-- MEMORY_FIELDS\n"
+        f'{{"memory_type":"experiences","status":"{status}"}}\n-->'
+    )
+    read_file = AsyncMock(return_value=raw)
+    service = FSService(viking_fs=SimpleNamespace(read_file=read_file))
+
+    assert await service.read_visible(uri, ctx=request_context) == f"{status} body"
+    read_file.assert_awaited_once_with(uri, ctx=request_context)
 
 
 @pytest.mark.asyncio

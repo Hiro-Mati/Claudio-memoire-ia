@@ -19,8 +19,13 @@ from openviking.privacy import (
 from openviking.resource.uri_mutation_coordinator import UriMutationCoordinator
 from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
+from openviking.session.memory.experience_lifecycle import (
+    experience_file_is_archived,
+    is_experience_memory_uri,
+)
 from openviking.session.memory.memory_updater import MemoryUpdater
 from openviking.session.memory.utils.content_visibility import visible_content
+from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.storage.content_write import ContentWriteCoordinator
 from openviking.storage.queuefs import SemanticMsg, get_queue_manager
 from openviking.storage.queuefs.semantic_msg import build_semantic_coalesce_key
@@ -33,7 +38,7 @@ from openviking.telemetry import get_current_telemetry
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.telemetry.resource_summary import build_queue_status_payload
 from openviking.utils.embedding_utils import vectorize_directory_meta
-from openviking_cli.exceptions import DeadlineExceededError, NotInitializedError
+from openviking_cli.exceptions import DeadlineExceededError, NotFoundError, NotInitializedError
 from openviking_cli.utils import VikingURI, get_logger
 
 logger = get_logger(__name__)
@@ -605,6 +610,10 @@ class FSService:
         if not classify_uri(uri).is_memory:
             return await self.read(uri, ctx=ctx, offset=offset, limit=limit)
         content = await self.read(uri, ctx=ctx)
+        if is_experience_memory_uri(uri):
+            memory_file = MemoryFileUtils.read(content, uri=uri)
+            if experience_file_is_archived(memory_file, uri=uri):
+                raise NotFoundError(f"Experience is archived and unavailable for Agent use: {uri}")
         return visible_content(content, uri=uri, offset=offset, limit=limit)
 
     async def abstract(self, uri: str, ctx: RequestContext) -> str:

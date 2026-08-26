@@ -28,6 +28,8 @@ from openviking.session.train.interfaces import (
     SemanticGradient,
 )
 
+_POLICY_VERSION_CONFLICT_MAX_REPLANS = 1
+
 
 @dataclass(slots=True)
 class PolicyTrainingEngine:
@@ -100,22 +102,32 @@ class PolicyTrainingEngine:
         gate_runner = _gate_runner_for_gradients(ctx, gradients)
         async with policy_set.lock() as transaction_handle:
             latest_policy_set = await policy_set.reload()
-            _prepare_optimization_context_for_gates(
-                ctx.optimization_context,
-                analyses=list(analyses or []),
-                gate_runner=gate_runner,
-            )
-            plan = await self.policy_optimizer.plan(
-                gradients,
-                latest_policy_set,
-                ctx.optimization_context,
-            )
-            apply_result = await self.policy_updater.apply(
-                plan,
-                latest_policy_set,
-                ctx.apply_context or latest_policy_set.request_context,
-                transaction_handle=transaction_handle,
-            )
+            for conflict_replan in range(_POLICY_VERSION_CONFLICT_MAX_REPLANS + 1):
+                _prepare_optimization_context_for_gates(
+                    ctx.optimization_context,
+                    analyses=list(analyses or []),
+                    gate_runner=gate_runner,
+                )
+                plan = await self.policy_optimizer.plan(
+                    gradients,
+                    latest_policy_set,
+                    ctx.optimization_context,
+                )
+                if conflict_replan:
+                    plan.metadata["version_conflict_replan"] = conflict_replan
+                apply_result = await self.policy_updater.apply(
+                    plan,
+                    latest_policy_set,
+                    ctx.apply_context or latest_policy_set.request_context,
+                    transaction_handle=transaction_handle,
+                )
+                if not bool(apply_result.metadata.get("version_conflict")):
+                    break
+                if conflict_replan >= _POLICY_VERSION_CONFLICT_MAX_REPLANS:
+                    break
+                # Discard the stale operation. Reload the latest full content
+                # and rerun semantic planning with the same evidence.
+                latest_policy_set = await latest_policy_set.reload()
         return plan, apply_result
 
 

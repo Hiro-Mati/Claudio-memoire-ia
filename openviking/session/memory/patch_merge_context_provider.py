@@ -28,6 +28,10 @@ _SYSTEM_HIDDEN_FIELDS = {
     "_case_source_ids",
     CASE_PENDING_SOURCES_FIELD,
     PROPOSED_CASE_IDENTITY_FIELD,
+    "archived_at",
+    "archive_reason",
+    "archive_replacement_uri",
+    "archived_case_uris",
 }
 _MAX_EXTRA_CANDIDATE_FILES = 10
 _MAX_CASE_EXTRA_CANDIDATE_FILES = 3

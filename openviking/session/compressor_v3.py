@@ -40,6 +40,10 @@ from openviking.session.memory.dataclass import (
     ResolvedOperations,
     StoredLink,
 )
+from openviking.session.memory.experience_lifecycle import (
+    experience_file_is_archived,
+    normalize_experience_status,
+)
 from openviking.session.memory.experience_validation import (
     build_memory_extraction_post_validation,
 )
@@ -1244,13 +1248,79 @@ class SessionCompressorV3:
         )
         if not links:
             return
-        await _render_case_links_from_template(
-            case_uri=case_uri,
-            links=links,
-            ctx=ctx,
-            viking_fs=viking_fs,
-        )
-        await write_stored_links(links, ctx, viking_fs, skip_uris={case_uri})
+        endpoint_uris = {uri for link in links for uri in (link.from_uri, link.to_uri) if uri}
+        lease = None
+        pathlock_client = getattr(viking_fs, "_async_agfs", None)
+        uri_to_path = getattr(viking_fs, "_uri_to_path", None)
+        if pathlock_client is not None and uri_to_path is not None:
+            lease = await pathlock_client.pathlock_acquire_exact_batch(
+                sorted(uri_to_path(uri, ctx=ctx) for uri in endpoint_uris)
+            )
+        try:
+            # Archive may win after policy apply but before Case provenance is
+            # written.  Validate each Experience under the same endpoint lock
+            # and reuse that read when writing backlinks.
+            prefetched_experiences: dict[str, MemoryFile] = {}
+            visible_links: list[StoredLink] = []
+            for link in links:
+                target_uri = str(link.to_uri or "")
+                if "/memories/experiences/" not in target_uri:
+                    visible_links.append(link)
+                    continue
+                memory_file = prefetched_experiences.get(target_uri)
+                if memory_file is None:
+                    try:
+                        raw = await viking_fs.read_file(target_uri, ctx=ctx)
+                        memory_file = MemoryFileUtils.read(raw or "", uri=target_uri)
+                    except Exception as exc:
+                        tracer.error(
+                            f"Skip Case link because Experience could not be verified: "
+                            f"uri={target_uri}, error={exc}"
+                        )
+                        continue
+                    prefetched_experiences[target_uri] = memory_file
+                if not experience_file_is_archived(memory_file, uri=target_uri):
+                    visible_links.append(link)
+
+            if not visible_links:
+                return
+            # Persist target backlinks first.  If an endpoint write fails, do
+            # not expose a forward URI from the Case that an archive operation
+            # could never discover through the Experience's backlinks.
+            updated_endpoint_uris = await write_stored_links(
+                visible_links,
+                ctx,
+                viking_fs,
+                skip_uris={case_uri},
+                lease_ref=lease,
+                prefetched_files=prefetched_experiences,
+            )
+            required_experience_uris = {
+                link.to_uri
+                for link in visible_links
+                if link.to_uri and "/memories/experiences/" in link.to_uri
+            }
+            missing_experience_uris = required_experience_uris - set(updated_endpoint_uris)
+            if missing_experience_uris:
+                tracer.error(
+                    "Drop Case-to-Experience provenance because target backlinks failed: "
+                    f"case={case_uri}, targets={sorted(missing_experience_uris)}"
+                )
+                visible_links = [
+                    link for link in visible_links if link.to_uri not in missing_experience_uris
+                ]
+            if not visible_links:
+                return
+            await _render_case_links_from_template(
+                case_uri=case_uri,
+                links=visible_links,
+                ctx=ctx,
+                viking_fs=viking_fs,
+                lease_ref=lease,
+            )
+        finally:
+            if lease is not None:
+                await pathlock_client.pathlock_release(lease)
 
     async def _write_final_memory_diff(
         self,
@@ -1621,6 +1691,8 @@ def _operations_to_cases(operations: ResolvedOperations) -> list[Case]:
         if case is not None:
             cases.append(case)
     return cases
+
+
 async def _canonical_cases_from_update_result(
     *,
     operations: ResolvedOperations,
@@ -1989,6 +2061,8 @@ def _case_experience_links_via_trajectories(
         uri = _experience_plan_item_uri(item, root_uri)
         if uri not in touched:
             continue
+        if _applied_experience_is_archived(apply_result, uri):
+            continue
         if uri in seen:
             continue
         seen.add(uri)
@@ -2001,6 +2075,17 @@ def _case_experience_links_via_trajectories(
             )
         )
     return result
+
+
+def _applied_experience_is_archived(
+    apply_result: PolicyApplyResult,
+    uri: str,
+) -> bool:
+    policy_set = getattr(apply_result, "updated_policy_set", None)
+    for policy in getattr(policy_set, "policies", []) or []:
+        if str(getattr(policy, "uri", "") or "") == uri:
+            return normalize_experience_status(getattr(policy, "status", None)) == "archived"
+    return False
 
 
 def _plan_item_has_source_trajectory(item: PolicyPlanItem, trajectory_uris: set[str]) -> bool:
@@ -2145,11 +2230,16 @@ async def _render_case_links_from_template(
     links: list[StoredLink],
     ctx: RequestContext,
     viking_fs: Any,
+    lease_ref: Any = None,
 ) -> None:
     if not links:
         return
-    lock_path = viking_fs._uri_to_path(case_uri, ctx=ctx)
-    lock_lease = await viking_fs._async_agfs.pathlock_acquire_exact_batch([lock_path])
+    lock_lease = lease_ref
+    owns_lease = False
+    if lock_lease is None:
+        lock_path = viking_fs._uri_to_path(case_uri, ctx=ctx)
+        lock_lease = await viking_fs._async_agfs.pathlock_acquire_exact_batch([lock_path])
+        owns_lease = True
     try:
         try:
             raw = await viking_fs.read_file(case_uri, ctx=ctx)
@@ -2175,7 +2265,8 @@ async def _render_case_links_from_template(
             lease_ref=lock_lease,
         )
     finally:
-        await viking_fs._async_agfs.pathlock_release(lock_lease)
+        if owns_lease:
+            await viking_fs._async_agfs.pathlock_release(lock_lease)
 
 
 def _retain_case_links(links: list[dict[str, Any]]) -> list[dict[str, Any]]:
