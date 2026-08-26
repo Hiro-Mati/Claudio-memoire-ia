@@ -131,6 +131,35 @@ def _parse_semantic_work(data: Dict[str, Any]) -> SemanticWork:
     )
 
 
+def _recover_keyed_batch_contributions(data: Optional[Dict[str, Any]]) -> tuple[SemanticMsg, ...]:
+    """Best-effort decode batch members solely for terminal failure accounting."""
+
+    if not isinstance(data, dict):
+        return ()
+    try:
+        payload = json.loads(data["data"]) if isinstance(data.get("data"), str) else data
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return ()
+    if not isinstance(payload, dict):
+        return ()
+    wrapper = payload.get("_queuefs_keyed_batch")
+    if not isinstance(wrapper, dict):
+        return ()
+    encoded_contributions = wrapper.get("contributions")
+    if not isinstance(encoded_contributions, list):
+        return ()
+
+    contributions = []
+    for encoded in encoded_contributions:
+        if not isinstance(encoded, str):
+            continue
+        try:
+            contributions.append(SemanticMsg.from_json(encoded))
+        except Exception:
+            continue
+    return tuple(contributions)
+
+
 def _log_keyed_batch_event(event: str, data: Dict[str, Any], work: SemanticWork) -> None:
     diagnostic = get_keyed_batch_diagnostic() or diagnostic_from_queue_data(data)
     if diagnostic is None:
@@ -290,16 +319,29 @@ class SemanticProcessor(DequeueHandlerBase):
         if work.is_keyed_batch:
             _log_keyed_batch_event("semantic.keyed_batch_completed", data, work)
 
-    def _mark_work_failed(self, work: SemanticWork, error: Exception) -> None:
+    def _mark_contributions_failed(
+        self,
+        contributions: tuple[SemanticMsg, ...],
+        error: Exception,
+        *,
+        is_keyed_batch: bool,
+    ) -> None:
         tracker = get_request_wait_tracker()
-        message = bounded_error_class(error) if work.is_keyed_batch else str(error)
-        for contribution in work.contributions:
+        message = bounded_error_class(error) if is_keyed_batch else str(error)
+        for contribution in contributions:
             self._merge_request_stats(contribution.telemetry_id, error_count=1)
             tracker.mark_semantic_failed(
                 contribution.telemetry_id,
                 contribution.id,
                 message,
             )
+
+    def _mark_work_failed(self, work: SemanticWork, error: Exception) -> None:
+        self._mark_contributions_failed(
+            work.contributions,
+            error,
+            is_keyed_batch=work.is_keyed_batch,
+        )
 
     def _report_processing_error(
         self,
@@ -606,6 +648,14 @@ class SemanticProcessor(DequeueHandlerBase):
         except QueueMessageRetry:
             raise
         except Exception as e:
+            if work is None:
+                recovered = _recover_keyed_batch_contributions(data)
+                if recovered:
+                    self._mark_contributions_failed(
+                        recovered,
+                        e,
+                        is_keyed_batch=True,
+                    )
             if isinstance(e, LockAcquisitionError):
                 logger.warning(
                     "Lock error processing semantic message, retrying without "

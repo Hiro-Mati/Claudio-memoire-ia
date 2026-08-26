@@ -527,18 +527,25 @@ impl FileSystem for QueueFileSystem {
             }
             "ack" => {
                 let msg_id = String::from_utf8_lossy(data).trim().to_string();
-                backend.ack(&queue_name, &msg_id)?;
+                if !backend.ack(&queue_name, &msg_id)? {
+                    return Err(Error::InvalidOperation(
+                        "ack did not settle a processing message".to_string(),
+                    ));
+                }
                 Ok(0)
             }
             "requeue" => {
                 let msg_id = String::from_utf8_lossy(data).trim().to_string();
-                if backend.requeue(&queue_name, &msg_id)? {
-                    tracing::debug!(
-                        event = "queuefs.message_requeued",
-                        queue = queue_name,
-                        reason = "explicit_retry",
-                    );
+                if !backend.requeue(&queue_name, &msg_id)? {
+                    return Err(Error::InvalidOperation(
+                        "requeue did not settle a processing message".to_string(),
+                    ));
                 }
+                tracing::debug!(
+                    event = "queuefs.message_requeued",
+                    queue = queue_name,
+                    reason = "explicit_retry",
+                );
                 Ok(0)
             }
             _ => Err(Error::InvalidOperation(format!(
