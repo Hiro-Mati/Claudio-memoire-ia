@@ -125,14 +125,14 @@ def _make_tracked_commit(behavior="instant", result_overrides=None, gate=None, s
 # ── Commit returns task_id ──
 
 
-async def test_commit_with_no_wait_returns_task_id(api_client):
-    """wait=false preserves the asynchronous accepted response."""
+async def test_commit_defaults_to_accepted_task_response(api_client):
+    """Omitting wait preserves the asynchronous commit contract."""
     client, service = api_client
     session_id = await _new_session_with_message(client)
 
     service.sessions.commit_async = _make_tracked_commit()
 
-    resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
+    resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
     assert resp.status_code == 200
     body = resp.json()
     assert body["result"]["status"] == "accepted"
@@ -151,7 +151,7 @@ async def test_commit_waits_for_its_own_task_and_returns_final_result(api_client
         result_overrides={"memories_extracted": {"event": 2}}
     )
 
-    resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": True})
 
     assert resp.status_code == 200
     result = resp.json()["result"]
@@ -178,7 +178,7 @@ async def test_commit_wait_does_not_wait_for_another_commit_task(api_client):
     await asyncio.wait_for(started.wait(), timeout=2.0)
 
     service.sessions.commit_async = _make_tracked_commit()
-    resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": True})
 
     assert resp.status_code == 200
     assert resp.json()["result"]["status"] == "completed"
@@ -203,7 +203,7 @@ async def test_commit_wait_timeout_leaves_its_task_running(api_client):
 
     resp = await client.post(
         f"/api/v1/sessions/{session_id}/commit",
-        json={"timeout": 0.01},
+        json={"wait": True, "timeout": 0.01},
     )
 
     assert resp.status_code == 504

@@ -1392,6 +1392,8 @@ curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/used \
 |------|------|------|--------|------|
 | session_id | str | 是 | - | 要提交的会话 ID |
 | keep_recent_count | int | 否 | 0 | 提交后保留为 live 状态的最近消息数 (保持 live, 不归档)。`0` (默认) 归档全部消息。 |
+| wait | bool | 否 | false | 是否等待本次 commit 创建的任务完成。 |
+| timeout | float | 否 | - | `wait=true` 时服务端最多等待的秒数。 |
 
 有效策略按 Session `.meta.json`、最新 `settings/user_config.json`、内核默认值的
 顺序解析。Phase 2 开始前会将完整有效策略固化到异步任务。
@@ -1405,7 +1407,7 @@ POST /api/v1/sessions/{session_id}/commit
 ```
 
 ```bash
-# 提交会话（立即返回）
+# 异步提交会话（默认行为）
 curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/commit \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key"
@@ -1413,6 +1415,15 @@ curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/commit \
 # 查询任务状态
 curl -X GET http://localhost:1933/api/v1/tasks/{task_id} \
   -H "X-API-Key: your-key"
+```
+
+如需只等待本次 commit 创建的任务，传入 `wait=true`。`timeout` 限制服务端等待时间；超时会返回带任务 ID 和轮询地址的 `DEADLINE_EXCEEDED`，任务本身仍会继续运行。
+
+```bash
+curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/commit \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{"wait": true, "timeout": 300}'
 ```
 
 **Python SDK**
@@ -1423,7 +1434,7 @@ from openviking_sdk import AsyncHTTPClient
 client = AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
 await client.initialize()
 
-# commit 立即返回 task_id，后台异步执行摘要生成和记忆提取
+# 默认 commit 立即返回 task_id，后台异步执行摘要生成和记忆提取
 result = await client.commit_session(session_id="a1b2c3d4")
 print(f"Status: {result['status']}")
 print(f"Task ID: {result['task_id']}")
@@ -1436,6 +1447,8 @@ if task["status"] == "completed":
     print(f"Memories extracted: {total}")
 ```
 
+传入 `options={"wait": True, "timeout": 300}` 可等待本次 commit 创建的任务完成。
+
 **TypeScript SDK**
 
 ```typescript
@@ -1447,6 +1460,7 @@ console.log(await client.commitSession("session-id"));
 ```go
 commit, err := client.CommitSession(ctx, "a1b2c3d4", &openviking.CommitSessionOptions{
     KeepRecentCount: 0,
+    // 设置 Wait: openviking.Bool(true) 可等待本次 commit 任务。
 })
 if err != nil {
     return err

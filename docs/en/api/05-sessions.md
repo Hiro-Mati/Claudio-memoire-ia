@@ -1421,6 +1421,8 @@ Commit a session. Message archiving (Phase 1) completes immediately. Summary gen
 |-----------|------|----------|---------|-------------|
 | session_id | str | Yes | - | Session ID to commit |
 | keep_recent_count | int | No | 0 | Number of recent live messages to retain (kept live, not archived) after commit. `0` (default) archives all messages. |
+| wait | bool | No | false | Wait for the task created by this commit to finish. |
+| timeout | float | No | - | Maximum seconds to wait when `wait=true`. |
 
 The effective policy is resolved in this order: Session `.meta.json`, latest
 `settings/user_config.json`, then the kernel default. The fully resolved policy
@@ -1435,7 +1437,7 @@ POST /api/v1/sessions/{session_id}/commit
 ```
 
 ```bash
-# Commit session (returns immediately)
+# Commit session asynchronously (the default)
 curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/commit \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key"
@@ -1443,6 +1445,17 @@ curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/commit \
 # Poll task status
 curl -X GET http://localhost:1933/api/v1/tasks/{task_id} \
   -H "X-API-Key: your-key"
+```
+
+To wait for the task created by this commit only, set `wait=true`. `timeout`
+limits the server-side wait; a timeout returns `DEADLINE_EXCEEDED` with the
+task ID and polling URL, while the task continues running.
+
+```bash
+curl -X POST http://localhost:1933/api/v1/sessions/a1b2c3d4/commit \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{"wait": true, "timeout": 300}'
 ```
 
 **Python SDK**
@@ -1453,7 +1466,7 @@ import openviking as ov
 client = ov.AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
 await client.initialize()
 
-# Commit returns immediately with task_id; summary + memory extraction runs in background
+# The default returns immediately with task_id; summary + memory extraction runs in background
 result = await client.commit_session(session_id="a1b2c3d4")
 print(f"Status: {result['status']}")
 print(f"Task ID: {result['task_id']}")
@@ -1466,6 +1479,9 @@ if task["status"] == "completed":
     print(f"Memories extracted: {total}")
 ```
 
+Pass `options={"wait": True, "timeout": 300}` to wait for the task created
+by this commit.
+
 **TypeScript SDK**
 
 ```typescript
@@ -1477,6 +1493,7 @@ console.log(await client.commitSession("session-id"));
 ```go
 commit, err := client.CommitSession(ctx, "a1b2c3d4", &openviking.CommitSessionOptions{
     KeepRecentCount: 0,
+    // Set Wait: openviking.Bool(true) to wait for this commit task.
 })
 if err != nil {
     return err

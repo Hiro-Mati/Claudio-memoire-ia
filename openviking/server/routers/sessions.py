@@ -610,10 +610,10 @@ class CommitRequest(BaseModel):
         ),
     )
     wait: bool = Field(
-        default=True,
+        default=False,
         description=(
-            "Wait for this commit task to finish. Set false to return after the "
-            "archive has been persisted and the background task has been queued."
+            "Wait for this commit task to finish. Defaults to false and returns "
+            "after the archive has been persisted and the background task queued."
         ),
     )
     timeout: Optional[float] = Field(
@@ -733,9 +733,9 @@ async def commit_session(
 ):
     """Commit a session (archive and extract memories).
 
-    Archive (Phase 1) completes before returning.  Memory extraction
-    (Phase 2) runs in the background.  A ``task_id`` is returned for
-    polling progress via ``GET /tasks/{task_id}``.
+    Archive (Phase 1) completes before returning. Memory extraction
+    (Phase 2) runs in the background unless ``wait=true``. The asynchronous
+    response includes a ``task_id`` for polling via ``GET /tasks/{task_id}``.
     """
     service = get_service()
     commit_kwargs: Dict[str, Any] = {"keep_recent_count": body.keep_recent_count}
