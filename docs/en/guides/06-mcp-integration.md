@@ -129,14 +129,13 @@ If you already have HTTPS configured, just connect to `https://your-server.com/m
 
 ## Available MCP Tools
 
-Once connected, OpenViking exposes 16 tools:
+Once connected, OpenViking exposes 15 tools:
 
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
 | `find` | Fast semantic retrieval without session context | `query`, `target_uri` (optional), `limit`, `min_score`, `level` (optional), `context_type` (optional) |
-| `search` | Deep semantic retrieval with optional session context and intent analysis | `query`, `target_uri` (optional), `session_id` (optional), `limit`, `min_score`, `level` (optional), `context_type` (optional) |
-| `recall` | Type-quota recall assembled server-side into flat `<memory>` blocks that always carry their URI | `query`, `quotas` (optional), `max_chars`, `min_score`, `peer_scope`, `other_peer_penalty` (optional), `session_id` (optional), `detail` (optional), `max_tokens` (optional), `rewrite` (optional) |
-| `read` | Read one or more `viking://` URIs | `uris` (single string or array) |
+| `search` | Deep semantic retrieval; `mode="context"` assembles injection-ready context and replaces the former `recall` tool | `query`, `mode` (`list` or `context`), `target_uri` (list mode only), `session_id` (optional), `limit`, `min_score`, `level` (list mode), `context_type` (optional), plus context-mode `quotas`, `purpose`, `max_tokens`, `detail` or `detail_by_category`, `dedup_turns`, `exclude_uris`, `peer_scope`, scalar `other_peer_penalty` or `other_peer_penalties` by category, and `rewrite` (`off` or `auto`) |
+| `read` | Read one or more `viking://` URIs. PNG, JPEG, GIF, and WebP return native MCP image content; WAV, MP3, FLAC, OGG, and M4A return native audio content. Video is not supported because MCP has no standard video content block | `uris` (single string or array) |
 | `list` | List entries under a `viking://` directory | `uri`, `recursive` (optional) |
 | `tree` | Show the recursive directory tree under a `viking://` URI, indented by depth — use when you need a full picture of the file tree (prefer `list` for a single level, `glob` for filename patterns) | `uri` (optional), `level_limit` (default 3), `node_limit` (default 1000), `include_abstract` (optional — also show each file's summary) |
 | `remember` | Store messages into long-term memory (triggers extraction) | `messages` (list of `{role, content}`) |
@@ -150,11 +149,17 @@ Once connected, OpenViking exposes 16 tools:
 | `forget` | Delete any `viking://` URI (use `search` to find it first; pass `recursive=true` to delete a directory) | `uri`, `recursive` (optional) |
 | `health` | Check OpenViking service health | none |
 
-For MCP tools, `viking://user` is the authenticated user's workspace. For example,
-`viking://user/notes/todo.md` resolves to
-`viking://user/<current-user>/notes/todo.md`, regardless of the file name or
-extension. Canonical URIs containing that exact current user id are also accepted;
-MCP does not use this shorthand for cross-user access.
+To address your own workspace from an MCP tool, use the home alias `viking://~`. It
+expands to `viking://user/<current-user>` on every control plane (REST API, `ov` CLI,
+SDKs, and MCP alike), so `viking://~/notes/todo.md` resolves to
+`viking://user/<current-user>/notes/todo.md`. Responses always echo the expanded
+canonical URI, and those canonical URIs are accepted as tool input as well.
+
+The uid-less spelling `viking://user/<segment>/...` (`memories`, `resources`, `skills`,
+`peers`, `privacy`, `sessions`) is no longer accepted; such calls fail with an error that
+points at the `viking://~/...` replacement. `viking://user` on its own is the container of
+user spaces, not a shortcut to yours. See
+[Viking URI](../concepts/04-viking-uri.md) for details.
 
 > **Note**: MCP exposes the minimum closure for watch management (`list_watches` + `cancel_watch`). Pause / resume / trigger and the unified `update` verb are intentionally not exposed here — use the REST `/api/v1/watches/*` endpoints or the `ov task watch` CLI for those operations.
 

@@ -27,7 +27,7 @@ const packagedExperienceSkillPath = join(pluginDir, "skills", "ov-experience-mem
 
 const PLUGIN_NAME = "openviking-memory";
 const REAL_MCP_TOOLS = [
-  "find", "search", "recall", "read", "list", "tree", "remember", "write", "edit",
+  "find", "search", "read", "list", "tree", "remember", "write", "edit",
   "add_resource", "list_watches", "cancel_watch", "grep", "glob", "forget", "health",
 ];
 const LEGACY_TOOL_NAMES = ["openviking_recall", "openviking_store", "openviking_forget", "openviking_health"];
@@ -180,7 +180,7 @@ test("Codex MCP entrypoint forwards only native OpenViking tools", () => {
 test("canonical MCP tool list matches server registrations", () => {
   const source = readFileSync(mcpEndpointPath, "utf-8");
   const registered = [
-    ...source.matchAll(/@mcp\.tool\((?:name="([a-z_]+)")?\)\s*\nasync def ([a-z_]+)\(/g),
-  ].map((match) => match[1] || match[2]);
+    ...source.matchAll(/@mcp\.tool\(([^)]*)\)\s*\nasync def ([a-z_]+)\(/g),
+  ].map((match) => match[1].match(/(?:^|,\s*)name="([a-z_]+)"/)?.[1] || match[2]);
   assert.deepEqual(registered, REAL_MCP_TOOLS);
 });

@@ -121,14 +121,13 @@ claude mcp add --transport http openviking \
 
 ## 可用的 MCP 工具
 
-连接后，OpenViking MCP 端点暴露 16 个工具：
+连接后，OpenViking MCP 端点暴露 15 个工具：
 
 | 工具 | 说明 | 主要参数 |
 |------|------|----------|
 | `find` | 无 session 上下文的快速语义检索 | `query`, `target_uri`(可选), `limit`, `min_score`, `level`(可选), `context_type`(可选) |
-| `search` | 支持可选 session 上下文和意图分析的深度语义检索 | `query`, `target_uri`(可选), `session_id`(可选), `limit`, `min_score`, `level`(可选), `context_type`(可选) |
-| `recall` | 按记忆类别配额召回，服务端组装为带 URI 的扁平 `<memory>` 块 | `query`, `quotas`(可选), `max_chars`, `min_score`, `peer_scope`, `other_peer_penalty`(可选), `session_id`(可选), `detail`(可选), `max_tokens`(可选), `rewrite`(可选) |
-| `read` | 读取一个或多个 `viking://` URI 的内容 | `uris`（单个字符串或数组） |
+| `search` | 深度语义检索；`mode="context"` 组装可直接注入的上下文，并替代原 `recall` 工具 | `query`, `mode`（`list` 或 `context`）, `target_uri`（仅 list 模式）, `session_id`(可选), `limit`, `min_score`, `level`（list 模式）, `context_type`(可选)，以及 context 模式的 `quotas`, `purpose`, `max_tokens`, `detail` 或 `detail_by_category`, `dedup_turns`, `exclude_uris`, `peer_scope`, 标量 `other_peer_penalty` 或按类别设置的 `other_peer_penalties`, `rewrite`（`off` 或 `auto`） |
+| `read` | 读取一个或多个 `viking://` URI 的内容。PNG、JPEG、GIF、WebP 返回 MCP 原生图片内容；WAV、MP3、FLAC、OGG、M4A 返回原生音频内容。MCP 没有标准视频内容块，因此暂不支持视频 | `uris`（单个字符串或数组） |
 | `list` | 列出 `viking://` 目录下的条目 | `uri`, `recursive`(可选) |
 | `tree` | 以缩进形式展示 `viking://` URI 下的递归目录树——当需要全面了解文件树结构时使用（单层列表用 `list`，按文件名查找用 `glob`） | `uri`(可选), `level_limit`(默认 3), `node_limit`(默认 1000), `include_abstract`(可选——同时展示每个文件的摘要) |
 | `remember` | 存储消息到长期记忆（触发记忆提取） | `messages`（`{role, content}` 列表） |
@@ -142,10 +141,15 @@ claude mcp add --transport http openviking \
 | `forget` | 删除任意 `viking://` URI（先用 `search` 查找；删除目录需 `recursive=true`） | `uri`, `recursive`(可选) |
 | `health` | 检查 OpenViking 服务健康状态 | 无 |
 
-在 MCP 工具中，`viking://user` 表示当前认证用户的工作区。例如，
-`viking://user/notes/todo.md` 会解析成
-`viking://user/<当前用户>/notes/todo.md`，不依赖文件名或扩展名判断。工具返回的、
-包含当前用户 ID 的 canonical URI 也可以直接使用；这套简写不用于跨用户访问。
+在 MCP 工具中访问自己的工作区，请使用家目录别名 `viking://~`。它在所有控制面
+（REST API、`ov` CLI、SDK 和 MCP）上都会展开为 `viking://user/<当前用户>`，因此
+`viking://~/notes/todo.md` 会解析成 `viking://user/<当前用户>/notes/todo.md`。
+响应始终回显展开后的 canonical URI，这些 canonical URI 也可以直接作为工具入参使用。
+
+无 uid 的写法 `viking://user/<segment>/...`（`memories`、`resources`、`skills`、`peers`、
+`privacy`、`sessions`）不再被接受，这类调用会报错并提示改用 `viking://~/...`。
+`viking://user` 本身是所有用户空间的容器，而不是自己空间的快捷方式。详见
+[Viking URI](../concepts/04-viking-uri.md)。
 
 > **注**：MCP 仅暴露 watch 管理的最小闭包（`list_watches` + `cancel_watch`）。pause / resume / trigger 和统一的 `update` 动作刻意不在此处暴露，请通过 REST `/api/v1/watches/*` 接口或 `ov task watch` CLI 使用上述操作。
 

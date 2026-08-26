@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional
 from uuid import uuid4
 
+from openviking.core.context import ContextLevel
 from openviking.core.namespace import canonical_session_uri
 from openviking.core.peer_id import normalize_peer_id, safe_peer_id
 from openviking.message import Message, Part
@@ -44,6 +45,7 @@ from openviking.session.tool_result_synopsis import (
     ToolResultSynopsis,
     generate_tool_result_synopsis,
 )
+from openviking.storage.abstract_overview import body_for_preview, render_abstract_overview
 from openviking.telemetry import get_current_telemetry, tracer
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.model_retry import is_retryable_api_error, retry_async
@@ -63,6 +65,9 @@ if TYPE_CHECKING:
     from openviking.storage.queuefs.session_commit_msg import SessionCommitMsg
     from openviking.storage.viking_fs import VikingFS
     from openviking.usage_reporter import UsageReporter
+
+MemoryPolicyData = Optional[Dict[str, Any]]
+MemoryPolicyProvider = Callable[[], Awaitable[MemoryPolicyData]]
 
 logger = get_logger(__name__)
 
@@ -199,6 +204,7 @@ def _message_peer_ids(messages: List[Message]) -> set[str]:
 @dataclass(frozen=True)
 class _MemoryExtractionScope:
     allow_self_memory: bool
+    peer_memory_enabled: bool
     allowed_peer_ids: set[str]
     include_session_skills: bool
     memory_types: Optional[set[str]]
@@ -216,6 +222,7 @@ def _resolve_memory_extraction_scope(
 
     return _MemoryExtractionScope(
         allow_self_memory=allow_self_memory,
+        peer_memory_enabled=policy.peer_enabled,
         allowed_peer_ids=allowed_peer_ids,
         include_session_skills=config_session_skill_extraction_enabled and allow_self_memory,
         memory_types=policy.memory_types,
@@ -621,6 +628,7 @@ class Session:
         agent_evolution_enabled: bool = True,
         usage_reporter: Optional["UsageReporter"] = None,
         agent_evolution_enabled_provider: Optional[Callable[[], bool | Awaitable[bool]]] = None,
+        memory_policy_provider: Optional[MemoryPolicyProvider] = None,
     ):
         self._viking_fs = viking_fs
         self._vikingdb_manager = vikingdb_manager
@@ -653,7 +661,16 @@ class Session:
         )
         self._agent_evolution_enabled = agent_evolution_enabled
         self._agent_evolution_enabled_provider = agent_evolution_enabled_provider
+        self._memory_policy_provider = memory_policy_provider
         self._usage_reporter = usage_reporter
+
+    async def _resolve_memory_policy(
+        self, override: Optional[Dict[str, Any]] = None
+    ) -> MemoryPolicy:
+        policy = override if override is not None else self._meta.memory_policy
+        if policy is None and self._memory_policy_provider is not None:
+            policy = await self._memory_policy_provider()
+        return MemoryPolicy.from_dict(policy)
 
     async def load(self):
         """Load session data from storage."""
@@ -839,9 +856,7 @@ class Session:
         update_auto_commit_policy: bool = False,
     ) -> None:
         """Update mutable session config without overwriting concurrent meta changes."""
-        update_auto_commit_policy = (
-            update_auto_commit_policy or auto_commit_policy is not None
-        )
+        update_auto_commit_policy = update_auto_commit_policy or auto_commit_policy is not None
         session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
         lease = await self._viking_fs._async_agfs.pathlock_acquire_tree(
             session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
@@ -1908,10 +1923,6 @@ class Session:
         if turn_mode and effective_token_budget <= 0:
             raise ValueError("retained_message_token_budget must be greater than 0")
         in_memory_default_memory_policy = self._meta.memory_policy
-        effective_policy = MemoryPolicy.from_dict(
-            memory_policy if memory_policy is not None else self._meta.memory_policy
-        )
-        _validate_memory_policy_types(effective_policy)
         agent_evolution_enabled = self._agent_evolution_enabled
         if self._agent_evolution_enabled_provider is not None:
             provided_enabled = self._agent_evolution_enabled_provider()
@@ -1920,16 +1931,19 @@ class Session:
                 if inspect.isawaitable(provided_enabled)
                 else provided_enabled
             )
-        effective_policy = _apply_agent_evolution_setting(
-            effective_policy,
-            agent_evolution_enabled=agent_evolution_enabled,
-        )
-        effective_memory_policy = effective_policy.to_dict()
-        effective_memory_types = sorted(_effective_memory_types(effective_policy))
-        agent_memory_skip_reason = _agent_memory_skip_reason(
-            agent_evolution_enabled=agent_evolution_enabled,
-            effective_memory_types=set(effective_memory_types),
-        )
+        if memory_policy is not None:
+            effective_policy = await self._resolve_memory_policy(memory_policy)
+            _validate_memory_policy_types(effective_policy)
+            effective_policy = _apply_agent_evolution_setting(
+                effective_policy,
+                agent_evolution_enabled=agent_evolution_enabled,
+            )
+            effective_memory_policy = effective_policy.to_dict()
+            effective_memory_types = sorted(_effective_memory_types(effective_policy))
+            agent_memory_skip_reason = _agent_memory_skip_reason(
+                agent_evolution_enabled=agent_evolution_enabled,
+                effective_memory_types=set(effective_memory_types),
+            )
         logger.info(
             f"[TRACER] session_commit started, trace_id={trace_id}, "
             f"keep_recent_count={keep_recent_count}, retention_mode={retention_mode}, "
@@ -1989,7 +2003,7 @@ class Session:
             # messages being archived, unless this commit supplied an explicit
             # override.
             if memory_policy is None:
-                effective_policy = MemoryPolicy.from_dict(self._meta.memory_policy)
+                effective_policy = await self._resolve_memory_policy()
                 _validate_memory_policy_types(effective_policy)
                 effective_policy = _apply_agent_evolution_setting(
                     effective_policy,
@@ -2421,7 +2435,7 @@ class Session:
         record_auto_commit_success: bool = False,
         event_search_tags: Optional[List[str]] = None,
     ) -> None:
-        """Phase 2: Extract memories, write relations, enqueue — runs in background."""
+        """Phase 2: Extract memories and enqueue semantic work in the background."""
         from openviking.service.task_tracker import get_task_tracker
         from openviking.telemetry import OperationTelemetry, bind_telemetry
         from openviking.telemetry.registry import register_telemetry, unregister_telemetry
@@ -2432,6 +2446,7 @@ class Session:
         memories_extracted: Dict[str, int] = {}
         usage_events_extracted = 0
         extracted_skill_results: list[dict] = []
+        skipped_memory_operations: list[dict[str, Any]] = []
         active_count_updated = 0
         memory_diff_uri: Optional[str] = None
         completed_memory_steps: Dict[str, set[str]] = {}
@@ -2526,12 +2541,32 @@ class Session:
                             abstract = self._extract_abstract_from_summary(summary)
                             await self._viking_fs.write_file(
                                 uri=f"{archive_uri}/.abstract.md",
-                                content=abstract,
+                                content=render_abstract_overview(
+                                    ContextLevel.ABSTRACT,
+                                    archive_uri,
+                                    abstract,
+                                    {
+                                        "generated_by": {
+                                            "component": "Session",
+                                            "trigger": "archive_summary",
+                                        }
+                                    },
+                                ),
                                 ctx=self.ctx,
                             )
                             await self._viking_fs.write_file(
                                 uri=f"{archive_uri}/.overview.md",
-                                content=summary,
+                                content=render_abstract_overview(
+                                    ContextLevel.OVERVIEW,
+                                    archive_uri,
+                                    summary,
+                                    {
+                                        "generated_by": {
+                                            "component": "Session",
+                                            "trigger": "archive_summary",
+                                        }
+                                    },
+                                ),
                                 ctx=self.ctx,
                             )
                             await self._merge_archive_meta(
@@ -2599,6 +2634,7 @@ class Session:
                         ),
                     )
                     self_memory_enabled = extraction_scope.allow_self_memory
+                    peer_memory_enabled = extraction_scope.peer_memory_enabled
                     allowed_peer_ids = extraction_scope.allowed_peer_ids
                     long_term_memory_types = extraction_scope.memory_types
 
@@ -2646,6 +2682,7 @@ class Session:
                                     allowed_memory_types=long_term_memory_types,
                                     agent_evolution_enabled=agent_evolution_enabled,
                                     allow_self_memory=self_memory_enabled,
+                                    peer_memory_enabled=peer_memory_enabled,
                                     allowed_peer_ids=allowed_peer_ids,
                                     event_search_tags=event_search_tags,
                                     extraction_context_policy=(
@@ -2685,14 +2722,6 @@ class Session:
 
                         if extraction_error is not None:
                             raise extraction_error
-
-                        if long_term_has_work and self._viking_fs:
-                            candidate_memory_diff_uri = f"{archive_uri}/memory_diff.json"
-                            if await self._viking_fs.exists(
-                                candidate_memory_diff_uri,
-                                ctx=self.ctx,
-                            ):
-                                memory_diff_uri = candidate_memory_diff_uri
 
                         total_extracted = 0
                         for label, result in zip(extraction_labels, _results, strict=True):
@@ -2737,15 +2766,34 @@ class Session:
                         else:
                             await _run_archive_summary()
 
-                    # Write relations (using snapshot, not self._usage_records)
-                    if self._viking_fs:
-                        for usage in usage_records:
+                    # A recovered Phase 2 run may have already completed the
+                    # long-term step before a sibling step failed. Reuse its
+                    # persisted diff instead of reporting an empty task result.
+                    if completed_memory_steps.get("long_term") and self._viking_fs:
+                        candidate_memory_diff_uri = f"{archive_uri}/memory_diff.json"
+                        if await self._viking_fs.exists(
+                            candidate_memory_diff_uri,
+                            ctx=self.ctx,
+                        ):
+                            memory_diff_uri = candidate_memory_diff_uri
                             try:
-                                await self._viking_fs.link(
-                                    self._session_uri, usage.uri, ctx=self.ctx
+                                raw_memory_diff = await self._viking_fs.read_file(
+                                    candidate_memory_diff_uri,
+                                    ctx=self.ctx,
                                 )
-                            except Exception as e:
-                                logger.warning(f"Failed to create relation to {usage.uri}: {e}")
+                                memory_diff = json.loads(raw_memory_diff or "{}")
+                                if isinstance(memory_diff, dict):
+                                    skipped_memory_operations.extend(
+                                        item
+                                        for item in memory_diff.get("skipped_operations", [])
+                                        if isinstance(item, dict)
+                                    )
+                            except Exception as exc:
+                                logger.warning(
+                                    "Failed to read skipped memory operations from %s: %s",
+                                    candidate_memory_diff_uri,
+                                    exc,
+                                )
 
                     # Update active_count (using snapshot, not self._usage_records)
                     if self._vikingdb_manager:
@@ -2815,6 +2863,10 @@ class Session:
                     for item in extracted_skill_results
                     if isinstance(item, dict) and (item.get("uri") or item.get("root_uri"))
                 ],
+                "memory_extraction": {
+                    "skipped": len(skipped_memory_operations),
+                    "skipped_operations": skipped_memory_operations,
+                },
                 "usage_events_extracted": usage_events_extracted,
                 "active_count_updated": active_count_updated,
                 "effective_memory_types": sorted(
@@ -3370,7 +3422,7 @@ class Session:
             overview = await self._viking_fs.read_file(f"{archive_uri}/.overview.md", ctx=self.ctx)
         except Exception:
             return ""
-        return overview or ""
+        return body_for_preview(overview or "")
 
     async def _read_archive_abstract(self, archive_uri: str, overview: str = "") -> str:
         """Read archive abstract text, falling back to summary extraction."""
@@ -3380,7 +3432,7 @@ class Session:
             abstract = ""
 
         if abstract:
-            return abstract
+            return body_for_preview(abstract)
 
         if not overview:
             overview = await self._read_archive_overview(archive_uri)
@@ -3914,9 +3966,7 @@ class Session:
         if archive_index <= 1 or not self._viking_fs:
             return True
 
-        predecessor_uri = (
-            f"{self._session_uri}/history/archive_{archive_index - 1:03d}"
-        )
+        predecessor_uri = f"{self._session_uri}/history/archive_{archive_index - 1:03d}"
         if not await self._viking_fs.exists(predecessor_uri, ctx=self.ctx):
             return True
         if await self._archive_terminal_state(predecessor_uri) != "pending":
@@ -5264,13 +5314,33 @@ class Session:
         )
         await viking_fs.write_file(
             uri=f"{self._session_uri}/.abstract.md",
-            content=abstract,
+            content=render_abstract_overview(
+                ContextLevel.ABSTRACT,
+                self._session_uri,
+                abstract,
+                {
+                    "generated_by": {
+                        "component": "Session",
+                        "trigger": "session_update",
+                    }
+                },
+            ),
             ctx=self.ctx,
             lease_ref=lease_ref,
         )
         await viking_fs.write_file(
             uri=f"{self._session_uri}/.overview.md",
-            content=overview,
+            content=render_abstract_overview(
+                ContextLevel.OVERVIEW,
+                self._session_uri,
+                overview,
+                {
+                    "generated_by": {
+                        "component": "Session",
+                        "trigger": "session_update",
+                    }
+                },
+            ),
             ctx=self.ctx,
             lease_ref=lease_ref,
         )

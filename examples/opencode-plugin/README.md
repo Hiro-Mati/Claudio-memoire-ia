@@ -2,6 +2,10 @@
 
 A unified OpenCode plugin for OpenViking repository retrieval and long-term memory.
 
+> **Requires an OpenViking server with `viking://~` home-alias support.** Recall targets the
+> caller's own context space through `viking://~/memories` and `viking://~/skills`; the uid-less
+> `viking://user/memories` shorthand is rejected by newer servers.
+
 This is the only OpenCode plugin example maintained in this repository. It supersedes the former split examples for indexed repository prompt injection and long-term memory.
 
 The plugin uses OpenCode hooks for lifecycle behavior and registers OpenViking's standard stdio MCP proxy for model tools. It does not install or require an OpenCode skill, and agents do not need to run `ov` shell commands.
@@ -186,14 +190,16 @@ call and points it to the OpenViking MCP tools.
 
 OpenCode sees the OpenViking MCP server as `openviking`, so tool names are namespaced with `openviking_`.
 
-- `openviking_recall`: balanced current-task recall using OpenViking's `/recall` endpoint.
-- `openviking_search`: deep semantic retrieval across memories, resources, and skills.
+- `openviking_search`: deep semantic retrieval across memories, resources, and skills; use `mode="context"` for balanced, injection-ready context.
 - `openviking_find`: fast semantic retrieval.
 - `openviking_remember`: store important facts or decisions for memory extraction.
 - `openviking_read`: read one or more `viking://` files.
 - `openviking_list`: list a `viking://` directory.
+- `openviking_tree`: show a `viking://` directory tree.
 - `openviking_grep`: exact text or regex search.
 - `openviking_glob`: glob file matching.
+- `openviking_write`: create, overwrite, or append to a `viking://` file.
+- `openviking_edit`: exact string replacement in a `viking://` file.
 - `openviking_add_resource`: add a URL, local file, sitemap, or feed.
 - `openviking_forget`: delete a `viking://` URI after explicit user confirmation.
 - `openviking_list_watches` / `openviking_cancel_watch`: inspect or cancel resource watches.

@@ -28,10 +28,10 @@ from .log_config import LogConfig
 from .memory_config import MemoryConfig
 from .oauth_config import OAuthConfig
 from .parser_config import (
+    AnydocConfig,
     AudioConfig,
     CodeConfig,
     DirectoryConfig,
-    ExcelConfig,
     FeishuConfig,
     HTMLConfig,
     ImageConfig,
@@ -44,6 +44,7 @@ from .parser_config import (
 )
 from .prompts_config import PromptsConfig
 from .queue_worker_config import QueueWorkersConfig
+from .reindex_config import ReindexConfig
 from .rerank_config import RerankConfig
 from .retrieval_config import RetrievalConfig
 from .storage_config import StorageConfig
@@ -51,7 +52,7 @@ from .telemetry_config import TelemetryConfig
 from .vlm_config import VLMConfig
 
 
-def _get_config_warning_logger():
+def _get_config_logger():
     """Use stdlib logging during config bootstrap to avoid early logger side effects."""
     return logging.getLogger(__name__)
 
@@ -205,12 +206,9 @@ class OpenVikingConfig(BaseModel):
         default_factory=MarkdownConfig, description="Markdown parsing configuration"
     )
 
-    excel: ExcelConfig = Field(
-        # from_dict on an empty mapping, not the bare constructor: an absent
-        # parsers.excel section must record that no key was set, so sectioning
-        # still follows parsers.markdown for deployments predating this section.
-        default_factory=lambda: ExcelConfig.from_dict({}),
-        description="Excel parsing configuration",
+    anydoc: AnydocConfig = Field(
+        default_factory=AnydocConfig,
+        description="Shared anydoc Office conversion configuration",
     )
 
     html: HTMLConfig = Field(default_factory=HTMLConfig, description="HTML parsing configuration")
@@ -239,6 +237,11 @@ class OpenVikingConfig(BaseModel):
     queue_workers: QueueWorkersConfig = Field(
         default_factory=QueueWorkersConfig,
         description="Queue worker runtime configuration",
+    )
+
+    reindex: ReindexConfig = Field(
+        default_factory=ReindexConfig,
+        description="Admin reindex runtime configuration",
     )
 
     parser_api: ParserApiConfig = Field(
@@ -296,7 +299,7 @@ class OpenVikingConfig(BaseModel):
     @model_validator(mode="after")
     def _warn_on_deprecated_language_fallback(self) -> "OpenVikingConfig":
         if self.language_fallback and self.language_fallback != "en":
-            _get_config_warning_logger().warning(
+            _get_config_logger().warning(
                 "Config field 'language_fallback=%s' is deprecated and has no effect; "
                 "remove it, or set 'output_language_override' to pin an explicit language.",
                 self.language_fallback,
@@ -401,7 +404,7 @@ class OpenVikingConfig(BaseModel):
                 "audio",
                 "video",
                 "markdown",
-                "excel",
+                "anydoc",
                 "html",
                 "text",
                 "directory",
@@ -426,6 +429,13 @@ class OpenVikingConfig(BaseModel):
                     parser_configs = {}
                 if not isinstance(parser_configs, dict):
                     raise ValueError("Invalid parsers config: 'parsers' section must be an object")
+                parser_configs = parser_configs.copy()
+                if "excel" in parser_configs:
+                    parser_configs.pop("excel")
+                    _get_config_logger().error(
+                        "Config field 'parsers.excel' was removed and is ignored; "
+                        "spreadsheet parsing now uses 'parsers.anydoc'."
+                    )
             raise_unknown_config_fields(
                 data=parser_configs,
                 valid_fields=set(parser_types),

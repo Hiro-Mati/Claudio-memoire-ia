@@ -153,6 +153,11 @@ async function resolveUserSpace(actorPeerId = "") {
 
 async function resolveTargetUri(targetUri, actorPeerId = "") {
   const trimmed = targetUri.trim().replace(/\/+$/, "");
+  // viking://~ is the home alias: the server expands it to the caller's own user
+  // space, so it needs no client-side rewrite.
+  if (trimmed === "viking://~" || trimmed.startsWith("viking://~/")) return trimmed;
+  // Legacy compat: uid-less viking://user/<reserved> URIs may still sit in plugin
+  // configs. Newer servers reject them, so rewrite to an explicit-uid URI here.
   const m = trimmed.match(/^viking:\/\/user(?:\/(.*))?$/);
   if (!m) return trimmed;
   const rawRest = (m[1] ?? "").trim();
@@ -170,8 +175,8 @@ async function resolveTargetUri(targetUri, actorPeerId = "") {
 // ---------------------------------------------------------------------------
 
 const SOURCES = [
-  { type: "memory", uri: "viking://user/memories",  bucket: "memories" },
-  { type: "skill",  uri: "viking://user/skills",    bucket: "skills"   },
+  { type: "memory", uri: "viking://~/memories",  bucket: "memories" },
+  { type: "skill",  uri: "viking://~/skills",    bucket: "skills"   },
 ];
 
 async function searchOneSource(query, source, limit, actorPeerId = "") {
@@ -399,7 +404,6 @@ async function main() {
       hint_items: 0,
       tokens_used: estimateTokens(endpointBlock),
       tokens_budget: cfg.recallTokenBudget,
-      top_score: 0,
       cc_session_id: sessionId,
       reason: "ok",
     });
@@ -436,14 +440,12 @@ async function main() {
   }
 
   const built = await buildInjectionBlock(picked, effectivePeer.peerId);
-  const topScore = picked.reduce((m, it) => Math.max(m, clampScore(it.score)), 0);
   writeRecallState({
     count: picked.length,
     content_items: built?.contentCount ?? 0,
     hint_items: built?.hintCount ?? 0,
     tokens_used: built?.budgetUsed ?? 0,
     tokens_budget: cfg.recallTokenBudget,
-    top_score: topScore,
     cc_session_id: sessionId,
     reason: "ok",
   });

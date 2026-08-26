@@ -119,8 +119,20 @@ Leaf directories → Parent directories → Root
 2. **Collect child directory abstracts**: Read generated .abstract.md
 3. **Generate .overview.md**: LLM generates L1 overview
 4. **Extract .abstract.md**: Extract L0 from overview
-5. **Write files**: Save to AGFS
+5. **Write files**: Store the body and protected metadata as OKF Markdown
 6. **Vectorize**: Create Context and queue to EmbeddingQueue
+
+L0/L1 are directory sidecars, not per-file sidecars. Parent-summary generation consumes only child L0 bodies; OKF frontmatter is excluded from prompts. Embedding input contains the body and the whitelisted `directory`; `source`, `generated_by`, and `freshness` are excluded.
+
+### Freshness, Sampling, and Parent Refresh
+
+Each generation records direct-child `total_entries`, `sampled_entries`, and `unsampled_entries`. When the direct-child count exceeds `semantic.overview_sample_limit` (32 by default), OpenViking uses deterministic stable sampling. `pending_child_changes` increases when a known child change is not yet reflected in the parent body and resets to 0 after a successful refresh.
+
+Currently, each successful resource/skill semantic task schedules the next parent refresh and marks that parent pending before enqueue, continuing to the namespace-root boundary.
+
+> **TODO: control bubbling frequency with freshness**
+>
+> Bubbling after every successful task can create repeated refreshes and upward write amplification in hot, deeply nested directories. A future scheduler should use `pending_child_changes`, sampling coverage, direct-child change volume, and recent refresh state to coalesce, threshold, or time-window parent refreshes while preserving eventual consistency.
 
 ### Processing Limits
 
@@ -129,6 +141,7 @@ Leaf directories → Parent directories → Root
 | `max_concurrent_llm` | 10 | Concurrent LLM calls |
 | `max_images_per_call` | 10 | Max images per VLM call |
 | `max_sections_per_call` | 20 | Max sections per VLM call |
+| `overview_sample_limit` | 32 | Maximum direct-child sample used for one directory summary |
 
 ## Code Skeleton Extraction
 
@@ -155,7 +168,7 @@ This routing applies to short and long code files alike.
 | Phase | Resource | Memory | Skill |
 |-------|----------|--------|-------|
 | **Parser** | Common flow | Common flow | Common flow |
-| **Base URI** | `viking://resources` | `viking://user/memories` | `viking://user/skills` |
+| **Base URI** | `viking://resources` | `viking://~/memories` | `viking://~/skills` |
 | **TreeBuilder scope** | resources | user | user |
 | **SemanticMsg type** | resource | memory | skill |
 
@@ -164,8 +177,8 @@ This routing applies to short and long code files alike.
 ```python
 # Add resource
 await client.add_resource(
-    "/path/to/doc.pdf",
-    reason="API documentation"
+    path="/path/to/doc.pdf",
+    options={"reason": "API documentation"},
 )
 
 # Flow: Parser → TreeBuilder(scope=resources) → SemanticQueue
@@ -175,12 +188,14 @@ await client.add_resource(
 
 ```python
 # Add skill
-await client.add_skill({
-    "name": "search-web",
-    "content": "# search-web\\n..."
-})
+await client.add_skill(
+    data={
+        "name": "search-web",
+        "content": "# search-web\\n...",
+    },
+)
 
-# Flow: Direct write to viking://user/skills/{name}/ → SemanticQueue
+# Flow: Direct write to viking://~/skills/{name}/ → SemanticQueue
 ```
 
 ### Memory Extraction

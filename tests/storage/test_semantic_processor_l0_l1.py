@@ -3,6 +3,8 @@
 
 from types import SimpleNamespace
 
+from openviking.core.context import ContextLevel
+from openviking.storage.abstract_overview import render_abstract_overview
 from openviking.storage.queuefs import semantic_processor as semantic_processor_module
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 
@@ -32,6 +34,19 @@ def test_markdown_overview_uses_brief_description_as_abstract(monkeypatch):
     assert overview == generated
     assert abstract == "This brief description is the retrieval abstract."
 
+    raw = render_abstract_overview(
+        ContextLevel.OVERVIEW,
+        "viking://resources/demo",
+        generated,
+        {"source": {"kind": "http", "uri": "https://example.com/private.pdf"}},
+    )
+
+    overview, abstract = processor._normalize_overview_generation(raw)
+
+    assert overview == generated
+    assert abstract == "This brief description is the retrieval abstract."
+    assert "source:" not in overview
+
 
 def test_markdown_overview_extracts_multiline_brief_description(monkeypatch):
     _patch_semantic_limits(monkeypatch)
@@ -50,14 +65,70 @@ def test_markdown_overview_extracts_multiline_brief_description(monkeypatch):
     assert abstract == "This is the first abstract line.\nThis is the second abstract line."
 
 
-def test_index_references_are_replaced_inside_markdown_overview(monkeypatch):
+def test_directory_coverage_section_is_excluded_from_abstract(monkeypatch):
     _patch_semantic_limits(monkeypatch)
     processor = SemanticProcessor()
-    generated = "# README\n\nUse [1] to get started."
+    generated = (
+        "# docs-index\n\n"
+        "OpenViking documentation covering agent context, retrieval, and operations.\n\n"
+        "## Directory Coverage\n\n"
+        "This directory contains 513 direct entries; 32 were sampled.\n\n"
+        "## Quick Navigation\n\n"
+        "- Read the getting-started guide"
+    )
 
-    replaced = processor._replace_index_references(generated, {1: "README.md"})
+    overview, abstract = processor._normalize_overview_generation(generated)
 
-    assert replaced == "# README\n\nUse README.md to get started."
+    assert "513 direct entries" in overview
+    assert abstract == (
+        "OpenViking documentation covering agent context, retrieval, and operations."
+    )
+
+
+def test_link_references_are_replaced_inside_markdown_overview(monkeypatch):
+    _patch_semantic_limits(monkeypatch)
+    processor = SemanticProcessor()
+    generated = "# README\n\nSee [README](viking://input_sample_f1) to get started."
+
+    replaced = processor._replace_link_references(
+        generated, {"viking://input_sample_f1": "viking://resources/docs/README.md"}
+    )
+
+    assert replaced == (
+        "# README\n\nSee [README](viking://resources/docs/README.md) to get started."
+    )
+
+
+def test_parse_overview_uses_decoded_link_target_name_as_cache_key(monkeypatch):
+    _patch_semantic_limits(monkeypatch)
+    processor = SemanticProcessor()
+    overview = (
+        "# docs\n\n"
+        "## Detailed Description\n\n"
+        "### [Friendly title](viking://resources/docs/README%20guide%23intro.md)\n"
+        "Reusable summary.\n"
+    )
+
+    assert processor._parse_overview_md(overview) == {"README guide#intro.md": "Reusable summary."}
+
+
+def test_parse_overview_keeps_plain_heading_cache_key(monkeypatch):
+    _patch_semantic_limits(monkeypatch)
+    processor = SemanticProcessor()
+    overview = "# docs\n\n## Detailed Description\n\n### README.md\nLegacy summary.\n"
+
+    assert processor._parse_overview_md(overview) == {"README.md": "Legacy summary."}
+
+
+def test_markdown_link_target_percent_encodes_uri_path_characters(monkeypatch):
+    _patch_semantic_limits(monkeypatch)
+    processor = SemanticProcessor()
+
+    target = processor._markdown_link_target(
+        "viking://resources/product docs", "file #1(approved).md"
+    )
+
+    assert target == ("viking://resources/product%20docs/file%20%231%28approved%29.md")
 
 
 def test_abstract_truncation_prefers_complete_sentence(monkeypatch):
@@ -92,9 +163,7 @@ def test_overview_truncation_prefers_complete_sentence(monkeypatch):
     _patch_semantic_limits(monkeypatch, overview_max_chars=45)
     processor = SemanticProcessor()
     overview = (
-        "# README\n\n"
-        "This is a complete sentence. "
-        "This second sentence would be cut in the middle."
+        "# README\n\nThis is a complete sentence. This second sentence would be cut in the middle."
     )
 
     overview, abstract = processor._enforce_size_limits(overview, "abstract")
@@ -106,12 +175,7 @@ def test_overview_truncation_prefers_complete_sentence(monkeypatch):
 def test_overview_truncation_keeps_last_complete_sentence_within_limit(monkeypatch):
     _patch_semantic_limits(monkeypatch, overview_max_chars=57)
     processor = SemanticProcessor()
-    overview = (
-        "# README\n\n"
-        "First sentence. "
-        "Second sentence. "
-        "Third sentence should be omitted."
-    )
+    overview = "# README\n\nFirst sentence. Second sentence. Third sentence should be omitted."
 
     overview, abstract = processor._enforce_size_limits(overview, "abstract")
 

@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: AGPL-3.0
 """MCP (Model Context Protocol) endpoint for OpenViking server.
 
-Exposes tools to Claude Code (or any MCP client) via streamable HTTP:
-  find, search, read, write, edit, list, tree, remember, add_resource, grep, glob, forget, health
+Exposes OpenViking tools (filesystem, retrieval, memory, watch management,
+health) to Claude Code (or any MCP client) via streamable HTTP; the
+`@mcp.tool` registrations below are the authoritative list.
 
 Mounted on the FastAPI app at /mcp. The MCP session manager lifecycle is
 tied to the FastAPI app lifespan (not a sub-app lifespan) so the task group
@@ -15,25 +16,40 @@ are extracted from HTTP request scope and propagated via contextvars.
 
 from __future__ import annotations
 
+import base64
 import contextvars
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import PurePosixPath
 from typing import Any, Dict, List, Literal, Optional, Union
 from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import (
+    AudioContent,
+    ContentBlock,
+    ImageContent,
+    TextContent,
+)
 from pydantic import BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from openviking.core.namespace import canonical_user_root, canonicalize_uri, uri_parts
+from openviking.core.path_variables import resolve_path_variables
+from openviking.core.uri_validation import (
+    validate_content_target_uri,
+    validate_request_viking_uri,
+)
 from openviking.parse.mode import ParseMode, normalize_parse_mode
 from openviking.resource.processing_mode import DEFAULT_PROCESSING_MODE, ProcessingMode
-from openviking.retrieve.context_assembler import assemble_context
-from openviking.retrieve.context_assembler.recall_preset import fold_recall_request
+from openviking.retrieve.context_assembler import (
+    DEFAULT_MAX_TOKENS,
+    AssembleParams,
+    assemble_context,
+)
 from openviking.server.auth import _extract_api_key, normalize_actor_peer_header, resolve_identity
 from openviking.server.dependencies import get_server_config, get_service
 from openviking.server.identity import RequestContext
@@ -49,6 +65,7 @@ from openviking.utils.search_filters import SearchContextTypeInput, merge_search
 from openviking_cli.exceptions import (
     InvalidArgumentError,
     NotFoundError,
+    OpenVikingError,
     PermissionDeniedError,
     UnauthenticatedError,
 )
@@ -82,22 +99,8 @@ def _get_ctx() -> RequestContext:
 
 
 def _resolve_mcp_workspace_uri(uri: str, ctx: RequestContext) -> str:
-    """Resolve ``viking://user/...`` as the current user's MCP workspace.
-
-    Generic namespace parsing must preserve canonical cross-user URIs, so it
-    cannot infer whether the first segment after ``user`` is a user id or a
-    file/directory name. MCP has a narrower contract: its filesystem tools act
-    on the authenticated user's workspace. An exact current-user id is already
-    canonical; every other suffix is relative to that user's root.
-    """
-    parts = uri_parts(uri)
-    if parts[:1] != ["user"]:
-        return uri
-    suffix = parts[1:]
-    if suffix[:1] == [ctx.user.user_id]:
-        return canonicalize_uri(uri, ctx)
-    root = canonical_user_root(ctx)
-    return root if not suffix else f"{root}/{'/'.join(suffix)}"
+    """Resolve MCP workspace URIs, expanding the viking://~ home alias, at its boundary."""
+    return validate_request_viking_uri(resolve_path_variables(uri), ctx)
 
 
 def _scope_to_origin(scope: Scope) -> Optional[str]:
@@ -264,6 +267,7 @@ async def find(
     min_score: float = 0.35,
     level: Optional[List[int]] = None,
     context_type: Optional[Union[str, List[str]]] = None,
+    read_content: bool = False,
 ) -> str:
     """Fast semantic retrieval without session context. Returns ranked memories, resources, and skills with URI, abstract, and score."""
     service = get_service()
@@ -279,7 +283,7 @@ async def find(
         filter=_resolve_context_type_filter(context_type),
         level=level,
     )
-    return _format_search_result(result)
+    return await _format_search_result(result, service=service, ctx=ctx, read_content=read_content)
 
 
 @mcp.tool()
@@ -288,13 +292,82 @@ async def search(
     target_uri: str = "",
     session_id: Optional[str] = None,
     limit: int = 10,
-    min_score: float = 0.35,
+    min_score: Optional[float] = None,
     level: Optional[List[int]] = None,
     context_type: Optional[Union[str, List[str]]] = None,
+    mode: Literal["list", "context"] = "list",
+    query_expansion: Literal["off", "auto"] = "auto",
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    quotas: Optional[Dict[str, int]] = None,
+    purpose: Optional[Literal["chat", "coding"]] = None,
+    detail: Literal["auto", "abstract", "overview", "full"] = "auto",
+    detail_by_category: Optional[Dict[str, str]] = None,
+    dedup_turns: int = 0,
+    exclude_uris: Optional[List[str]] = None,
+    peer_scope: Literal["actor", "all"] = "all",
+    other_peer_penalty: Optional[float] = None,
+    other_peer_penalties: Optional[Dict[str, float]] = None,
+    rewrite: Literal["off", "auto"] = "off",
+    rewrite_max_bullets: int = 6,
+    read_content: bool = False,
 ) -> str:
-    """Deep semantic retrieval with optional session context and intent analysis. Returns ranked memories, resources, and skills with URI, abstract, and score."""
+    """Deep semantic retrieval with optional session context and intent analysis.
+
+    ``mode="list"`` returns ranked memories, resources, and skills with URI,
+    abstract, and score. ``mode="context"`` returns an injection-ready,
+    token-budgeted context block and supports category quotas, purpose presets,
+    detail tiers, cross-turn deduplication, peer scoping, and optional rewriting.
+    ``target_uri`` is only supported in list mode.
+    """
     service = get_service()
     ctx = _get_ctx()
+    context_filter = _resolve_context_type_filter(context_type)
+    if mode == "context":
+        if read_content:
+            raise InvalidArgumentError("read_content is only supported in mode='list'")
+        if target_uri:
+            raise InvalidArgumentError("target_uri is not supported in mode='context'")
+        if detail != "auto" and detail_by_category:
+            raise InvalidArgumentError(
+                "detail cannot be combined with detail_by_category in mode='context'"
+            )
+        if other_peer_penalty is not None and other_peer_penalties:
+            raise InvalidArgumentError(
+                "other_peer_penalty cannot be combined with other_peer_penalties in mode='context'"
+            )
+        # Resolve exclusions with the same strictness as the REST search router,
+        # so alias URIs match the canonical URIs they are compared against.
+        resolved_exclude_uris = [
+            _resolve_mcp_workspace_uri(exclude_uri, ctx) for exclude_uri in (exclude_uris or ())
+        ]
+        result = await assemble_context(
+            service=service,
+            ctx=ctx,
+            params=AssembleParams(
+                query=query,
+                limit=limit,
+                score_threshold=min_score,
+                filter=context_filter,
+                session_id=session_id,
+                query_expansion=query_expansion,
+                max_tokens=max_tokens,
+                quotas=quotas,
+                purpose=purpose,
+                detail=detail_by_category or (None if detail == "auto" else detail),
+                dedup_turns=dedup_turns,
+                exclude_uris=resolved_exclude_uris,
+                peer_scope=peer_scope,
+                other_peer_penalty=other_peer_penalties or other_peer_penalty,
+                rewrite=rewrite == "auto",
+                rewrite_max_bullets=rewrite_max_bullets,
+            ),
+        )
+        if result.digest.strip():
+            return result.digest
+        if result.rendered.strip():
+            return result.rendered
+        return "No matching context found."
+
     if target_uri:
         target_uri = _resolve_mcp_workspace_uri(target_uri, ctx)
     session = None
@@ -308,14 +381,14 @@ async def search(
         target_uri=target_uri,
         session=session,
         limit=limit,
-        score_threshold=min_score,
-        filter=_resolve_context_type_filter(context_type),
+        score_threshold=0.35 if min_score is None else min_score,
+        filter=context_filter,
         level=level,
     )
-    return _format_search_result(result)
+    return await _format_search_result(result, service=service, ctx=ctx, read_content=read_content)
 
 
-def _format_search_result(result) -> str:
+async def _format_search_result(result, *, service, ctx, read_content: bool = False) -> str:
     items = []
     for ctx_type, contexts in [
         ("memory", result.memories),
@@ -328,67 +401,121 @@ def _format_search_result(result) -> str:
     if not items:
         return "No matching context found."
 
+    contents: dict[str, str] = {}
+    if read_content:
+        import asyncio
+
+        semaphore = asyncio.Semaphore(10)
+
+        async def _read(uri: str) -> None:
+            async with semaphore:
+                try:
+                    contents[uri] = await service.fs.read_visible(uri, ctx=ctx)
+                except Exception:
+                    pass
+
+        await asyncio.gather(*(_read(m.uri) for _, m in items))
+
     lines = []
     for ctx_type, m in items:
         abstract = (
             getattr(m, "abstract", "") or getattr(m, "overview", "") or "(no abstract)"
         ).strip()
         score = getattr(m, "score", 0.0)
-        lines.append(f"- [{ctx_type} {score * 100:.0f}%] {m.uri}\n    {abstract}")
+        line = f"- [{ctx_type} {score * 100:.0f}%] {m.uri}\n    {abstract}"
+        if m.uri in contents:
+            line += f"\n\n    {contents[m.uri]}"
+        lines.append(line)
 
     return (
         f"Found {len(items)} item(s):\n\n"
         + "\n".join(lines)
-        + "\n\nUse the read tool to expand a URI."
+        + ("" if read_content else "\n\nUse the read tool to expand a URI.")
     )
-
-
-@mcp.tool()
-async def recall(
-    query: str,
-    quotas: Optional[dict[str, int]] = None,
-    max_chars: Optional[int] = None,
-    min_score: Optional[float] = None,
-    peer_scope: str = "all",
-    other_peer_penalty: Optional[Union[float, Dict[str, float]]] = None,
-    session_id: Optional[str] = None,
-    detail: Optional[str] = None,
-    max_tokens: Optional[int] = None,
-    rewrite: Union[bool, str] = False,
-) -> str:
-    """Memory recall assembled server-side. Searches each memory type separately, then returns a token-budgeted block where every entry carries its viking:// URI. detail pins the tier for every entry: "abstract", "overview" or "full"."""
-    service = get_service()
-    # Omitted arguments must stay absent: this is the same preset as POST
-    # /recall, and a signature default sent through as a value would read as an
-    # explicit v1 alias and shift the whole profile.
-    values: Dict[str, Any] = {
-        "query": query,
-        "quotas": quotas,
-        "max_chars": None if max_chars is None else max(1, int(max_chars)),
-        "min_score": min_score,
-        "peer_scope": "actor" if peer_scope == "actor" else "all",
-        "other_peer_penalty": other_peer_penalty,
-        "session_id": session_id,
-        "detail": detail,
-        "max_tokens": max_tokens,
-        "rewrite": rewrite,
-    }
-    provided = {key for key, value in values.items() if value is not None}
-    params, _aliases = fold_recall_request(values, provided)
-    result = await assemble_context(service=service, ctx=_get_ctx(), params=params)
-    if result.digest.strip():
-        return result.digest
-    if result.rendered.strip():
-        return result.rendered
-    return "No relevant memories found."
 
 
 # -- read ------------------------------------------------------------------
 
 
-@mcp.tool()
-async def read(uris: str | list[str]) -> str:
-    """Read full content from one or more viking:// file URIs. Pass a single URI string or a list for batch reads. For directory listing, use the list tool instead."""
+_MCP_IMAGE_EXTENSIONS = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
+_MCP_AUDIO_EXTENSIONS = {".flac", ".m4a", ".mp3", ".oga", ".ogg", ".wav"}
+_MCP_VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
+# Common clients cap an inline result at 5 MiB base64, or 3.75 MiB raw.
+# Apply the same limit to one file and to the aggregate media in one tool call.
+_MCP_MEDIA_MAX_BYTES = 3_932_160
+
+
+def _mcp_uri_suffix(uri: str) -> str:
+    """Lowercased file extension of a URI, ignoring any query or fragment."""
+    path = uri.split("#", 1)[0].split("?", 1)[0]
+    return PurePosixPath(path).suffix.lower()
+
+
+def _is_mcp_image_uri(uri: str) -> bool:
+    return _mcp_uri_suffix(uri) in _MCP_IMAGE_EXTENSIONS
+
+
+def _is_mcp_audio_uri(uri: str) -> bool:
+    return _mcp_uri_suffix(uri) in _MCP_AUDIO_EXTENSIONS
+
+
+def _is_mcp_video_uri(uri: str) -> bool:
+    return _mcp_uri_suffix(uri) in _MCP_VIDEO_EXTENSIONS
+
+
+def _sniff_mcp_image_mime_type(data: bytes) -> Optional[str]:
+    """Recognize the raster formats shared by common MCP coding clients."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _mcp_image_content(data: bytes, mime_type: str) -> ImageContent:
+    encoded = base64.b64encode(data).decode("ascii")
+    return ImageContent(type="image", data=encoded, mimeType=mime_type)
+
+
+def _sniff_mcp_audio_mime_type(data: bytes, uri: str) -> Optional[str]:
+    """Recognize audio formats represented by MCP AudioContent."""
+    suffix = _mcp_uri_suffix(uri)
+    if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WAVE":
+        return "audio/wav"
+    if data.startswith(b"fLaC"):
+        return "audio/flac"
+    if data.startswith(b"OggS") and suffix in {".oga", ".ogg"}:
+        return "audio/ogg"
+    if data.startswith(b"ID3") or (len(data) >= 2 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0):
+        return "audio/mpeg"
+    if len(data) >= 12 and data[4:8] == b"ftyp" and suffix == ".m4a":
+        return "audio/mp4"
+    return None
+
+
+def _mcp_audio_content(data: bytes, mime_type: str) -> AudioContent:
+    encoded = base64.b64encode(data).decode("ascii")
+    return AudioContent(type="audio", data=encoded, mimeType=mime_type)
+
+
+def _mcp_media_download_hint(uri: str) -> str:
+    """Return actionable fallbacks when media cannot be inlined."""
+    path = uri.split("#", 1)[0].split("?", 1)[0]
+    filename = PurePosixPath(path).name or "download"
+    encoded_uri = quote(uri, safe="")
+    return (
+        f'Use `ov get "{uri}" "./{filename}"` or GET '
+        f"`/api/v1/content/download?uri={encoded_uri}` to fetch the original file."
+    )
+
+
+@mcp.tool(structured_output=False)
+async def read(uris: str | list[str]) -> str | list[ContentBlock]:
+    """Read one or more viking:// file URIs. Raster images and supported audio return native MCP content blocks. For directory listing, use the list tool instead."""
     import asyncio
 
     service = get_service()
@@ -396,21 +523,119 @@ async def read(uris: str | list[str]) -> str:
     uri_list = uris if isinstance(uris, list) else [uris]
     semaphore = asyncio.Semaphore(10)
 
-    async def _read_one(uri: str) -> str:
+    async def _preflight_one(uri: str) -> tuple[str, Optional[int], Optional[str]]:
+        """Resolve a URI and stat media before any binary bytes are loaded."""
+        try:
+            resolved_uri = _resolve_mcp_workspace_uri(uri, ctx)
+            is_image = _is_mcp_image_uri(resolved_uri)
+            is_audio = _is_mcp_audio_uri(resolved_uri)
+            is_video = _is_mcp_video_uri(resolved_uri)
+            if not (is_image or is_audio or is_video):
+                return resolved_uri, None, None
+
+            async with semaphore:
+                stat = await service.fs.stat(resolved_uri, ctx=ctx)
+            if stat.get("isDir"):
+                return (
+                    resolved_uri,
+                    None,
+                    f"Cannot render {uri}: URI points to a directory. "
+                    "Use the list tool (or `ov ls` / `ov tree`) to browse its contents.",
+                )
+            if is_video:
+                return (
+                    resolved_uri,
+                    None,
+                    f"Cannot render {uri}: MCP has no standard VideoContent block. "
+                    f"{_mcp_media_download_hint(uri)}",
+                )
+
+            size = stat.get("size") if stat else None
+            if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+                return (
+                    resolved_uri,
+                    None,
+                    f"Cannot render {uri}: file size is unavailable. "
+                    f"{_mcp_media_download_hint(uri)}",
+                )
+            return resolved_uri, size, None
+        except OpenVikingError as exc:
+            return uri, None, str(exc)
+
+    preflight = await asyncio.gather(*[_preflight_one(uri) for uri in uri_list])
+    checked: list[tuple[str, Optional[int], Optional[str]]] = []
+    media_total = 0
+    for uri, (resolved_uri, size, error) in zip(uri_list, preflight, strict=True):
+        if error is None and size is not None:
+            if size > _MCP_MEDIA_MAX_BYTES:
+                error = (
+                    f"Media file is too large to inline through MCP ({size} bytes; limit "
+                    f"{_MCP_MEDIA_MAX_BYTES} bytes). {_mcp_media_download_hint(uri)}"
+                )
+            elif media_total + size > _MCP_MEDIA_MAX_BYTES:
+                error = (
+                    f"Cannot inline {uri}: combined media size would exceed the MCP tool-call "
+                    f"limit of {_MCP_MEDIA_MAX_BYTES} bytes. Read fewer media files at once. "
+                    f"{_mcp_media_download_hint(uri)}"
+                )
+            else:
+                media_total += size
+        checked.append((resolved_uri, size, error))
+
+    async def _read_one(
+        uri: str, prepared: tuple[str, Optional[int], Optional[str]]
+    ) -> str | ContentBlock:
         async with semaphore:
             try:
-                resolved_uri = _resolve_mcp_workspace_uri(uri, ctx)
-                body = await service.fs.read_visible(resolved_uri, ctx=ctx)
-                if isinstance(body, str) and body.strip():
-                    return body
-            except Exception:
-                pass
-            return f"(nothing found at {uri})"
+                resolved_uri, declared_size, error = prepared
+                if error is not None:
+                    return error
+                is_image = _is_mcp_image_uri(resolved_uri)
+                is_audio = _is_mcp_audio_uri(resolved_uri)
+                if is_image or is_audio:
+                    data = await service.fs.read_file_bytes(resolved_uri, ctx=ctx)
+                    if declared_size is None or len(data) > declared_size:
+                        return (
+                            f"Cannot render {uri}: file changed after its size was checked. "
+                            "Retry the read."
+                        )
+                    mime_type = (
+                        _sniff_mcp_image_mime_type(data)
+                        if is_image
+                        else _sniff_mcp_audio_mime_type(data, resolved_uri)
+                    )
+                    if mime_type is None:
+                        return (
+                            f"Cannot render {uri}: its bytes do not match a supported media "
+                            f"format. {_mcp_media_download_hint(uri)}"
+                        )
+                    if is_image:
+                        return _mcp_image_content(data, mime_type)
+                    return _mcp_audio_content(data, mime_type)
+                content = await service.fs.read_visible(resolved_uri, ctx=ctx)
+                return content
+            except OpenVikingError as exc:
+                return str(exc)
 
     if len(uri_list) == 1:
-        return await _read_one(uri_list[0])
+        result = await _read_one(uri_list[0], checked[0])
+        if isinstance(result, str):
+            return result
+        return [TextContent(type="text", text=f"Source: {uri_list[0]}"), result]
 
-    results = await asyncio.gather(*[_read_one(u) for u in uri_list])
+    results = await asyncio.gather(
+        *[_read_one(uri, prepared) for uri, prepared in zip(uri_list, checked, strict=True)]
+    )
+    if any(not isinstance(result, str) for result in results):
+        blocks: list[ContentBlock] = []
+        for uri, result in zip(uri_list, results, strict=True):
+            blocks.append(TextContent(type="text", text=f"=== {uri} ==="))
+            if isinstance(result, str):
+                blocks.append(TextContent(type="text", text=result))
+            else:
+                blocks.append(result)
+        return blocks
+
     parts = []
     for uri, text in zip(uri_list, results, strict=True):
         parts.append(f"=== {uri} ===\n{text}")
@@ -541,7 +766,7 @@ async def write(
     - Any new file (whether created by "replace" or "create") must end in one of: .md .txt .json .yaml .yml .toml .py .js .ts
     - mode="append": append to the end of an existing file; fails if the file does not exist.
 
-    Writable scopes: viking://resources/, viking://user/ (all paths are relative to the authenticated user's root unless the URI already contains that exact user id), viking://agent/. The managed user subtrees skills/, peers/, privacy/ and sessions/ are read-only. After a write, semantic search indexes refresh in the background; pass wait=true to block until search reflects the change."""
+    Writable scopes: viking://resources/, viking://user/{user_id}/, viking://agent/. The viking://~ home alias expands to the caller's user root. The managed user subtrees skills/, peers/, privacy/ and sessions/ are read-only. After a write, semantic search indexes refresh in the background; pass wait=true to block until search reflects the change."""
     service = get_service()
     ctx = _get_ctx()
     uri = _resolve_mcp_workspace_uri(uri, ctx)
@@ -777,6 +1002,21 @@ async def add_resource(
     ctx = _get_ctx()
 
     try:
+        to = resolve_path_variables(to).strip() if to else ""
+        if to:
+            to = validate_content_target_uri(to, ctx, kind="resource", field_name="to")
+        parent = resolve_path_variables(parent).strip() if parent else ""
+        if parent:
+            parent = validate_content_target_uri(
+                parent,
+                ctx,
+                kind="resource",
+                field_name="parent",
+            )
+    except (InvalidArgumentError, PermissionDeniedError) as exc:
+        return f"Error: {exc}"
+
+    try:
         mode = normalize_parse_mode((args or {}).get("parse_mode", ParseMode.DEFAULT))
     except InvalidArgumentError as exc:
         return f"Error: {exc}"
@@ -994,6 +1234,7 @@ async def cancel_watch(to_uri: str) -> str:
 
     service = get_service()
     ctx = _get_ctx()
+    to_uri = _resolve_mcp_workspace_uri(to_uri, ctx)
     scheduler = getattr(service, "watch_scheduler", None)
     if scheduler is None or not scheduler.is_running:
         return "Error: Watch scheduler not running"
@@ -1228,7 +1469,7 @@ async def mcp_lifespan():
     """Run the MCP session manager. Call this inside the FastAPI lifespan."""
     async with mcp.session_manager.run():
         logger.info(
-            "MCP endpoint ready (16 tools: find, search, recall, read, write, edit, list, "
+            "MCP endpoint ready (15 tools: find, search, read, write, edit, list, "
             "tree, remember, add_resource, list_watches, cancel_watch, grep, glob, forget, health)"
         )
         yield

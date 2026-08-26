@@ -51,33 +51,35 @@ viking://
 **类 Unix API**：熟悉的命令式操作
 
 ```python
-client.find("用户认证")              # 语义搜索
-client.ls("viking://resources/")     # 列出目录
-client.read("viking://resources/doc") # 读取内容
-client.abstract("viking://...")       # 获取 L0 摘要
-client.overview("viking://...")       # 获取 L1 概览
+client.find(query="用户认证")              # 语义搜索
+client.ls(uri="viking://resources/")       # 列出目录
+client.read(uri="viking://resources/doc")  # 读取内容
+client.abstract(uri="viking://...")        # 获取 L0 摘要
+client.overview(uri="viking://...")        # 获取 L1 概览
 ```
 
 ### 2. 分层上下文按需加载
 
 将海量上下文一次性塞入提示词，不仅成本高昂，更容易超出模型窗口并引入噪声。OpenViking 在上下文写入时便自动将其处理为三个层级：
 
-| 层级 | 名称 | Token 限制 | 用途 |
-|------|------|-----------|------|
-| **L0** | 摘要 | ~100 tokens | 向量搜索、快速过滤 |
-| **L1** | 概览 | ~2k tokens | Rerank 精排、内容导航 |
-| **L2** | 详情 | 无限制 | 完整内容、按需加载 |
+| 层级 | 名称 | 默认正文上限 | 用途 |
+| --- | --- | --- | --- |
+| **L0** | 摘要 | 256 字符 | 向量搜索、快速过滤 |
+| **L1** | 概览 | 4000 字符 | Rerank 精排、内容导航 |
+| **L2** | 详情 | 无统一上限 | 完整内容、按需加载 |
 
 ```
 viking://resources/my_project/
 ├── .abstract.md               # L0 层：摘要
 ├── .overview.md               # L1 层：概览
 ├── docs/
-│   ├── .abstract.md          # 每个目录都有对应的 L0/L1 层
+│   ├── .abstract.md          # 语义处理目录通常包含 L0/L1
 │   ├── .overview.md
 │   └── api.md                # L2 层：完整内容
 └── src/
 ```
+
+L0/L1 是目录级 sidecar，不是 per-file sidecar；两者也不保证始终同时存在。详见[上下文层级](../concepts/03-context-layers.md)。
 
 ### 3. 目录递归检索
 

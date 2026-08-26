@@ -118,8 +118,20 @@ SemanticMsg(
 2. **收集子目录摘要**：读取已生成的 .abstract.md
 3. **生成 .overview.md**：LLM 生成 L1 概览
 4. **提取 .abstract.md**：从 overview 提取 L0 摘要
-5. **写入文件**：保存到 AGFS
+5. **写入文件**：以 OKF Markdown 保存正文和受保护元数据
 6. **向量化**：创建 Context 并入队 EmbeddingQueue
+
+L0/L1 是目录级 sidecar，不是 per-file sidecar。生成父目录摘要时只使用子目录 L0 的正文，OKF frontmatter 不进入 prompt。Embedding 使用正文和白名单中的 `directory`；`source`、`generated_by`、`freshness` 不进入向量输入。
+
+### Freshness、采样与父级刷新
+
+每次生成都会记录直接子项的 `total_entries`、`sampled_entries` 和 `unsampled_entries`。直接子项超过 `semantic.overview_sample_limit`（默认 32）时，系统使用确定性稳定采样。已知子项发生变化但父正文尚未刷新时，`pending_child_changes` 会递增；刷新成功后重置为 0。
+
+当前每个成功的 resource/skill 语义任务都会继续安排父目录刷新，并在入队前将父目录标记为 pending。该行为会一直传播到 namespace 根边界。
+
+> **TODO：使用 freshness 控制冒泡频率**
+>
+> 当前按每次成功任务冒泡会使热点深层目录产生重复刷新和向上写放大。后续应基于 `pending_child_changes`、采样覆盖率、直接子项变化规模和最近刷新状态进行合并、阈值控制或时间窗口节流，同时保持最终一致性。
 
 ### 处理限制
 
@@ -128,6 +140,7 @@ SemanticMsg(
 | `max_concurrent_llm` | 10 | 并发 LLM 调用数 |
 | `max_images_per_call` | 10 | 单次 VLM 最大图片数 |
 | `max_sections_per_call` | 20 | 单次 VLM 最大章节数 |
+| `overview_sample_limit` | 32 | 单个目录摘要使用的直接子项样本上限 |
 
 ## 代码骨架提取
 
@@ -154,7 +167,7 @@ SemanticMsg(
 | 环节 | Resource | Memory | Skill |
 |------|----------|--------|-------|
 | **Parser** | 通用流程 | 通用流程 | 通用流程 |
-| **基础 URI** | `viking://resources` | `viking://user/memories` | `viking://user/skills` |
+| **基础 URI** | `viking://resources` | `viking://~/memories` | `viking://~/skills` |
 | **TreeBuilder scope** | resources | user | user |
 | **SemanticMsg type** | resource | memory | skill |
 
@@ -163,8 +176,8 @@ SemanticMsg(
 ```python
 # 添加资源
 await client.add_resource(
-    "/path/to/doc.pdf",
-    reason="API 文档"
+    path="/path/to/doc.pdf",
+    options={"reason": "API 文档"},
 )
 
 # 流程: Parser → TreeBuilder(scope=resources) → SemanticQueue
@@ -174,12 +187,14 @@ await client.add_resource(
 
 ```python
 # 添加技能
-await client.add_skill({
-    "name": "search-web",
-    "content": "# search-web\\n..."
-})
+await client.add_skill(
+    data={
+        "name": "search-web",
+        "content": "# search-web\\n...",
+    },
+)
 
-# 流程: 直接写入 viking://user/skills/{name}/ → SemanticQueue
+# 流程: 直接写入 viking://~/skills/{name}/ → SemanticQueue
 ```
 
 ### 记忆提取
