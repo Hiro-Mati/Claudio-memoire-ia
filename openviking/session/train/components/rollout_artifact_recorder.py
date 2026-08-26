@@ -71,6 +71,27 @@ class RolloutArtifactRecorder(NoopPipelineLifecycleHook):
         self.commit_case_spec_enabled = commit_case_spec_enabled
         self._case_groups: dict[str, dict[str, Any]] = {}
         self._latest_failed_rollout: Path | None = None
+        self._load_existing_index()
+
+    def _load_existing_index(self) -> None:
+        """Preserve previously recorded groups when a run resumes in place."""
+
+        index_path = self.run_dir / "rollouts_index.json"
+        if not index_path.exists():
+            return
+        try:
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+        for item in payload.get("case_groups", []):
+            if not isinstance(item, dict):
+                continue
+            group_id = str(item.get("case_group_id") or "").strip()
+            if group_id:
+                self._case_groups[group_id] = item
+        latest = str(payload.get("latest_failed_rollout") or "").strip()
+        if latest:
+            self._latest_failed_rollout = Path(latest)
 
     def record_rollout_completion(
         self,

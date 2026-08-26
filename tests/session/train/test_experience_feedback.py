@@ -25,10 +25,11 @@ class FakeVikingFS:
         self.writes.append((uri, content, ctx))
 
 
-def _experience_file(uri: str, *, stats=None) -> str:
+def _experience_file(uri: str, *, stats=None, status: str = "promoted") -> str:
     extra_fields = {
         "memory_type": "experiences",
         "experience_name": "payment_guard",
+        "status": status,
         "trigger_code": 'def should_trigger(ctx):\n    return ctx.get("candidate_tool") == "book"\n',
     }
     if stats is not None:
@@ -135,3 +136,55 @@ async def test_record_experience_feedback_stats_stores_aggregate_counts_only():
         "weak_count": 0,
         "neutral_count": 0,
     }
+
+
+async def test_reproducible_negative_transfer_degrades_promoted_experience():
+    exp_uri = "viking://user/u/memories/experiences/payment_guard.md"
+    fs = FakeVikingFS({exp_uri: _experience_file(exp_uri)})
+    reminder = {"id": "E1", "experience_uri": exp_uri}
+
+    def negative_trajectory(name: str) -> Trajectory:
+        return Trajectory(
+            name=name,
+            uri=f"viking://user/u/memories/trajectories/{name}.md",
+            content=f"# {name}",
+            outcome="failure",
+            retrieval_anchor="Stage: final",
+            metadata={
+                "experience_effects": (
+                    '{"positive_ids":[],"negative_ids":["E1"],"weak_ids":[]}'
+                )
+            },
+        )
+
+    await record_experience_feedback_stats(
+        trajectories=[negative_trajectory("t1")],
+        injected_reminders=[reminder],
+        viking_fs=fs,
+        ctx=None,
+    )
+    after_first = MemoryFileUtils.read(fs.files[exp_uri], uri=exp_uri).extra_fields
+    assert after_first["status"] == "promoted"
+    assert after_first["negative_source_count"] == 1
+
+    # Replaying one trajectory must not count as independent evidence.
+    await record_experience_feedback_stats(
+        trajectories=[negative_trajectory("t1")],
+        injected_reminders=[reminder],
+        viking_fs=fs,
+        ctx=None,
+    )
+    after_replay = MemoryFileUtils.read(fs.files[exp_uri], uri=exp_uri).extra_fields
+    assert after_replay["status"] == "promoted"
+    assert after_replay["negative_source_count"] == 1
+
+    await record_experience_feedback_stats(
+        trajectories=[negative_trajectory("t2")],
+        injected_reminders=[reminder],
+        viking_fs=fs,
+        ctx=None,
+    )
+    after_second = MemoryFileUtils.read(fs.files[exp_uri], uri=exp_uri).extra_fields
+    assert after_second["status"] == "degraded"
+    assert after_second["negative_source_count"] == 2
+    assert after_second["promotion_reason"] == "reproducible_negative_transfer"

@@ -32,6 +32,68 @@ DEFAULT_REMOTE_CASE_PAGE_SIZE = 100
 
 
 @dataclass(slots=True)
+class RemoteBenchmarkLifecycle:
+    """Optional per-run lifecycle exposed by benchmark adapters.
+
+    Generic benchmark services do not have to implement these endpoints. A
+    404/405 from ``start`` means lifecycle management is unsupported and the
+    native runner keeps its previous behavior.
+    """
+
+    service_url: str
+    timeout_seconds: float = 1200.0
+
+    async def start(
+        self,
+        *,
+        run_id: str,
+        dataset: str,
+        domain: str,
+        concurrency: int | None = None,
+        casehub_dataset_ids: list[str] | None = None,
+        casehub_case_ids: list[str] | None = None,
+        task_casehub_dataset_ids: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        body: dict[str, Any] = {"run_id": run_id, "dataset": dataset, "domain": domain}
+        if concurrency is not None:
+            if concurrency <= 0:
+                raise ValueError("concurrency must be > 0")
+            body["concurrency"] = concurrency
+        if casehub_dataset_ids or casehub_case_ids:
+            body["casehub"] = {
+                "dataset_ids": list(casehub_dataset_ids or []),
+                "case_ids": list(casehub_case_ids or []),
+            }
+            if task_casehub_dataset_ids:
+                body["casehub"]["task_dataset_ids"] = list(task_casehub_dataset_ids)
+        async with httpx.AsyncClient(
+            base_url=self.service_url.rstrip("/"), timeout=self.timeout_seconds
+        ) as client:
+            response = await client.post(
+                "/v1/runs/start",
+                json=body,
+            )
+        if response.status_code in {404, 405}:
+            return None
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("benchmark lifecycle start response must be a JSON object")
+        return data
+
+    async def complete(self, *, run_id: str) -> dict[str, Any]:
+        async with httpx.AsyncClient(
+            base_url=self.service_url.rstrip("/"), timeout=self.timeout_seconds
+        ) as client:
+            response = await client.post(f"/v1/runs/{run_id}/complete")
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("benchmark lifecycle completion response must be a JSON object")
+        return data
+
+
+@dataclass(slots=True)
 class RemoteCaseLoader:
     """Load Case batches from a benchmark/environment HTTP service."""
 

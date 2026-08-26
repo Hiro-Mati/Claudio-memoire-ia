@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 from dataclasses import dataclass, field
 from typing import Any
@@ -10,7 +11,8 @@ from typing import Any
 from case_loader import ArkCaseLoader, ArkCaseRepository, task_indices_from_filters
 from fastapi import FastAPI, HTTPException, Request
 from memory_proxy import MemoryProxyConfig, install_memory_proxy
-from platform_client import TrainingPlatformClient
+from platform_client import PlatformAPIError, TrainingPlatformClient
+from pydantic import BaseModel, Field
 from rollout_executor import ArkRolloutExecutor
 
 from openviking.session.train.components.dataset_service import create_dataset_service_app
@@ -20,7 +22,12 @@ from openviking.session.train.components.dataset_service import create_dataset_s
 class ArkAdapterServiceConfig:
     dataset: str
     domain: str
-    platform_task_id: str
+    task_name: str = "openviking_ark4_external_training"
+    workflow_id: str = "ov_external_training"
+    agent_id: str = "ark"
+    evaluator_id: str = "rollout_builtin@v1"
+    task_ready_poll_interval_seconds: float = 2.0
+    task_ready_timeout_seconds: float = 900.0
     rollout_concurrency: int = 16
     rollout_poll_interval_seconds: float = 2.0
     rollout_timeout_seconds: float = 3600.0
@@ -37,16 +44,185 @@ class ArkAdapterServiceConfig:
             raise ValueError("dataset is required")
         if not str(self.domain or "").strip():
             raise ValueError("domain is required")
-        if not str(self.platform_task_id or "").strip():
-            raise ValueError("platform_task_id is required")
         if self.rollout_concurrency <= 0:
             raise ValueError("rollout_concurrency must be > 0")
+
+
+class CaseHubRunSelection(BaseModel):
+    dataset_ids: list[str]
+    case_ids: list[str] = Field(default_factory=list)
+    task_dataset_ids: list[str] = Field(default_factory=list)
+
+
+class StartRunRequest(BaseModel):
+    run_id: str
+    dataset: str
+    domain: str
+    concurrency: int | None = Field(default=None, ge=1)
+    casehub: CaseHubRunSelection
+
+
+@dataclass(slots=True)
+class ArkRun:
+    run_id: str
+    task_id: str
+    status: str
+    task: dict[str, Any]
+    casehub_dataset_ids: list[str]
+    casehub_case_ids: list[str]
+    task_casehub_dataset_ids: list[str]
+    case_count: int
+    concurrency: int
+    repository: ArkCaseRepository | None = field(repr=False)
+    completion: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "status": self.status,
+            "casehub_dataset_ids": self.casehub_dataset_ids,
+            "casehub_case_ids": self.casehub_case_ids,
+            "task_casehub_dataset_ids": self.task_casehub_dataset_ids,
+            "case_count": self.case_count,
+            "concurrency": self.concurrency,
+            "task": self.task,
+            "completion": self.completion,
+        }
+
+
+class ArkRunRegistry:
+    """Bind one native train/eval invocation to one platform Task."""
+
+    def __init__(self, client: TrainingPlatformClient, config: ArkAdapterServiceConfig) -> None:
+        self._client = client
+        self._config = config
+        self._runs: dict[str, ArkRun] = {}
+        self._lock = asyncio.Lock()
+
+    async def start(self, request: StartRunRequest) -> ArkRun:
+        run_id = request.run_id.strip()
+        if not run_id:
+            raise ValueError("run_id is required")
+        if request.dataset != self._config.dataset:
+            raise ValueError(f"Unsupported dataset: {request.dataset}")
+        if request.domain != self._config.domain:
+            raise ValueError(f"Unsupported domain: {request.domain}")
+        dataset_ids = _normalized_ids(request.casehub.dataset_ids, label="dataset_ids")
+        case_ids = _normalized_ids(request.casehub.case_ids, label="case_ids")
+        task_dataset_ids = _normalized_ids(
+            request.casehub.task_dataset_ids or dataset_ids,
+            label="task_dataset_ids",
+        )
+        if not dataset_ids:
+            raise ValueError("casehub.dataset_ids is required")
+        unknown_task_dataset_ids = [
+            dataset_id for dataset_id in task_dataset_ids if dataset_id not in dataset_ids
+        ]
+        if unknown_task_dataset_ids:
+            raise ValueError(
+                "casehub.task_dataset_ids must be a subset of casehub.dataset_ids: "
+                + ", ".join(unknown_task_dataset_ids)
+            )
+        async with self._lock:
+            existing = self._runs.get(run_id)
+            if existing is not None:
+                if (
+                    existing.casehub_dataset_ids != dataset_ids
+                    or existing.casehub_case_ids != case_ids
+                    or existing.task_casehub_dataset_ids != task_dataset_ids
+                    or existing.concurrency
+                    != (request.concurrency or self._config.rollout_concurrency)
+                ):
+                    raise ValueError(
+                        f"benchmark run {run_id} already exists with a different CaseHub selection"
+                    )
+                return existing
+            repository = ArkCaseRepository(
+                client=self._client,
+                dataset_ids=dataset_ids,
+                case_ids=case_ids,
+            )
+            cases = await repository.all_cases()
+            mismatched_case_ids = [
+                str(case.metadata.get("platform_case_id") or case.name)
+                for case in cases
+                if case.metadata.get("dataset_id")
+                and str(case.metadata["dataset_id"]) not in dataset_ids
+            ]
+            if mismatched_case_ids:
+                raise ValueError(
+                    "CaseHub case(s) do not belong to the selected dataset(s): "
+                    + ", ".join(mismatched_case_ids)
+                )
+            body: dict[str, Any] = {
+                "task_name": f"{self._config.task_name}_{run_id}",
+                "workflow_id": self._config.workflow_id,
+                "agent_id": self._config.agent_id,
+                "casehub_dataset_ids": task_dataset_ids,
+                "evaluator_id": self._config.evaluator_id,
+                "workers": request.concurrency or self._config.rollout_concurrency,
+            }
+            created = await self._client.create_training_task(body)
+            task_id = str(created["task_id"])
+            run = ArkRun(
+                run_id=run_id,
+                task_id=task_id,
+                status="created",
+                task=created,
+                casehub_dataset_ids=dataset_ids,
+                casehub_case_ids=case_ids,
+                task_casehub_dataset_ids=task_dataset_ids,
+                case_count=len(cases),
+                concurrency=request.concurrency or self._config.rollout_concurrency,
+                repository=repository,
+            )
+            self._runs[run_id] = run
+            ready = await self._client.wait_for_ov_wait(
+                task_id,
+                poll_interval_seconds=self._config.task_ready_poll_interval_seconds,
+                timeout_seconds=self._config.task_ready_timeout_seconds,
+            )
+            run.task = ready
+            run.status = "ov_wait"
+            print(
+                f"[ark4-adapter] run {run_id} created platform task {task_id}; OV_WAIT ready",
+                flush=True,
+            )
+            return run
+
+    def get(self, run_id: str) -> ArkRun | None:
+        return self._runs.get(run_id)
+
+    def all(self) -> list[ArkRun]:
+        return list(self._runs.values())
+
+    async def complete(self, run_id: str) -> ArkRun:
+        async with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise KeyError(run_id)
+            if run.status == "completed":
+                return run
+            completion = await self._client.complete_external_training(
+                run.task_id,
+                idempotency_key=(
+                    f"{self._config.idempotency_namespace}:{run.task_id}:complete"
+                ),
+            )
+            run.completion = completion
+            run.status = "completed"
+            run.repository = None
+            print(
+                f"[ark4-adapter] run {run_id} completed platform task {run.task_id}",
+                flush=True,
+            )
+            return run
 
 
 def create_app(
     *,
     client: TrainingPlatformClient,
-    repository: ArkCaseRepository,
     config: ArkAdapterServiceConfig,
 ) -> FastAPI:
     """Create the localhost compatibility service consumed by run_batch_train_eval."""
@@ -61,17 +237,49 @@ def create_app(
             raise ValueError(f"Unsupported dataset: {dataset}")
         if domain != config.domain:
             raise ValueError(f"Unsupported domain: {domain}")
+        run_id = str(filters.pop("_openviking_benchmark_run_id", "")).strip()
+        requested_dataset_ids = _normalized_ids(
+            filters.pop("_openviking_casehub_dataset_ids", []),
+            label="_openviking_casehub_dataset_ids",
+        )
+        run = run_registry.get(run_id)
+        if run is None or run.repository is None:
+            raise ValueError(
+                "case query has no active benchmark run; start it through /v1/runs/start first"
+            )
+        if run.status != "ov_wait":
+            raise ValueError(f"benchmark run {run_id} is not active: {run.status}")
+        unknown_dataset_ids = [
+            dataset_id
+            for dataset_id in requested_dataset_ids
+            if dataset_id not in run.casehub_dataset_ids
+        ]
+        if unknown_dataset_ids:
+            raise ValueError(
+                "case query dataset(s) are outside the active benchmark run: "
+                + ", ".join(unknown_dataset_ids)
+            )
         return ArkCaseLoader(
-            repository=repository,
+            repository=run.repository,
             split=split,
             task_indices=task_indices_from_filters(filters),
+            dataset_ids=requested_dataset_ids or None,
         )
 
+    run_registry = ArkRunRegistry(client, config)
+
     def make_rollout_executor(options: dict[str, Any]) -> ArkRolloutExecutor:
-        del options
+        run_id = str(options.pop("_openviking_benchmark_run_id", "")).strip()
+        run = run_registry.get(run_id)
+        if run is None:
+            raise ValueError(
+                "rollout has no active benchmark run; start it through /v1/runs/start first"
+            )
+        if run.status != "ov_wait":
+            raise ValueError(f"benchmark run {run_id} is not active: {run.status}")
         return ArkRolloutExecutor(
             client=client,
-            platform_task_id=config.platform_task_id,
+            platform_task_id=run.task_id,
             connector_config=config.connector_config,
             runtime_params=config.runtime_params,
             extra_header=config.extra_header,
@@ -89,7 +297,7 @@ def create_app(
         max_rollout_concurrency=config.rollout_concurrency,
         rollout_thread_workers=None,
     )
-    app.state.platform_task_id = config.platform_task_id
+    app.state.run_registry = run_registry
     app.state.dataset = config.dataset
     app.state.domain = config.domain
     memory_proxy = install_memory_proxy(app, config.memory_proxy)
@@ -101,20 +309,36 @@ def create_app(
         if not hmac.compare_digest(supplied, config.admin_token):
             raise HTTPException(status_code=401, detail="invalid Ark4 admin token")
 
-    @app.get("/admin/platform-task")
-    async def get_platform_task(request: Request) -> dict[str, Any]:
-        authorize_admin(request)
-        task = await client.get_training_task(config.platform_task_id)
-        return {"task_id": config.platform_task_id, "task": task}
+    @app.post("/v1/runs/start")
+    async def start_run(request: StartRunRequest) -> dict[str, Any]:
+        try:
+            return (await run_registry.start(request)).to_dict()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except PlatformAPIError as exc:
+            status_code = 400 if exc.status_code == 404 else 502
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
-    @app.post("/admin/external-training-completed")
-    async def complete_external_training(request: Request) -> dict[str, Any]:
+    @app.post("/v1/runs/{run_id}/complete")
+    async def complete_run(run_id: str) -> dict[str, Any]:
+        try:
+            return (await run_registry.complete(run_id)).to_dict()
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"run not found: {run_id}") from exc
+
+    @app.get("/admin/platform-runs")
+    async def get_platform_runs(request: Request) -> dict[str, Any]:
         authorize_admin(request)
-        completion = await client.complete_external_training(
-            config.platform_task_id,
-            idempotency_key=(f"{config.idempotency_namespace}:{config.platform_task_id}:complete"),
-        )
-        return {"task_id": config.platform_task_id, "completion": completion}
+        return {"runs": [run.to_dict() for run in run_registry.all()]}
+
+    @app.get("/admin/platform-runs/{run_id}")
+    async def get_platform_run(run_id: str, request: Request) -> dict[str, Any]:
+        authorize_admin(request)
+        run = run_registry.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
+        task = await client.get_training_task(run.task_id)
+        return {**run.to_dict(), "task": task}
 
     @app.get("/admin/memory-proxy")
     async def get_memory_proxy(request: Request) -> dict[str, Any]:
@@ -132,3 +356,14 @@ def create_app(
         }
 
     return app
+
+
+def _normalized_ids(values: list[str], *, label: str) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError(f"casehub.{label} must not contain empty values")
+        if text not in result:
+            result.append(text)
+    return result

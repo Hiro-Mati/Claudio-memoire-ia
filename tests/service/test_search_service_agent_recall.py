@@ -18,8 +18,9 @@ from openviking_cli.retrieve import (
 from openviking_cli.session.user_id import UserIdentifier
 
 
-def _memory_file(status: str | None) -> str:
-    fields = {} if status is None else {"case_status": status}
+def _memory_file(status: str | None, *, memory_type: str = "cases") -> str:
+    status_field = "case_status" if memory_type == "cases" else "status"
+    fields = {} if status is None else {status_field: status}
     return "# Memory\n\n<!-- MEMORY_FIELDS\n" + json.dumps(fields) + "\n-->"
 
 
@@ -95,6 +96,7 @@ async def test_agent_recall_only_returns_promoted_cases_and_filters_provenance(r
         {
             promoted_uri: _memory_file("promoted"),
             draft_uri: _memory_file("draft"),
+            experience_uri: _memory_file("promoted", memory_type="experiences"),
         },
     )
 
@@ -111,7 +113,9 @@ async def test_agent_recall_only_returns_promoted_cases_and_filters_provenance(r
     ]
     assert [item.uri for item in experience.relations] == [promoted_uri]
     assert filtered.total == 2
-    assert sorted(viking_fs.read_uris) == sorted([promoted_uri, draft_uri])
+    assert sorted(viking_fs.read_uris) == sorted(
+        [promoted_uri, draft_uri, experience_uri]
+    )
 
 
 @pytest.mark.asyncio
@@ -145,7 +149,10 @@ async def test_agent_recall_excludes_case_directory_summaries(request_ctx):
         resources=[],
         skills=[],
     )
-    viking_fs = _FakeVikingFS(result, {})
+    viking_fs = _FakeVikingFS(
+        result,
+        {experience_uri: _memory_file("promoted", memory_type="experiences")},
+    )
 
     filtered = await SearchService(viking_fs).find(
         query="report",
@@ -155,7 +162,47 @@ async def test_agent_recall_excludes_case_directory_summaries(request_ctx):
 
     assert [item.uri for item in filtered.memories] == [experience_uri]
     assert filtered.total == 1
-    assert viking_fs.read_uris == []
+    assert viking_fs.read_uris == [experience_uri]
+
+
+@pytest.mark.asyncio
+async def test_agent_recall_only_returns_promoted_experiences(request_ctx):
+    promoted_uri = "viking://user/default/default/memories/experiences/promoted.md"
+    draft_uri = "viking://user/default/default/memories/experiences/draft.md"
+    degraded_uri = "viking://user/default/default/memories/experiences/degraded.md"
+    archived_uri = "viking://user/default/default/memories/experiences/archived.md"
+    legacy_uri = "viking://user/default/default/memories/experiences/legacy.md"
+    result = FindResult(
+        memories=[
+            _context(promoted_uri),
+            _context(draft_uri),
+            _context(degraded_uri),
+            _context(archived_uri),
+            _context(legacy_uri),
+        ],
+        resources=[],
+        skills=[],
+    )
+    viking_fs = _FakeVikingFS(
+        result,
+        {
+            promoted_uri: _memory_file("promoted", memory_type="experiences"),
+            draft_uri: _memory_file("draft", memory_type="experiences"),
+            degraded_uri: _memory_file("degraded", memory_type="experiences"),
+            archived_uri: _memory_file("archived", memory_type="experiences"),
+            # Existing files without lifecycle metadata remain visible for compatibility.
+            legacy_uri: _memory_file(None, memory_type="experiences"),
+        },
+    )
+
+    filtered = await SearchService(viking_fs).find(
+        query="report",
+        ctx=request_ctx,
+        retrieval_purpose="agent_recall",
+    )
+
+    assert [item.uri for item in filtered.memories] == [promoted_uri, legacy_uri]
+    assert filtered.total == 2
 
 
 @pytest.mark.asyncio

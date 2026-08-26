@@ -45,7 +45,7 @@ class ArkCaseRepository:
     case_ids: list[str] = field(default_factory=list)
     caseset_id: str | None = None
     split_field: str | None = None
-    page_size: int = 1000
+    page_size: int = 500
     detail_concurrency: int = 20
     default_split: str = "train"
     _cases: list[Case] | None = field(default=None, init=False, repr=False)
@@ -143,10 +143,18 @@ class ArkCaseLoader:
     repository: ArkCaseRepository
     split: str
     task_indices: list[int] | None = None
+    dataset_ids: list[str] | None = None
 
     async def batches(self, context: Any = None) -> AsyncIterator[list[Case]]:
         del context
         cases = await self.repository.cases_for_split(self.split)
+        if self.dataset_ids:
+            selected_dataset_ids = set(self.dataset_ids)
+            cases = [
+                case
+                for case in cases
+                if str(case.metadata.get("dataset_id") or "") in selected_dataset_ids
+            ]
         if self.task_indices is not None:
             selected: list[Case] = []
             for index in self.task_indices:

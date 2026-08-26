@@ -13,6 +13,11 @@ from typing import Any
 from openviking.message import Message
 from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import MemoryFile, MemoryTypeSchema, StoredLink
+from openviking.session.memory.experience_lifecycle import (
+    experience_lifecycle_fields,
+    experience_source_trajectory_uris,
+    normalize_experience_status,
+)
 from openviking.session.memory.extract_loop import ExtractLoop, PostValidationRetryDecision
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 from openviking.session.memory.memory_type_registry import (
@@ -792,6 +797,25 @@ async def _operations_to_plan_items(
             ),
             include_all_sources=(upsert_output_count == 1 or single_source_trajectory),
         )
+        existing_policy = _find_policy_for_plan_item(
+            policy_set,
+            target_uri=target_uri,
+            target_name=target_name,
+        )
+        if memory_type == "experiences":
+            item_links = _merge_source_trajectory_links(
+                [
+                    *_source_trajectory_links_from_experience(existing_policy),
+                    *item_links,
+                ]
+            )
+            plan_fields.update(
+                experience_lifecycle_fields(
+                    existing_policy=existing_policy,
+                    links=item_links,
+                    gradients=_gradients_for_source_links(gradients, item_links),
+                )
+            )
         items.append(
             PolicyPlanItem(
                 kind="upsert",
@@ -834,6 +858,46 @@ async def _operations_to_plan_items(
         )
         if not target_uri or target_uri in upsert_target_uris:
             continue
+        item_links = _source_trajectory_links_for_plan_item(
+            target_uri=target_uri,
+            target_name=target_name,
+            before_content=old_file.plain_content(),
+            after_content=None,
+            trigger_code=str((old_file.extra_fields or {}).get("trigger_code") or ""),
+            source_links_by_target=source_links_by_target,
+            replacement_source_uris=[],
+        )
+        if memory_type == "experiences":
+            existing_policy = _find_policy_for_plan_item(
+                policy_set,
+                target_uri=target_uri,
+                target_name=target_name,
+            )
+            item_links = _merge_source_trajectory_links(
+                [
+                    *_source_trajectory_links_from_experience(existing_policy),
+                    *item_links,
+                ]
+            )
+            items.append(
+                _archived_experience_plan_item(
+                    target_name=target_name,
+                    target_uri=target_uri,
+                    before_content=old_file.plain_content(),
+                    base_version=_base_version_from_old_file_or_policy(
+                        old_file,
+                        target_uri,
+                        policy_set,
+                    ),
+                    confidence=confidence,
+                    links=item_links,
+                    fields=dict(old_file.extra_fields or {}),
+                    rationale="PatchMergeContextProvider retired this Experience.",
+                    merge_gradient_count=len(gradients),
+                )
+            )
+            delete_uris.add(target_uri)
+            continue
         items.append(
             PolicyPlanItem(
                 kind="delete",
@@ -843,15 +907,7 @@ async def _operations_to_plan_items(
                 before_content=old_file.plain_content(),
                 after_content=None,
                 confidence=confidence,
-                links=_source_trajectory_links_for_plan_item(
-                    target_uri=target_uri,
-                    target_name=target_name,
-                    before_content=old_file.plain_content(),
-                    after_content=None,
-                    trigger_code=str((old_file.extra_fields or {}).get("trigger_code") or ""),
-                    source_links_by_target=source_links_by_target,
-                    replacement_source_uris=[],
-                ),
+                links=item_links,
                 metadata={
                     "rationale": "PatchMergeContextProvider merge requested memory deletion.",
                     "merge_gradient_count": len(gradients),
@@ -863,30 +919,82 @@ async def _operations_to_plan_items(
     for policy in superseded_policies:
         if policy.uri in upsert_target_uris or policy.uri in delete_uris:
             continue
+        superseded_by = [
+            item.target_uri or item.target_name
+            for item in items
+            if item.kind == "upsert"
+            and item.target_uri != policy.uri
+            and normalize_experience_status(
+                (item.metadata.get("merge_memory_fields") or {}).get("status"),
+                default="draft",
+            )
+            != "archived"
+        ]
         items.append(
-            PolicyPlanItem(
-                kind="delete",
-                memory_type=memory_type,
+            _archived_experience_plan_item(
                 target_name=policy.name,
                 target_uri=policy.uri,
                 before_content=policy.content,
-                after_content=None,
                 base_version=policy.version,
                 confidence=confidence,
                 links=_source_trajectory_links_from_experience(policy),
-                metadata={
-                    "rationale": "Superseded by broader experience from semantic gradient.",
-                    "merge_gradient_count": len(gradients),
-                    "superseded_by": [
-                        item.target_uri or item.target_name
-                        for item in items
-                        if item.kind == "upsert"
-                    ],
-                },
+                fields=dict(policy.metadata or {}),
+                rationale="Superseded by broader Experience from semantic gradient.",
+                merge_gradient_count=len(gradients),
+                superseded_by=superseded_by,
             )
         )
         delete_uris.add(policy.uri)
     return items
+
+
+def _archived_experience_plan_item(
+    *,
+    target_name: str,
+    target_uri: str,
+    before_content: str,
+    base_version: int | None,
+    confidence: float | None,
+    links: list[StoredLink],
+    fields: dict[str, Any],
+    rationale: str,
+    merge_gradient_count: int,
+    superseded_by: list[str] | None = None,
+) -> PolicyPlanItem:
+    """Retain retired Experience content and provenance outside Agent recall."""
+
+    archived_fields = {
+        key: value
+        for key, value in fields.items()
+        if key not in {"content", "constraint", "trigger_code"}
+    }
+    archived_fields.update(
+        {
+            "status": "archived",
+            "source_count": max(
+                safe_int(archived_fields.get("source_count")) or 0,
+                len(experience_source_trajectory_uris(links)),
+            ),
+            "promotion_reason": "superseded_or_obsolete",
+        }
+    )
+    return PolicyPlanItem(
+        kind="upsert",
+        memory_type="experiences",
+        target_name=target_name,
+        target_uri=target_uri,
+        before_content=before_content,
+        after_content=before_content,
+        base_version=base_version,
+        confidence=confidence,
+        links=links,
+        metadata={
+            "rationale": rationale,
+            "merge_gradient_count": merge_gradient_count,
+            "merge_memory_fields": archived_fields,
+            **({"superseded_by": superseded_by} if superseded_by else {}),
+        },
+    )
 
 
 def _plan_quality_review_metadata(
@@ -1294,6 +1402,39 @@ def _find_policy_by_uri(policy_set: PolicySet, uri: str) -> Policy | None:
         if policy.uri == uri:
             return policy
     return None
+
+
+def _find_policy_for_plan_item(
+    policy_set: PolicySet,
+    *,
+    target_uri: str | None,
+    target_name: str,
+) -> Policy | None:
+    if target_uri:
+        policy = _find_policy_by_uri(policy_set, target_uri)
+        if policy is not None:
+            return policy
+    for policy in policy_set.policies:
+        if policy.name == target_name:
+            return policy
+    return None
+
+
+def _gradients_for_source_links(
+    gradients: list[SemanticGradient],
+    links: list[StoredLink],
+) -> list[SemanticGradient]:
+    source_uris = experience_source_trajectory_uris(links)
+    if not source_uris:
+        return list(gradients) if len(gradients) == 1 else []
+    related = [
+        gradient
+        for gradient in gradients
+        if source_uris.intersection(
+            experience_source_trajectory_uris(list(getattr(gradient, "links", []) or []))
+        )
+    ]
+    return related
 
 
 def _base_version_from_old_file_or_policy(

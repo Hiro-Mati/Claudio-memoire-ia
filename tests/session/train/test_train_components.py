@@ -476,6 +476,49 @@ async def test_split_experiences_keep_single_trajectory_provenance():
     )
 
 
+@pytest.mark.asyncio
+async def test_experience_delete_operation_is_preserved_as_archived():
+    from openviking.session.memory.dataclass import ResolvedOperations
+
+    policy_set = _experience_set()
+    old_file = _memory_file(
+        name="booking_duplicate_handling",
+        uri=policy_set.policies[0].uri,
+        content="content",
+        status="promoted",
+    )
+    operations = ResolvedOperations(
+        upsert_operations=[],
+        delete_file_contents=[old_file],
+        errors=[],
+    )
+
+    items = await _operations_to_plan_items(
+        operations=operations,
+        gradients=[_patch_gradient()],
+        policy_set=policy_set,
+        memory_type="experiences",
+        schema=PatchMergePolicyOptimizer()._get_schema(),
+    )
+
+    assert len(items) == 1
+    item = items[0]
+    assert item.kind == "upsert"
+    assert item.after_content == "content"
+    assert item.metadata["merge_memory_fields"]["status"] == "archived"
+    assert (
+        item.metadata["merge_memory_fields"]["promotion_reason"]
+        == "superseded_or_obsolete"
+    )
+    applied = await DryRunPolicyUpdater().apply(
+        PolicyUpdatePlan(items=items),
+        policy_set,
+    )
+    archived = applied.updated_policy_set.policies[0]
+    assert archived.status == "archived"
+    assert archived.metadata["status"] == "archived"
+
+
 def _plan_item_from_gradient(gradient: PatchSemanticGradient):
     from openviking.session.train import PolicyPlanItem
 
@@ -550,7 +593,8 @@ async def test_experience_set_loader_reads_memory_files():
     policy = loaded.policies[0]
     assert policy.name == "booking_duplicate_handling"
     assert policy.version == 3
-    assert policy.status == "staging"
+    assert policy.status == "draft"
+    assert policy.metadata["status"] == "draft"
     assert policy.content == "## Situation\n- test"
     assert policy.metadata["memory_type"] == "experiences"
 

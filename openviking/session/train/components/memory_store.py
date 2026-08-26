@@ -9,13 +9,22 @@ from typing import Any
 
 from openviking.core.skill_loader import SkillLoader
 from openviking.server.identity import RequestContext
+from openviking.session.memory.experience_lifecycle import normalize_experience_status
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.train.domain import Policy, PolicySet, PolicyStatus
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import tracer
 
 _HIDDEN_MEMORY_FILES = {".overview.md", ".abstract.md"}
-_ALLOWED_STATUSES = {"draft", "staging", "production", "deprecated", "archived"}
+_ALLOWED_STATUSES = {
+    "draft",
+    "promoted",
+    "degraded",
+    "staging",
+    "production",
+    "deprecated",
+    "archived",
+}
 
 
 @dataclass(slots=True)
@@ -55,9 +64,10 @@ class ExperienceSetLoader:
             fields = dict(mf.extra_fields or {})
             policy_name = str(fields.get("experience_name") or name.removesuffix(".md"))
             version = _safe_int(fields.get("version"), default=1)
-            status = _safe_status(fields.get("status"))
+            status = normalize_experience_status(fields.get("status"))
             metadata = dict(fields)
             metadata.setdefault("memory_type", mf.memory_type or fields.get("memory_type"))
+            metadata["status"] = status
             policies.append(
                 Policy(
                     name=policy_name,

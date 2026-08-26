@@ -88,6 +88,7 @@ async def test_loader_unions_case_linked_and_loaded_candidates_with_uri_deduplic
     case_first_uri = "viking://user/user/memories/experiences/case-first.md"
     shared_uri = "viking://user/user/memories/experiences/shared.md"
     loaded_only_uri = "viking://user/user/memories/experiences/loaded-only.md"
+    archived_uri = "viking://user/user/memories/experiences/archived.md"
     case = MemoryFile(
         uri=case_uri,
         content="case",
@@ -108,9 +109,17 @@ async def test_loader_unions_case_linked_and_loaded_candidates_with_uri_deduplic
                     extra_fields={"experience_name": uri.rsplit("/", 1)[-1][:-3]},
                 )
             )
-            for uri in (case_first_uri, shared_uri, loaded_only_uri)
+            for uri in (case_first_uri, shared_uri, loaded_only_uri, archived_uri)
         },
     }
+    files[archived_uri] = _raw(
+        MemoryFile(
+            uri=archived_uri,
+            content="retired",
+            memory_type="experiences",
+            extra_fields={"experience_name": "archived", "status": "archived"},
+        )
+    )
     viking_fs = AsyncMock()
     viking_fs.read_file = AsyncMock(side_effect=lambda uri, ctx=None: files[uri])
     loader = ExperienceEvidenceLoader(viking_fs)
@@ -118,7 +127,12 @@ async def test_loader_unions_case_linked_and_loaded_candidates_with_uri_deduplic
     bundle = await loader.load(
         _query(
             case_uri=case_uri,
-            loaded_experience_uris=[shared_uri, loaded_only_uri, loaded_only_uri],
+            loaded_experience_uris=[
+                shared_uri,
+                loaded_only_uri,
+                loaded_only_uri,
+                archived_uri,
+            ],
         ),
         _ctx(),
     )
@@ -289,16 +303,19 @@ async def test_loader_prefers_case_linked_successes_in_reverse_link_recency() ->
 
     bundle = await loader.load(_query(case_uri=case_uri), _ctx())
 
-    assert [item.memory_file.uri for item in bundle.comparison_trajectories] == list(
-        reversed(success_uris)
-    )
+    assert [item.memory_file.uri for item in bundle.comparison_trajectories] == [
+        failure_uri,
+        *reversed(success_uris),
+    ]
     assert all(
         item.memory_file.content.endswith("\n...<truncated>")
         for item in bundle.comparison_trajectories
+        if item.memory_file.uri in success_uris
     )
     assert [call.args[0] for call in viking_fs.read_file.await_args_list] == [
         case_uri,
         *reversed(success_uris),
+        failure_uri,
     ]
 
 

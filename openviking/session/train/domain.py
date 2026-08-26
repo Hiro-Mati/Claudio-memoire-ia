@@ -20,7 +20,15 @@ from openviking.session.memory.dataclass import StoredLink
 if TYPE_CHECKING:
     from openviking.session.train.gradients import PatchSemanticGradient
 
-PolicyStatus = Literal["draft", "staging", "production", "deprecated", "archived"]
+PolicyStatus = Literal[
+    "draft",
+    "promoted",
+    "degraded",
+    "staging",
+    "production",
+    "deprecated",
+    "archived",
+]
 TrajectoryOutcome = Literal["success", "failure", "partial", "unfinished", "unknown"]
 PolicyPlanItemKind = Literal["upsert", "delete"]
 

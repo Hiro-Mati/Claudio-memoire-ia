@@ -47,8 +47,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("command", choices=("start", "stop", "status"))
     parser.add_argument(
         "--config",
-        default=str(SCRIPT_DIR / "kubevpn_config.local.json"),
-        help="JSON config (default: kubevpn_config.local.json next to this script)",
+        default=str(SCRIPT_DIR / "adapter_config.local.json"),
+        help=(
+            "Combined adapter JSON config "
+            "(default: adapter_config.local.json next to this script)"
+        ),
     )
     return parser.parse_args()
 
@@ -56,17 +59,32 @@ def parse_args() -> argparse.Namespace:
 def load_config(path: str | Path) -> ProxyConfig:
     config_path = Path(path).expanduser().resolve()
     try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        root = json.loads(config_path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise ValueError(f"kubevpn config does not exist: {config_path}") from exc
     except json.JSONDecodeError as exc:
         raise ValueError(f"kubevpn config is not valid JSON: {exc}") from exc
-    if not isinstance(raw, dict):
+    if not isinstance(root, dict):
         raise ValueError("kubevpn config root must be a JSON object")
+    combined = "kubevpn" in root
+    raw = _object(root.get("kubevpn"), "kubevpn") if combined else root
+    if not raw:
+        raise ValueError("combined config must contain a non-empty kubevpn object")
     probe = _object(raw.get("probe"), "probe")
     headers = _string_dict(raw.get("headers"), "headers")
-    deployment = _text(raw.get("deployment"), "deployment")
-    openviking_target = _text(raw.get("openviking_target"), "openviking_target")
+    if combined:
+        openviking_target = _combined_openviking_target(root, raw)
+        local_port = _combined_local_port(root, raw)
+        deployment = _text(
+            raw.get("deployment") or f"ov-proxy-{openviking_target}",
+            "kubevpn.deployment",
+        )
+        remote_port = _port(raw.get("remote_port", 8765), "kubevpn.remote_port")
+    else:
+        deployment = _text(raw.get("deployment"), "deployment")
+        openviking_target = _text(raw.get("openviking_target"), "openviking_target")
+        local_port = _port(raw.get("local_port"), "local_port")
+        remote_port = _port(raw.get("remote_port"), "remote_port")
     expected_deployment = f"ov-proxy-{openviking_target}"
     if deployment != expected_deployment:
         raise ValueError(
@@ -75,17 +93,22 @@ def load_config(path: str | Path) -> ProxyConfig:
         )
     probe_enabled = _boolean(probe.get("enabled"), "probe.enabled", default=False)
     probe_host = _text(probe.get("host") or "127.0.0.1", "probe.host")
-    local_port = _port(raw.get("local_port"), "local_port")
     local_health_url = str(raw.get("local_health_url") or "").strip()
     if probe_enabled and not local_health_url:
         local_health_url = f"http://{probe_host}:{local_port}/healthz"
+    elif combined and not local_health_url:
+        service = _object(root.get("service"), "service")
+        service_host = str(service.get("host") or "127.0.0.1").strip()
+        if service_host in {"0.0.0.0", "::"}:
+            service_host = "127.0.0.1"
+        local_health_url = f"http://{service_host}:{local_port}/health"
     return ProxyConfig(
         path=config_path,
         kubeconfig=_path(raw.get("kubeconfig"), "kubeconfig", base=config_path.parent),
         namespace=_text(raw.get("namespace"), "namespace"),
         deployment=deployment,
         openviking_target=openviking_target,
-        remote_port=_port(raw.get("remote_port"), "remote_port"),
+        remote_port=remote_port,
         local_port=local_port,
         headers=headers,
         image=str(raw.get("image") or "").strip(),
@@ -118,6 +141,42 @@ def load_config(path: str | Path) -> ProxyConfig:
             "probe.marker",
         ),
     )
+
+
+def _combined_openviking_target(
+    root: dict[str, Any],
+    kubevpn: dict[str, Any],
+) -> str:
+    memory_proxy = _object(root.get("memory_proxy"), "memory_proxy")
+    proxy_target = str(memory_proxy.get("openviking_target") or "").strip()
+    rollout = _object(root.get("rollout"), "rollout")
+    runtime_params = _object(rollout.get("runtime_params"), "rollout.runtime_params")
+    memory = _object(runtime_params.get("memory"), "rollout.runtime_params.memory")
+    rollout_target = str(memory.get("openviking_target") or "").strip()
+    kubevpn_target = str(kubevpn.get("openviking_target") or "").strip()
+    targets = [value for value in (kubevpn_target, proxy_target, rollout_target) if value]
+    if not targets:
+        raise ValueError(
+            "rollout.runtime_params.memory.openviking_target is required when kubevpn is configured"
+        )
+    if len(set(targets)) != 1:
+        raise ValueError(
+            "kubevpn, memory_proxy, and rollout memory openviking_target values must match: "
+            f"{targets!r}"
+        )
+    return targets[0]
+
+
+def _combined_local_port(root: dict[str, Any], kubevpn: dict[str, Any]) -> int:
+    service = _object(root.get("service"), "service")
+    service_port = _port(service.get("port", 1944), "service.port")
+    local_port = _port(kubevpn.get("local_port", service_port), "kubevpn.local_port")
+    if service_port != local_port:
+        raise ValueError(
+            "kubevpn.local_port must equal service.port so callbacks reach the adapter: "
+            f"{local_port!r} != {service_port!r}"
+        )
+    return local_port
 
 
 def build_kubevpn_command(config: ProxyConfig) -> list[str]:

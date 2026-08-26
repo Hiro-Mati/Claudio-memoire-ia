@@ -39,6 +39,38 @@ fields:
       Good: "verify_before_irreversible_action", "missing_required_output", "关键校验遗漏".
     merge_op: immutable
 
+  - name: status
+    type: string
+    description: |
+      System-managed lifecycle state: draft, promoted, degraded, or archived.
+    merge_op: replace
+    init_value: draft
+    system_managed: true
+
+  - name: source_count
+    type: int64
+    description: |
+      System-managed count of independent source trajectories supporting this Experience.
+    merge_op: replace
+    init_value: "0"
+    system_managed: true
+
+  - name: promotion_reason
+    type: string
+    description: |
+      System-managed reason for the current lifecycle decision.
+    merge_op: replace
+    init_value: single_trajectory_only
+    system_managed: true
+
+  - name: negative_source_count
+    type: int64
+    description: |
+      System-managed count of independent trajectories that observed harmful transfer.
+    merge_op: replace
+    init_value: "0"
+    system_managed: true
+
   - name: situation
     type: string
     description: |

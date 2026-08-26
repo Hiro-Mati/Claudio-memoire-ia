@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import MemoryFile
+from openviking.session.memory.experience_lifecycle import normalize_experience_status
 from openviking.session.memory.session_extract_context_provider import (
     SessionExtractContextProvider,
 )
@@ -230,6 +231,10 @@ class ExperienceEvidenceLoader:
                 continue
             if memory_file.memory_type and memory_file.memory_type != EXPERIENCE_MEMORY_TYPE:
                 continue
+            if normalize_experience_status(
+                (memory_file.extra_fields or {}).get("status")
+            ) == "archived":
+                continue
             candidates.append(CandidateExperienceEvidence(memory_file=memory_file))
         return candidates
 
@@ -244,8 +249,16 @@ class ExperienceEvidenceLoader:
         seen = {query.trajectory_uri}
         linked_uris = _case_linked_trajectory_uris(case_file)
         results = await self._read_trajectory_evidence(linked_uris, seen, ctx)
+        non_successes = [item for item in results if not _is_success_trajectory(item.memory_file)]
         successes = [item for item in results if _is_success_trajectory(item.memory_file)]
-        return successes[:COMPARISON_TRAJ_TOP_K]
+        ordered: list[TrajectoryEvidence] = []
+        if non_successes:
+            ordered.append(non_successes.pop(0))
+        if successes:
+            ordered.append(successes.pop(0))
+        ordered.extend(non_successes)
+        ordered.extend(successes)
+        return ordered[:COMPARISON_TRAJ_TOP_K]
 
     async def _load_case_file(
         self,
@@ -330,7 +343,13 @@ def _case_linked_trajectory_uris(case_file: MemoryFile | None) -> list[str]:
         return []
     recency_by_uri: dict[str, tuple[str, str]] = {}
     for link in list(case_file.links or []) + list(case_file.backlinks or []):
-        if str(link.get("link_type") or "") != "successful_trajectory":
+        if str(link.get("link_type") or "") not in {
+            "successful_trajectory",
+            "failed_trajectory",
+            "partial_trajectory",
+            "unfinished_trajectory",
+            "unknown_trajectory",
+        }:
             continue
         created_at = str(link.get("created_at") or "")
         for uri in _link_uris(link):
@@ -418,7 +437,8 @@ and which runtime source binds the rule. """
 - One failed or partial `new_trajectory`, or one successful `new_trajectory` whose structured
   recovery evidence proves a material failed path, an actually executed alternative, and a
   verified recovered result
-- Up to two successful `comparison_trajectory` records from the exact same case
+- Up to two `comparison_trajectory` records from the exact same case, including successful and
+  non-successful peers when available
 - Existing `candidate_experience` memories linked to the exact case, actually loaded in the
   failed rollout, or found as semantically similar reusable failure patterns
 
@@ -465,6 +485,9 @@ that was missed.
   are all supported by runtime evidence.
 - Ordinary successful, case-specific, unsupported, random, already-covered, or non-preventable
   trajectories: output no changes.
+- A non-full trajectory may still contribute a narrow, evidenced repair. Update the single
+  compatible candidate when peer trajectories support the same trigger, decision boundary,
+  corrective action, and verification. Do not broaden the rule merely to make sources agree.
 - Treat trajectories as factual evidence, not authoritative conclusions. Compare observations,
   decisions, actions, verification, and outputs at the first material divergence.
 - Do not copy trajectory wording directly into an experience. Re-check runtime evidence,
@@ -625,7 +648,7 @@ All memory content must be written in {output_language}.
                 "role": "user",
                 "content": "\n".join(
                     [
-                        "You have already read one `new_trajectory`, optional exact-case successful `comparison_trajectory` records, and candidate experience memories.",
+                        "You have already read one `new_trajectory`, optional exact-case peer `comparison_trajectory` records, and candidate experience memories.",
                         "Treat `new_trajectory` as the new execution to incorporate.",
                         "Treat `comparison_trajectory` as factual peer evidence for comparing success and failure paths; do not modify it directly.",
                         "Treat `candidate_experience` as existing memories you may update, replace, or skip.",

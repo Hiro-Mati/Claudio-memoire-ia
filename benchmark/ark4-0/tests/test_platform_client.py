@@ -11,6 +11,7 @@ async def test_platform_client_runs_task_rollout_and_completion_flow() -> None:
 
     def gateway_handler(request: httpx.Request) -> httpx.Response:
         nonlocal task_reads
+        assert request.headers["x-vaka-request-source"] == "ark-lx"
         if request.method == "POST" and request.url.path == "/inspect/training/tasks":
             return httpx.Response(
                 200,
@@ -92,6 +93,8 @@ async def test_platform_client_runs_task_rollout_and_completion_flow() -> None:
             gateway_base_url="https://gateway.test",
             api_key="secret",
             project_id="project-1",
+            vaka_request_source="ark-lx",
+            headers={"X-Vaka-Request-Source": "must-be-overridden"},
         ),
         transport=httpx.MockTransport(gateway_handler),
     )

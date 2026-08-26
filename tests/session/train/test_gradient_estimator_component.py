@@ -310,7 +310,7 @@ async def test_experience_gradient_estimator_allows_verified_observed_recovery()
 
 
 @pytest.mark.asyncio
-async def test_experience_gradient_estimator_requires_passed_evaluation_for_recovery():
+async def test_experience_gradient_estimator_allows_non_full_observed_recovery_as_draft_evidence():
     analysis = _analysis(passed=False, outcome="success")
     analysis.trajectories[0].metadata["recovery_evidence"] = {
         "status": "observed_recovered",
@@ -323,7 +323,8 @@ async def test_experience_gradient_estimator_requires_passed_evaluation_for_reco
     gradients = await estimator.estimate(analysis, _experience_set(), _context())
 
     assert gradients == []
-    assert estimator.calls == []
+    assert len(estimator.calls) == 1
+    assert estimator.calls[0][0] is analysis.trajectories[0]
 
 
 @pytest.mark.asyncio

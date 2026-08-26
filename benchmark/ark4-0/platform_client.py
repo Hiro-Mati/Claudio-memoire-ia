@@ -27,11 +27,18 @@ class PlatformClientConfig:
     gateway_base_url: str
     api_key: str | None = None
     project_id: str | None = None
+    vaka_request_source: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
     timeout_seconds: float = 120.0
 
     def __post_init__(self) -> None:
         self.gateway_base_url = _required_url(self.gateway_base_url, "gateway_base_url")
+        if self.vaka_request_source is not None:
+            self.vaka_request_source = str(self.vaka_request_source).strip()
+            if not self.vaka_request_source:
+                raise ValueError("vaka_request_source must not be empty")
+            if "\r" in self.vaka_request_source or "\n" in self.vaka_request_source:
+                raise ValueError("vaka_request_source must not contain CR/LF")
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be > 0")
 
@@ -47,6 +54,11 @@ class TrainingPlatformClient:
     ) -> None:
         self.config = config
         headers = dict(config.headers)
+        for key in list(headers):
+            if key.lower() == "x-vaka-request-source":
+                del headers[key]
+        if config.vaka_request_source:
+            headers["x-vaka-request-source"] = config.vaka_request_source
         if config.api_key:
             headers.setdefault("X-API-Key", config.api_key)
         if config.project_id:

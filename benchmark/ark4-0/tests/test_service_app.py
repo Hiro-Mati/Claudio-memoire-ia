@@ -32,14 +32,36 @@ def make_case() -> Case:
     )
 
 
-class StaticRepository:
-    async def cases_for_split(self, split: str) -> list[Case]:
-        return [make_case()] if split == "train" else []
-
-
 class CompletedPlatformClient:
     def __init__(self) -> None:
         self.completed = False
+        self.created_count = 0
+        self.created_bodies: list[dict[str, Any]] = []
+
+    async def create_training_task(self, body: dict[str, Any]) -> dict[str, Any]:
+        self.created_bodies.append(body)
+        self.created_count += 1
+        return {"task_id": f"task-{self.created_count}", "status": "pending"}
+
+    async def get_case(self, case_id: str) -> dict[str, Any]:
+        dataset_id = {"case-1": "dataset-1", "case-2": "dataset-2"}[case_id]
+        return {
+            "case_id": case_id,
+            "dataset_id": dataset_id,
+            "name": f"adapter {case_id}",
+            "envelope": {"user_query": f"hello {case_id}"},
+        }
+
+    async def wait_for_ov_wait(
+        self,
+        task_id: str,
+        *,
+        poll_interval_seconds: float,
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        assert poll_interval_seconds > 0
+        assert timeout_seconds > 0
+        return {"task_id": task_id, "status": "running", "current_step": "OV_WAIT"}
 
     async def get_training_task(self, task_id: str) -> dict[str, Any]:
         assert task_id == "task-1"
@@ -91,11 +113,9 @@ async def test_generic_service_contract_executes_platform_rollout() -> None:
     platform_client = CompletedPlatformClient()
     app = create_app(
         client=platform_client,  # type: ignore[arg-type]
-        repository=StaticRepository(),  # type: ignore[arg-type]
         config=ArkAdapterServiceConfig(
             dataset="ark4-0",
             domain="ark",
-            platform_task_id="task-1",
             rollout_concurrency=2,
             rollout_poll_interval_seconds=0.001,
             rollout_timeout_seconds=1,
@@ -106,6 +126,38 @@ async def test_generic_service_contract_executes_platform_rollout() -> None:
         transport=httpx.ASGITransport(app=app),
         base_url="http://adapter.test",
     ) as client:
+        start_response = await client.post(
+            "/v1/runs/start",
+            json={
+                "run_id": "run-1",
+                "dataset": "ark4-0",
+                "domain": "ark",
+                "concurrency": 30,
+                "casehub": {"dataset_ids": ["dataset-1"], "case_ids": ["case-1"]},
+            },
+        )
+        assert start_response.status_code == 200
+        assert start_response.json()["task_id"] == "task-1"
+        assert platform_client.created_count == 1
+        assert platform_client.created_bodies[0]["casehub_dataset_ids"] == ["dataset-1"]
+        assert platform_client.created_bodies[0]["workers"] == 30
+        assert start_response.json()["concurrency"] == 30
+        assert start_response.json()["task_casehub_dataset_ids"] == ["dataset-1"]
+        assert platform_client.created_bodies[0]["task_name"].endswith("_run-1")
+
+        duplicate_start = await client.post(
+            "/v1/runs/start",
+            json={
+                "run_id": "run-1",
+                "dataset": "ark4-0",
+                "domain": "ark",
+                "concurrency": 30,
+                "casehub": {"dataset_ids": ["dataset-1"], "case_ids": ["case-1"]},
+            },
+        )
+        assert duplicate_start.json()["task_id"] == "task-1"
+        assert platform_client.created_count == 1
+
         case_response = await client.post(
             "/v1/cases/query",
             json={
@@ -113,7 +165,7 @@ async def test_generic_service_contract_executes_platform_rollout() -> None:
                 "domain": "ark",
                 "split": "train",
                 "limit": 10,
-                "filters": {},
+                "filters": {"_openviking_benchmark_run_id": "run-1"},
             },
         )
         assert case_response.status_code == 200
@@ -133,7 +185,7 @@ async def test_generic_service_contract_executes_platform_rollout() -> None:
                     "policy_snapshot_id": "snapshot-1",
                     "metadata": {"training": True, "epoch": 0},
                 },
-                "options": {},
+                "options": {"_openviking_benchmark_run_id": "run-1"},
             },
         )
         assert execute_response.status_code == 200
@@ -154,18 +206,136 @@ async def test_generic_service_contract_executes_platform_rollout() -> None:
             "assistant",
         ]
 
-        unauthorized = await client.get("/admin/platform-task")
+        unauthorized = await client.get("/admin/platform-runs")
         assert unauthorized.status_code == 401
 
         admin_headers = {"X-Ark4-Admin-Token": "admin-secret"}
-        task_response = await client.get("/admin/platform-task", headers=admin_headers)
+        task_response = await client.get("/admin/platform-runs/run-1", headers=admin_headers)
         assert task_response.status_code == 200
         assert task_response.json()["task_id"] == "task-1"
 
         complete_response = await client.post(
-            "/admin/external-training-completed",
-            headers=admin_headers,
+            "/v1/runs/run-1/complete",
         )
         assert complete_response.status_code == 200
         assert complete_response.json()["completion"]["status"] == "succeeded"
         assert platform_client.completed is True
+
+
+@pytest.mark.asyncio
+async def test_each_run_has_its_own_casehub_selection() -> None:
+    platform_client = CompletedPlatformClient()
+    app = create_app(
+        client=platform_client,  # type: ignore[arg-type]
+        config=ArkAdapterServiceConfig(dataset="ark4-0", domain="ark"),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://adapter.test",
+    ) as client:
+        for run_id, dataset_id, case_id in (
+            ("run-1", "dataset-1", "case-1"),
+            ("run-2", "dataset-2", "case-2"),
+        ):
+            response = await client.post(
+                "/v1/runs/start",
+                json={
+                    "run_id": run_id,
+                    "dataset": "ark4-0",
+                    "domain": "ark",
+                    "casehub": {"dataset_ids": [dataset_id], "case_ids": [case_id]},
+                },
+            )
+            assert response.status_code == 200
+            assert response.json()["casehub_case_ids"] == [case_id]
+            assert response.json()["case_count"] == 1
+
+            cases = await client.post(
+                "/v1/cases/query",
+                json={
+                    "dataset": "ark4-0",
+                    "domain": "ark",
+                    "split": "train",
+                    "limit": 10,
+                    "filters": {"_openviking_benchmark_run_id": run_id},
+                },
+            )
+            assert cases.status_code == 200
+            assert [item["input"]["task_id"] for item in cases.json()["cases"]] == [case_id]
+
+    assert [body["casehub_dataset_ids"] for body in platform_client.created_bodies] == [
+        ["dataset-1"],
+        ["dataset-2"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_casehub_selection_is_validated_before_task_creation() -> None:
+    platform_client = CompletedPlatformClient()
+    app = create_app(
+        client=platform_client,  # type: ignore[arg-type]
+        config=ArkAdapterServiceConfig(dataset="ark4-0", domain="ark"),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://adapter.test",
+    ) as client:
+        response = await client.post(
+            "/v1/runs/start",
+            json={
+                "run_id": "run-invalid",
+                "dataset": "ark4-0",
+                "domain": "ark",
+                "casehub": {"dataset_ids": ["dataset-1"], "case_ids": ["case-2"]},
+            },
+        )
+
+    assert response.status_code == 400
+    assert "do not belong" in response.json()["detail"]
+    assert platform_client.created_count == 0
+
+
+@pytest.mark.asyncio
+async def test_case_query_can_select_one_dataset_from_multi_dataset_run() -> None:
+    platform_client = CompletedPlatformClient()
+    app = create_app(
+        client=platform_client,  # type: ignore[arg-type]
+        config=ArkAdapterServiceConfig(dataset="ark4-0", domain="ark"),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://adapter.test",
+    ) as client:
+        start_response = await client.post(
+            "/v1/runs/start",
+            json={
+                "run_id": "run-multi",
+                "dataset": "ark4-0",
+                "domain": "ark",
+                "casehub": {
+                    "dataset_ids": ["dataset-1", "dataset-2"],
+                    "case_ids": ["case-1", "case-2"],
+                    "task_dataset_ids": ["dataset-1"],
+                },
+            },
+        )
+        assert start_response.status_code == 200
+        assert platform_client.created_bodies[0]["casehub_dataset_ids"] == ["dataset-1"]
+        assert start_response.json()["task_casehub_dataset_ids"] == ["dataset-1"]
+
+        cases = await client.post(
+            "/v1/cases/query",
+            json={
+                "dataset": "ark4-0",
+                "domain": "ark",
+                "split": "train",
+                "limit": 10,
+                "filters": {
+                    "_openviking_benchmark_run_id": "run-multi",
+                    "_openviking_casehub_dataset_ids": ["dataset-2"],
+                },
+            },
+        )
+
+    assert cases.status_code == 200
+    assert [item["input"]["task_id"] for item in cases.json()["cases"]] == ["case-2"]

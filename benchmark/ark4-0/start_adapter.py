@@ -19,7 +19,6 @@ REPO_ROOT = SCRIPT_DIR.parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from case_loader import ArkCaseRepository  # noqa: E402
 from memory_proxy import MemoryProxyConfig  # noqa: E402
 from platform_client import PlatformClientConfig, TrainingPlatformClient  # noqa: E402
 from service_app import ArkAdapterServiceConfig, create_app  # noqa: E402
@@ -62,30 +61,19 @@ class PlatformSettings:
     gateway_base_url: str
     api_key: str = ""
     project_id: str = ""
+    vaka_request_source: str = "ark-lx"
     headers: dict[str, str] = field(default_factory=dict)
     request_timeout_seconds: float = 120.0
 
 
 @dataclass(frozen=True, slots=True)
 class TrainingTaskSettings:
-    task_id: str = ""
     task_name: str = "openviking_ark4_external_training"
     workflow_id: str = "ov_external_training"
     agent_id: str = "ark"
     evaluator_id: str = "rollout_builtin@v1"
     ready_poll_interval_seconds: float = 2.0
     ready_timeout_seconds: float = 900.0
-
-
-@dataclass(frozen=True, slots=True)
-class CaseHubSettings:
-    dataset_ids: list[str]
-    case_ids: list[str] = field(default_factory=list)
-    caseset_id: str = ""
-    split_field: str = ""
-    default_split: str = "train"
-    page_size: int = 1000
-    detail_concurrency: int = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,11 +90,9 @@ class RolloutSettings:
 @dataclass(frozen=True, slots=True)
 class AdapterFileConfig:
     path: Path
-    state_file: Path
     service: ServiceSettings
     platform: PlatformSettings
     training_task: TrainingTaskSettings
-    casehub: CaseHubSettings
     rollout: RolloutSettings
     memory_proxy: MemoryProxyConfig
 
@@ -143,14 +129,8 @@ def load_config(path: str | Path) -> AdapterFileConfig:
     service_raw = _object(raw, "service")
     platform_raw = _object(raw, "platform")
     task_raw = _object(raw, "training_task")
-    casehub_raw = _object(raw, "casehub")
     rollout_raw = _object(raw, "rollout")
     memory_raw = _object(raw, "memory_proxy")
-
-    state_value = str(raw.get("state_file") or "adapter_state.local.json").strip()
-    state_file = Path(state_value).expanduser()
-    if not state_file.is_absolute():
-        state_file = config_path.parent / state_file
 
     service = ServiceSettings(
         host=_text(service_raw.get("host"), "service.host", default="127.0.0.1"),
@@ -178,6 +158,11 @@ def load_config(path: str | Path) -> AdapterFileConfig:
         ),
         api_key=_optional_text(platform_raw.get("api_key")),
         project_id=project_id,
+        vaka_request_source=_text(
+            platform_raw.get("vaka_request_source"),
+            "platform.vaka_request_source",
+            default="ark-lx",
+        ),
         headers=_string_dict(
             platform_raw.get("headers"),
             "platform.headers",
@@ -190,7 +175,6 @@ def load_config(path: str | Path) -> AdapterFileConfig:
         ),
     )
     training_task = TrainingTaskSettings(
-        task_id=_optional_text(task_raw.get("task_id")),
         task_name=_text(
             task_raw.get("task_name"),
             "training_task.task_name",
@@ -218,33 +202,6 @@ def load_config(path: str | Path) -> AdapterFileConfig:
             "training_task.ready_timeout_seconds",
             default=900.0,
             minimum=0.001,
-        ),
-    )
-    dataset_ids = _string_list(casehub_raw.get("dataset_ids"), "casehub.dataset_ids")
-    caseset_id = _optional_text(casehub_raw.get("caseset_id"))
-    if not dataset_ids and not caseset_id:
-        raise ValueError("casehub.dataset_ids or casehub.caseset_id is required")
-    casehub = CaseHubSettings(
-        dataset_ids=dataset_ids,
-        case_ids=_string_list(casehub_raw.get("case_ids"), "casehub.case_ids"),
-        caseset_id=caseset_id,
-        split_field=_optional_text(casehub_raw.get("split_field")),
-        default_split=_text(
-            casehub_raw.get("default_split"),
-            "casehub.default_split",
-            default="train",
-        ),
-        page_size=_integer(
-            casehub_raw.get("page_size"),
-            "casehub.page_size",
-            default=1000,
-            minimum=1,
-        ),
-        detail_concurrency=_integer(
-            casehub_raw.get("detail_concurrency"),
-            "casehub.detail_concurrency",
-            default=20,
-            minimum=1,
         ),
     )
     extra_header = _any_dict(rollout_raw.get("extra_header"), "rollout.extra_header")
@@ -284,7 +241,13 @@ def load_config(path: str | Path) -> AdapterFileConfig:
         "memory_proxy.enabled",
         default=False,
     )
-    memory_target = _optional_text(memory_raw.get("openviking_target"))
+    runtime_memory = _any_dict(
+        rollout.runtime_params.get("memory"),
+        "rollout.runtime_params.memory",
+    )
+    memory_target = _optional_text(
+        memory_raw.get("openviking_target") or runtime_memory.get("openviking_target")
+    )
     event_log_value = _optional_text(memory_raw.get("event_log_file"))
     event_log_file = _relative_path(
         event_log_value or "memory_proxy_events.local.jsonl",
@@ -320,11 +283,9 @@ def load_config(path: str | Path) -> AdapterFileConfig:
     _validate_runtime_memory_target(rollout.runtime_params, memory_proxy)
     return AdapterFileConfig(
         path=config_path,
-        state_file=state_file.resolve(),
         service=service,
         platform=platform,
         training_task=training_task,
-        casehub=casehub,
         rollout=rollout,
         memory_proxy=memory_proxy,
     )
@@ -335,31 +296,24 @@ async def run(config: AdapterFileConfig) -> None:
         gateway_base_url=config.platform.gateway_base_url,
         api_key=config.platform.api_key or None,
         project_id=config.platform.project_id or None,
+        vaka_request_source=config.platform.vaka_request_source,
         headers=config.platform.headers,
         timeout_seconds=config.platform.request_timeout_seconds,
     )
     async with TrainingPlatformClient(client_config) as client:
-        task_id = await prepare_platform_task(config, client)
-        repository = ArkCaseRepository(
-            client=client,
-            dataset_ids=config.casehub.dataset_ids,
-            case_ids=config.casehub.case_ids,
-            caseset_id=config.casehub.caseset_id or None,
-            split_field=config.casehub.split_field or None,
-            page_size=config.casehub.page_size,
-            detail_concurrency=config.casehub.detail_concurrency,
-            default_split=config.casehub.default_split,
-        )
-        cases = await repository.all_cases()
-        print(f"[ark4-adapter] loaded {len(cases)} CaseHub case(s)", flush=True)
-
         app = create_app(
             client=client,
-            repository=repository,
             config=ArkAdapterServiceConfig(
                 dataset=config.service.dataset,
                 domain=config.service.domain,
-                platform_task_id=task_id,
+                task_name=config.training_task.task_name,
+                workflow_id=config.training_task.workflow_id,
+                agent_id=config.training_task.agent_id,
+                evaluator_id=config.training_task.evaluator_id,
+                task_ready_poll_interval_seconds=(
+                    config.training_task.ready_poll_interval_seconds
+                ),
+                task_ready_timeout_seconds=config.training_task.ready_timeout_seconds,
                 rollout_concurrency=config.service.rollout_concurrency,
                 rollout_poll_interval_seconds=config.rollout.poll_interval_seconds,
                 rollout_timeout_seconds=config.rollout.timeout_seconds,
@@ -373,17 +327,12 @@ async def run(config: AdapterFileConfig) -> None:
             ),
         )
         server_url = f"http://{config.service.host}:{config.service.port}"
-        _merge_state(
-            config.state_file,
-            {
-                "platform_task_id": task_id,
-                "status": "serving",
-                "service_url": server_url,
-                "config_file": str(config.path),
-            },
-        )
-        print(f"[ark4-adapter] platform task: {task_id}", flush=True)
         print(f"[ark4-adapter] listening at {server_url}", flush=True)
+        print(
+            "[ark4-adapter] each run_batch_train_eval invocation selects CaseHub cases "
+            "and creates its own platform task",
+            flush=True,
+        )
         print(
             f"[ark4-adapter] OpenViking argument: --benchmark-service-url {server_url}",
             flush=True,
@@ -403,53 +352,7 @@ async def run(config: AdapterFileConfig) -> None:
                 log_level=config.service.log_level,
             )
         )
-        try:
-            await server.serve()
-        finally:
-            _merge_state(config.state_file, {"status": "stopped"})
-
-
-async def prepare_platform_task(
-    config: AdapterFileConfig,
-    client: TrainingPlatformClient,
-) -> str:
-    state = _load_state(config.state_file)
-    task_id = config.training_task.task_id or _optional_text(state.get("platform_task_id"))
-    if not task_id:
-        if not config.casehub.dataset_ids:
-            raise ValueError(
-                "casehub.dataset_ids is required when creating a new platform training task"
-            )
-        body: dict[str, Any] = {
-            "task_name": config.training_task.task_name,
-            "workflow_id": config.training_task.workflow_id,
-            "agent_id": config.training_task.agent_id,
-            "casehub_dataset_ids": config.casehub.dataset_ids,
-            "evaluator_id": config.training_task.evaluator_id,
-        }
-        if config.casehub.caseset_id:
-            body["casehub_caseset_id"] = config.casehub.caseset_id
-        created = await client.create_training_task(body)
-        task_id = str(created["task_id"])
-        _merge_state(
-            config.state_file,
-            {"platform_task_id": task_id, "platform_task": created, "status": "created"},
-        )
-        print(f"[ark4-adapter] created platform task {task_id}", flush=True)
-    else:
-        print(f"[ark4-adapter] resuming platform task {task_id}", flush=True)
-
-    ready = await client.wait_for_ov_wait(
-        task_id,
-        poll_interval_seconds=config.training_task.ready_poll_interval_seconds,
-        timeout_seconds=config.training_task.ready_timeout_seconds,
-    )
-    _merge_state(
-        config.state_file,
-        {"platform_task_id": task_id, "platform_task": ready, "status": "ov_wait"},
-    )
-    print(f"[ark4-adapter] platform task {task_id} is ready at OV_WAIT", flush=True)
-    return task_id
+        await server.serve()
 
 
 def _object(parent: dict[str, Any], key: str) -> dict[str, Any]:
@@ -508,15 +411,6 @@ def _boolean(value: Any, label: str, *, default: bool) -> bool:
     if isinstance(value, bool):
         return value
     raise ValueError(f"{label} must be a boolean")
-
-
-def _string_list(value: Any, label: str) -> list[str]:
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise ValueError(f"{label} must be a JSON array")
-    result = [_optional_text(item) for item in value]
-    return list(dict.fromkeys(item for item in result if item))
 
 
 def _any_dict(value: Any, label: str) -> dict[str, Any]:
@@ -600,27 +494,6 @@ def _read_json_text(path: Path, dotted_path: str) -> str:
     if not result:
         raise ValueError(f"memory proxy config file {path} has an empty JSON path {dotted_path!r}")
     return result
-
-
-def _load_state(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return dict(value) if isinstance(value, dict) else {}
-
-
-def _merge_state(path: Path, updates: dict[str, Any]) -> None:
-    value = {**_load_state(path), **updates}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
 
 
 def main() -> None:

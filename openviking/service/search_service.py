@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 from openviking.server.identity import RequestContext
 from openviking.session.memory.case_aggregation import normalize_case_status
+from openviking.session.memory.experience_lifecycle import experience_is_agent_visible
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.storage.viking_fs import VikingFS
 from openviking.utils.image_search import (
@@ -51,13 +52,22 @@ def _is_case_directory_summary_uri(uri: str) -> bool:
     )
 
 
+def _experience_memory_file_uri(uri: str) -> Optional[str]:
+    source_uri = str(uri or "").split("#", 1)[0].rstrip("/")
+    if "/memories/experiences/" not in source_uri or not source_uri.endswith(".md"):
+        return None
+    if source_uri.endswith(("/.abstract.md", "/.overview.md")):
+        return None
+    return source_uri
+
+
 async def _apply_agent_recall_policy(
     result: Any,
     *,
     viking_fs: VikingFS,
     ctx: RequestContext,
 ) -> Any:
-    """Hide draft, degraded, and archived Cases from Agent-facing recall."""
+    """Expose only promoted Case and Experience memories to Agent recall."""
     memories = getattr(result, "memories", None)
     if not isinstance(memories, list):
         return result
@@ -73,11 +83,20 @@ async def _apply_agent_recall_policy(
         for candidate_uri in [getattr(context, "uri", "")]
         if (case_uri := _case_memory_file_uri(candidate_uri)) is not None
     }
+    experience_uris = {
+        experience_uri
+        for context in contexts
+        for candidate_uri in [getattr(context, "uri", "")]
+        if (experience_uri := _experience_memory_file_uri(candidate_uri)) is not None
+    }
     for context in contexts:
         for relation in getattr(context, "relations", None) or []:
             case_uri = _case_memory_file_uri(getattr(relation, "uri", ""))
             if case_uri is not None:
                 case_uris.add(case_uri)
+            experience_uri = _experience_memory_file_uri(getattr(relation, "uri", ""))
+            if experience_uri is not None:
+                experience_uris.add(experience_uri)
 
     async def _is_promoted(uri: str) -> tuple[str, bool]:
         try:
@@ -96,12 +115,35 @@ async def _apply_agent_recall_policy(
 
     promoted_by_uri = dict(await asyncio.gather(*(_is_promoted(uri) for uri in case_uris)))
 
+    async def _is_promoted_experience(uri: str) -> tuple[str, bool]:
+        try:
+            raw = await viking_fs.read_file(uri, ctx=ctx)
+            memory_file = MemoryFileUtils.read(raw, uri=uri)
+            return uri, experience_is_agent_visible(memory_file.extra_fields.get("status"))
+        except Exception as exc:
+            logger.warning(
+                "Exclude Experience from agent recall because its status could not be verified: "
+                "uri=%s error=%s",
+                uri,
+                exc,
+            )
+            return uri, False
+
+    promoted_experience_by_uri = dict(
+        await asyncio.gather(*(_is_promoted_experience(uri) for uri in experience_uris))
+    )
+
     def _is_visible(context: Any) -> bool:
         uri = getattr(context, "uri", "")
         if _is_case_directory_summary_uri(uri):
             return False
         case_uri = _case_memory_file_uri(uri)
-        return case_uri is None or promoted_by_uri.get(case_uri, False)
+        if case_uri is not None:
+            return promoted_by_uri.get(case_uri, False)
+        experience_uri = _experience_memory_file_uri(uri)
+        if experience_uri is not None:
+            return promoted_experience_by_uri.get(experience_uri, False)
+        return True
 
     def _filter_relations(context: Any) -> None:
         relations = getattr(context, "relations", None)
@@ -112,12 +154,18 @@ async def _apply_agent_recall_policy(
             for relation in relations
             if (
                 not _is_case_directory_summary_uri(getattr(relation, "uri", ""))
-                and (
-                    (case_uri := _case_memory_file_uri(getattr(relation, "uri", ""))) is None
-                    or promoted_by_uri.get(case_uri, False)
-                )
+                and _relation_is_visible(getattr(relation, "uri", ""))
             )
         ]
+
+    def _relation_is_visible(uri: str) -> bool:
+        case_uri = _case_memory_file_uri(uri)
+        if case_uri is not None:
+            return promoted_by_uri.get(case_uri, False)
+        experience_uri = _experience_memory_file_uri(uri)
+        if experience_uri is not None:
+            return promoted_experience_by_uri.get(experience_uri, False)
+        return True
 
     result.memories = [context for context in memories if _is_visible(context)]
     for context in result.memories:

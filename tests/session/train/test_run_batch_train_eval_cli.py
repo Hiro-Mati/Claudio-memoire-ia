@@ -3,12 +3,17 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from openviking.session.train import batch_runner
 from openviking.session.train.batch_runner import BatchTrainEvalConfig
-from openviking.session.train.run_batch_train_eval import _parse_server_header, parse_args
+from openviking.session.train.run_batch_train_eval import (
+    _parse_server_header,
+    main_async,
+    parse_args,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -90,6 +95,52 @@ def test_server_headers_are_repeatable(monkeypatch) -> None:
         "X-Tenant-ID": "tenant-a",
         "Authorization": "Bearer token==",
     }
+
+
+@pytest.mark.asyncio
+async def test_casehub_selection_is_repeatable_and_reaches_batch_config(monkeypatch) -> None:
+    captured: BatchTrainEvalConfig | None = None
+
+    async def capture(config: BatchTrainEvalConfig) -> SimpleNamespace:
+        nonlocal captured
+        captured = config
+        return SimpleNamespace(train_epochs=[])
+
+    monkeypatch.setattr(batch_runner, "run_batch_train_eval", capture)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_batch_train_eval",
+            "--dataset",
+            "ark4-0",
+            "--domain",
+            "ark",
+            "--casehub-dataset-id",
+            "dataset-1",
+            "--casehub-case-id",
+            "case-1",
+            "--casehub-case-id",
+            "case-2",
+            "--casehub-eval-dataset-id",
+            "dataset-eval",
+        ],
+    )
+
+    assert await main_async() == 0
+    assert captured is not None
+    assert captured.casehub_dataset_ids == ["dataset-1"]
+    assert captured.casehub_case_ids == ["case-1", "case-2"]
+    assert captured.casehub_eval_dataset_ids == ["dataset-eval"]
+
+
+def test_casehub_case_requires_dataset() -> None:
+    with pytest.raises(ValueError, match="casehub_dataset_ids is required"):
+        BatchTrainEvalConfig(
+            dataset="ark4-0",
+            domain="ark",
+            casehub_case_ids=["case-1"],
+        )
 
 
 @pytest.mark.parametrize(

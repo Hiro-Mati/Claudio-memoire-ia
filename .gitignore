@@ -214,6 +214,7 @@ specs/
 .codex/
 .ttadk/
 tests/integration/.tmp_*/
+doc-fetch-resources/
 
 # Beads / Dolt files (added by bd init)
 .dolt/

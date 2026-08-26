@@ -8,6 +8,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from openviking.session.memory.experience_lifecycle import normalize_experience_status
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.train.domain import Trajectory
 from openviking.telemetry import tracer
@@ -68,7 +69,11 @@ async def record_experience_feedback_stats(
                 before.get("feedback_stats"),
                 uri_observations,
             )
-            if not changed:
+            lifecycle_changed = _apply_negative_feedback_lifecycle(
+                mf.extra_fields,
+                uri_observations,
+            )
+            if not changed and not lifecycle_changed:
                 result.skipped_uris.append(uri)
                 continue
             mf.extra_fields["feedback_stats"] = stats
@@ -123,9 +128,47 @@ def _collect_observations(
                 by_uri_and_trajectory[key] = effect
 
     observations: dict[str, list[dict[str, Any]]] = {}
-    for (uri, _trajectory_uri), effect in by_uri_and_trajectory.items():
-        observations.setdefault(uri, []).append({"effect": effect})
+    for (uri, trajectory_uri), effect in by_uri_and_trajectory.items():
+        observations.setdefault(uri, []).append(
+            {"effect": effect, "trajectory_uri": trajectory_uri}
+        )
     return observations
+
+
+def _apply_negative_feedback_lifecycle(
+    fields: dict[str, Any],
+    observations: list[dict[str, Any]],
+) -> bool:
+    """Degrade a promoted Experience after reproducible negative transfer.
+
+    A single negative observation is retained as a conflict signal but does not
+    remove an otherwise usable Experience from Agent recall. Replaying the same
+    trajectory cannot increase the independent conflict count.
+    """
+
+    existing_uris = {
+        str(uri).strip()
+        for uri in fields.get("negative_trajectory_uris", [])
+        if str(uri).strip()
+    }
+    negative_uris = {
+        str(item.get("trajectory_uri") or "").strip()
+        for item in observations
+        if item.get("effect") == "negative"
+        and str(item.get("trajectory_uri") or "").strip()
+    }
+    merged_uris = existing_uris | negative_uris
+    if merged_uris == existing_uris:
+        return False
+
+    fields["negative_trajectory_uris"] = sorted(merged_uris)
+    fields["negative_source_count"] = len(merged_uris)
+    current_status = normalize_experience_status(fields.get("status"))
+    fields["status"] = current_status
+    if current_status == "promoted" and len(merged_uris) >= 2:
+        fields["status"] = "degraded"
+        fields["promotion_reason"] = "reproducible_negative_transfer"
+    return True
 
 
 def parse_experience_effects(value: Any) -> dict[str, set[str]] | None:

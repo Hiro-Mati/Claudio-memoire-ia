@@ -6,6 +6,7 @@ from __future__ import annotations
 from openviking.session.train.batch_runner import (
     BatchTrainEvalConfig,
     _baseline_cache_key,
+    _build_pipeline,
     _case_loader,
     _effective_eval_index,
     _train_rollout_cache_key_prefix,
@@ -36,6 +37,31 @@ def test_case_loader_uses_multi_value_train_and_eval_index_filters():
     assert config.eval_index == [10, 14, 18]
     assert train_loader.filters == {"task_indices": [1, 5, 6]}
     assert eval_loader.filters == {"task_indices": [10, 14, 18]}
+
+
+def test_pipeline_sends_benchmark_run_id_with_every_rollout():
+    config = BatchTrainEvalConfig(
+        dataset="ark4-0",
+        domain="ark",
+        benchmark_service_url="http://127.0.0.1:1944",
+        casehub_dataset_ids=["dataset-1"],
+    )
+
+    pipeline = _build_pipeline(
+        config,
+        policy_trainer=object(),  # type: ignore[arg-type]
+        benchmark_run_id="run-1",
+    )
+
+    assert pipeline.rollout_executor.options["_openviking_benchmark_run_id"] == "run-1"
+
+    loader = _case_loader(
+        config,
+        split="train",
+        sample_index=None,
+        benchmark_run_id="run-1",
+    )
+    assert loader.filters["_openviking_benchmark_run_id"] == "run-1"
 
 
 def test_train_split_can_target_test_cases_and_separates_cache_keys():

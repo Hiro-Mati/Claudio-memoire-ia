@@ -16,6 +16,7 @@ from openviking.session.memory.dataclass import (
     ResolvedOperations,
     StoredLink,
 )
+from openviking.session.memory.experience_lifecycle import normalize_experience_status
 from openviking.session.memory.memory_type_registry import (
     MemoryTypeRegistry,
     create_default_registry,
@@ -227,17 +228,31 @@ async def _apply_items_to_snapshot(
             metadata.update(patch_fields)
         metadata.setdefault("memory_type", memory_type)
         metadata["experience_name"] = item.target_name
-        if (item.memory_type or "experiences") == "experiences":
+        if memory_type == "experiences":
             metadata.pop("trigger_code", None)
+            status = normalize_experience_status(
+                metadata.get("status"),
+                default=(
+                    normalize_experience_status(existing.status)
+                    if existing is not None
+                    else "draft"
+                ),
+            )
+            metadata["status"] = status
+        else:
+            status = existing.status if existing is not None else "draft"
         version = (existing.version + 1) if existing is not None else 1
         updated = Policy(
             name=item.target_name,
             uri=uri,
             version=version,
-            status=(existing.status if existing is not None else "draft"),
+            status=status,
             content=item.after_content,
             metadata=metadata,
-            links=list(existing.links or []) if existing is not None else [],
+            links=_merge_policy_links(
+                list(existing.links or []) if existing is not None else [],
+                list(item.links or []),
+            ),
             backlinks=list(existing.backlinks or []) if existing is not None else [],
         )
         if existing is None:
@@ -269,6 +284,25 @@ def _metadata_patch_fields(item: PolicyPlanItem) -> dict[str, Any]:
                 }
             )
     return fields
+
+
+def _merge_policy_links(existing: list[Any], incoming: list[Any]) -> list[dict[str, Any]]:
+    merged: dict[tuple[str, str, str, str | None], dict[str, Any]] = {}
+    for raw in [*existing, *incoming]:
+        if isinstance(raw, StoredLink):
+            link = raw.model_dump()
+        elif isinstance(raw, dict):
+            link = dict(raw)
+        else:
+            continue
+        key = (
+            str(link.get("from_uri") or ""),
+            str(link.get("to_uri") or ""),
+            str(link.get("link_type") or ""),
+            link.get("match_text"),
+        )
+        merged[key] = link
+    return list(merged.values())
 
 
 def _find_policy(

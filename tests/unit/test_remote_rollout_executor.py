@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 
-from openviking.session.train.components.remote import RemoteRolloutExecutor
+from openviking.session.train.components.remote import (
+    RemoteBenchmarkLifecycle,
+    RemoteRolloutExecutor,
+)
 from openviking.session.train.context import ExecutionContext
 from openviking.session.train.domain import (
     Case,
@@ -51,6 +55,84 @@ def _policy_set() -> ExperienceSet:
             )
         ],
     )
+
+
+def test_remote_benchmark_lifecycle_starts_and_completes_supported_adapter(monkeypatch):
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.url.path == "/v1/runs/start":
+            body = json.loads(request.content)
+            assert body["concurrency"] == 30
+            assert body["casehub"] == {
+                "dataset_ids": ["dataset-1"],
+                "case_ids": ["case-1"],
+                "task_dataset_ids": ["dataset-1"],
+            }
+            return httpx.Response(
+                200,
+                json={"run_id": "run-1", "task_id": "task-1", "status": "ov_wait"},
+            )
+        if request.url.path == "/v1/runs/run-1/complete":
+            return httpx.Response(
+                200,
+                json={"run_id": "run-1", "task_id": "task-1", "status": "completed"},
+            )
+        return httpx.Response(500)
+
+    original_async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: original_async_client(
+            transport=httpx.MockTransport(handler),
+            base_url=kwargs.get("base_url"),
+            timeout=kwargs.get("timeout"),
+        ),
+    )
+    lifecycle = RemoteBenchmarkLifecycle("http://adapter")
+
+    started = asyncio.run(
+        lifecycle.start(
+            run_id="run-1",
+            dataset="ark4-0",
+            domain="ark",
+            concurrency=30,
+            casehub_dataset_ids=["dataset-1"],
+            casehub_case_ids=["case-1"],
+            task_casehub_dataset_ids=["dataset-1"],
+        )
+    )
+    completed = asyncio.run(lifecycle.complete(run_id="run-1"))
+
+    assert started is not None and started["task_id"] == "task-1"
+    assert completed["status"] == "completed"
+    assert calls == [
+        ("POST", "/v1/runs/start"),
+        ("POST", "/v1/runs/run-1/complete"),
+    ]
+
+
+def test_remote_benchmark_lifecycle_is_optional(monkeypatch):
+    original_async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: original_async_client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(404)),
+            base_url=kwargs.get("base_url"),
+            timeout=kwargs.get("timeout"),
+        ),
+    )
+
+    started = asyncio.run(
+        RemoteBenchmarkLifecycle("http://adapter").start(
+            run_id="run-1", dataset="tau2", domain="airline"
+        )
+    )
+
+    assert started is None
 
 
 def test_remote_rollout_executor_retries_transient_missing_execution(monkeypatch):

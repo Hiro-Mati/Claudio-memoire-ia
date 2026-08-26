@@ -741,11 +741,8 @@ def _should_update_experience_from_trajectory(
     outcome = str(getattr(trajectory, "outcome", "") or "").strip().lower()
     if outcome != "success":
         return True
-    return bool(
-        evaluation is not None
-        and evaluation.passed
-        and _trajectory_recovery_status(trajectory) == "observed_recovered"
-    )
+    del evaluation
+    return _trajectory_recovery_status(trajectory) == "observed_recovered"
 
 
 def _trajectory_recovery_status(trajectory: Trajectory) -> str:
@@ -841,6 +838,8 @@ async def _operations_to_gradients(
                     "uris": list(getattr(op, "uris", []) or []),
                     "trajectory_outcome": trajectory.outcome,
                     "rubric_passed": analysis.evaluation.passed,
+                    "rubric_score": analysis.evaluation.score,
+                    "recovery_status": _trajectory_recovery_status(trajectory),
                     "supersedes": fields.get("supersedes"),
                     "training_category": _trajectory_training_category(trajectory, analysis),
                 },

@@ -8,6 +8,7 @@ from pathlib import Path
 from openviking.session.train.batch_runner import (
     BatchTrainEvalConfig,
     CachedEpochZeroTrainRolloutExecutor,
+    ResumedFinalEvalRolloutExecutor,
     _baseline_cache_key,
     _clean_result_dir,
     _load_baseline_cache,
@@ -15,6 +16,19 @@ from openviking.session.train.batch_runner import (
     _result_base_dir,
     _write_baseline_cache,
 )
+
+
+def _trial_case(trial: int):
+    from openviking.session.train.domain import Case
+
+    base = _case()
+    return Case(
+        name=f"case-1_t{trial}",
+        task_signature=f"{base.task_signature}:trial:{trial}",
+        input={**base.input, "task_id": "platform-case-1", "eval_trial": trial},
+        rubric=base.rubric,
+        metadata={"platform_case_id": "platform-case-1", "eval_trial": trial},
+    )
 
 
 def _case():
@@ -248,6 +262,95 @@ def test_keep_recent_results_must_be_non_negative():
             benchmark_service_url="http://127.0.0.1:1944",
             keep_recent_results=-1,
         )
+
+
+def test_resume_final_eval_requires_preserved_results():
+    import pytest
+
+    with pytest.raises(ValueError, match="requires clean_result=False"):
+        BatchTrainEvalConfig(
+            dataset="tau2",
+            domain="airline",
+            benchmark_service_url="http://127.0.0.1:1944",
+            resume_final_eval=True,
+        )
+
+
+def test_resumed_final_eval_reuses_artifact_and_executes_only_miss(tmp_path: Path):
+    import asyncio
+    import json
+
+    from openviking.message import Message, TextPart
+    from openviking.session.train.components.dataset_service import rollout_to_dict
+    from openviking.session.train.context import ExecutionContext
+    from openviking.session.train.domain import ExperienceSet, Rollout, RubricEvaluation
+
+    cached_case = _trial_case(0)
+    cached_rollout = Rollout(
+        case=cached_case,
+        messages=[
+            Message(id="cached-message", role="assistant", parts=[TextPart(text="cached")])
+        ],
+        policy_snapshot_id="old-snapshot",
+        evaluation=RubricEvaluation(passed=True, score=1.0),
+    )
+    rollout_dir = (
+        tmp_path
+        / "rollouts"
+        / "case-group"
+        / "epoch_5"
+        / "final_train_rollout"
+        / "trial_0"
+    )
+    rollout_dir.mkdir(parents=True)
+    payload = rollout_to_dict(cached_rollout)
+    payload.pop("messages")
+    (rollout_dir / "rollout.json").write_text(json.dumps(payload), encoding="utf-8")
+    (rollout_dir / "messages.json").write_text(
+        json.dumps([message.to_dict() for message in cached_rollout.messages]),
+        encoding="utf-8",
+    )
+
+    class Delegate:
+        def __init__(self) -> None:
+            self.case_names: list[str] = []
+
+        async def execute(self, cases, policy_set, context):
+            del policy_set
+            self.case_names = [case.name for case in cases]
+            return [
+                Rollout(
+                    case=case,
+                    messages=[],
+                    policy_snapshot_id=context.policy_snapshot_id,
+                    evaluation=RubricEvaluation(passed=False, score=0.25),
+                )
+                for case in cases
+            ]
+
+    delegate = Delegate()
+    executor = ResumedFinalEvalRolloutExecutor(
+        delegate=delegate,
+        run_dir=tmp_path,
+        epoch=5,
+        rollout_stage="final_train_rollout",
+    )
+    results = asyncio.run(
+        executor.execute(
+            [cached_case, _trial_case(1)],
+            ExperienceSet(root_uri="viking://user/u/memories/experiences", policies=[]),
+            ExecutionContext(
+                policy_snapshot_id="new-snapshot",
+                metadata={"training": False, "stage": "final_train_rollout"},
+            ),
+        )
+    )
+
+    assert delegate.case_names == ["case-1_t1"]
+    assert [rollout.case.name for rollout in results] == ["case-1_t0", "case-1_t1"]
+    assert results[0].messages[0].parts[0].text == "cached"
+    assert executor.cache_hit_count == 1
+    assert executor.cache_miss_count == 1
 
 
 def test_case_loader_uses_sample_index_filter():
@@ -491,6 +594,64 @@ async def test_cached_epoch_zero_train_rollout_executor_reuses_epoch_zero_cache(
     assert second[0].metadata["source"] == "delegate"
     assert second[0].metadata["train_rollout_cache_hit"] is True
     assert str(tmp_path / "cache") in second[0].metadata["train_rollout_cache_path"]
+
+
+async def test_cached_epoch_zero_train_rollout_executor_reuses_run_artifact(tmp_path: Path):
+    import json
+
+    from openviking.message import Message, TextPart
+    from openviking.session.train.components.dataset_service import rollout_to_dict
+    from openviking.session.train.context import ExecutionContext
+    from openviking.session.train.domain import Rollout
+
+    case = _case()
+    artifact = Rollout(
+        case=case,
+        messages=[Message(id="artifact-message", role="user", parts=[TextPart("cached")])],
+        policy_snapshot_id="old-snapshot",
+        metadata={"source": "artifact"},
+    )
+    artifact_dir = (
+        tmp_path
+        / "rollouts"
+        / "case-group"
+        / "epoch_0"
+        / "1.train_rollout"
+        / "trial_0"
+    )
+    artifact_dir.mkdir(parents=True)
+    payload = rollout_to_dict(artifact)
+    payload.pop("messages")
+    (artifact_dir / "rollout.json").write_text(json.dumps(payload), encoding="utf-8")
+    (artifact_dir / "messages.json").write_text(
+        json.dumps([message.to_dict() for message in artifact.messages]),
+        encoding="utf-8",
+    )
+
+    class Delegate:
+        async def execute(self, cases, policy_set, context):
+            raise AssertionError("artifact should satisfy the epoch-0 rollout")
+
+    executor = CachedEpochZeroTrainRolloutExecutor(
+        delegate=Delegate(),
+        cache_dir=tmp_path / "cache",
+        cache_key_prefix="unit-prefix",
+        artifact_run_dir=tmp_path,
+    )
+    result = await executor.execute(
+        [case],
+        None,
+        ExecutionContext(
+            policy_snapshot_id="new-snapshot",
+            metadata={"training": True, "epoch": 0},
+        ),
+    )
+
+    assert result[0].messages[0].content == "cached"
+    assert result[0].policy_snapshot_id == "new-snapshot"
+    assert result[0].metadata["train_rollout_cache_hit"] is True
+    assert result[0].metadata["train_rollout_artifact_cache_hit"] is True
+    assert len(list((tmp_path / "cache").glob("*.json"))) == 1
 
 
 def test_train_rollout_report_marks_full_and_partial_cache_hits():

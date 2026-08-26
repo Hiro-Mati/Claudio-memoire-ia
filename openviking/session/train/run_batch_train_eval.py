@@ -125,6 +125,36 @@ def parse_args() -> argparse.Namespace:
         help="Benchmark runtime service URL, e.g. http://127.0.0.1:1944",
     )
     parser.add_argument(
+        "--casehub-dataset-id",
+        action="append",
+        default=[],
+        metavar="DATASET_ID",
+        help=(
+            "CaseHub dataset used by this benchmark run. Repeat for multiple datasets. "
+            "Required by the Ark adapter."
+        ),
+    )
+    parser.add_argument(
+        "--casehub-case-id",
+        action="append",
+        default=[],
+        metavar="CASE_ID",
+        help=(
+            "CaseHub case selected for this benchmark run. Repeat for multiple cases; "
+            "omit to use all cases in the selected dataset(s)."
+        ),
+    )
+    parser.add_argument(
+        "--casehub-eval-dataset-id",
+        action="append",
+        default=[],
+        metavar="DATASET_ID",
+        help=(
+            "CaseHub dataset used only by eval. Repeat for multiple datasets; "
+            "omit to evaluate the training CaseHub dataset(s)."
+        ),
+    )
+    parser.add_argument(
         "--max-iterations",
         type=int,
         default=30,
@@ -220,6 +250,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Skip the final held-out eval pass. When --eval-each-epoch is enabled, "
             "the last epoch eval is reused as final_eval in the report."
+        ),
+    )
+    parser.add_argument(
+        "--resume-final-eval",
+        action="store_true",
+        help=(
+            "Skip baseline/train, reuse final-eval rollout artifacts already present next "
+            "to --output, and execute only missing eval trials. Requires --no-clean-result."
         ),
     )
     parser.add_argument(
@@ -340,6 +378,9 @@ async def main_async() -> int:
             train_index=_parse_indices_arg(args.train_index),
             eval_index=_parse_indices_arg(args.eval_index),
             benchmark_service_url=args.benchmark_service_url,
+            casehub_dataset_ids=args.casehub_dataset_id,
+            casehub_case_ids=args.casehub_case_id,
+            casehub_eval_dataset_ids=args.casehub_eval_dataset_id,
             baseline_force_recompute=args.force_baseline_recompute,
             eval_each_epoch=args.eval_each_epoch,
             skip_final_eval=args.skip_final_eval,
@@ -348,6 +389,7 @@ async def main_async() -> int:
             trials=args.trials,
             train_trials=args.train_trials,
             reuse_train_rollout_cache=args.reuse_train_rollout_cache,
+            resume_final_eval=args.resume_final_eval,
             continue_on_rollout_failure=args.continue_on_rollout_failure,
             clean_result=args.clean_result,
             keep_recent_results=args.keep_recent_results,
@@ -355,6 +397,8 @@ async def main_async() -> int:
             git_notes_launch_command=os.environ.get("OPENVIKING_TRAIN_LAUNCH_COMMAND"),
         )
     )
+    if args.resume_final_eval:
+        return 0
     return 1 if any(epoch.get("errors") for epoch in report.train_epochs) else 0
 
 

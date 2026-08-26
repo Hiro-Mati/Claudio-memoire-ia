@@ -3,25 +3,22 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any
 
 import pytest
-from start_adapter import SCRIPT_DIR, load_config, parse_args, prepare_platform_task
+from start_adapter import SCRIPT_DIR, load_config, parse_args
 
 
-def write_config(path: Path, *, task_id: str = "") -> None:
+def write_config(path: Path) -> None:
     path.write_text(
         json.dumps(
             {
-                "state_file": "state.local.json",
                 "service": {"port": 1944, "admin_token": "secret"},
                 "platform": {
                     "gateway_base_url": "https://gateway.test",
                     "api_key": "platform-secret",
                     "project_id": "00000000000000000000000000000001",
+                    "vaka_request_source": "ark-lx",
                 },
-                "training_task": {"task_id": task_id},
-                "casehub": {"dataset_ids": ["dataset-1"], "case_ids": ["case-1"]},
                 "rollout": {"require_messages_for_training": True},
             }
         ),
@@ -29,7 +26,7 @@ def write_config(path: Path, *, task_id: str = "") -> None:
     )
 
 
-def test_load_config_uses_only_file_and_resolves_state_path(tmp_path: Path) -> None:
+def test_load_config_uses_only_file(tmp_path: Path) -> None:
     path = tmp_path / "adapter.local.json"
     write_config(path)
 
@@ -37,10 +34,8 @@ def test_load_config_uses_only_file_and_resolves_state_path(tmp_path: Path) -> N
 
     assert config.platform.gateway_base_url == "https://gateway.test"
     assert config.platform.api_key == "platform-secret"
-    assert config.casehub.dataset_ids == ["dataset-1"]
-    assert config.casehub.case_ids == ["case-1"]
+    assert config.platform.vaka_request_source == "ark-lx"
     assert config.service.dataset == "ark4-0"
-    assert config.state_file == tmp_path / "state.local.json"
 
 
 def test_config_argument_defaults_next_to_start_script(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -91,7 +86,6 @@ def test_load_config_resolves_memory_key_and_matching_target(tmp_path: Path) -> 
     }
     raw["memory_proxy"] = {
         "enabled": True,
-        "openviking_target": "ov-ark-test",
         "openviking_config_file": "openviking.conf",
         "openviking_api_key_json_path": "bot.ov_server.api_key",
     }
@@ -100,6 +94,7 @@ def test_load_config_resolves_memory_key_and_matching_target(tmp_path: Path) -> 
     config = load_config(path)
 
     assert config.memory_proxy.enabled is True
+    assert config.memory_proxy.openviking_target == "ov-ark-test"
     assert config.memory_proxy.openviking_api_key == "local-user-key"
     assert config.memory_proxy.event_log_file == tmp_path / "memory_proxy_events.local.jsonl"
 
@@ -120,41 +115,3 @@ def test_load_config_rejects_mismatched_memory_target(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="must equal"):
         load_config(path)
-
-
-class FakeTaskClient:
-    def __init__(self) -> None:
-        self.created_body: dict[str, Any] | None = None
-
-    async def create_training_task(self, body: dict[str, Any]) -> dict[str, Any]:
-        self.created_body = body
-        return {"task_id": "task-created", "status": "pending"}
-
-    async def wait_for_ov_wait(
-        self,
-        task_id: str,
-        *,
-        poll_interval_seconds: float,
-        timeout_seconds: float,
-    ) -> dict[str, Any]:
-        assert task_id == "task-created"
-        assert poll_interval_seconds > 0
-        assert timeout_seconds > 0
-        return {"task_id": task_id, "status": "running", "current_step": "OV_WAIT"}
-
-
-@pytest.mark.asyncio
-async def test_prepare_platform_task_creates_and_persists_task(tmp_path: Path) -> None:
-    path = tmp_path / "adapter.local.json"
-    write_config(path)
-    config = load_config(path)
-    client = FakeTaskClient()
-
-    task_id = await prepare_platform_task(config, client)  # type: ignore[arg-type]
-
-    assert task_id == "task-created"
-    assert client.created_body is not None
-    assert client.created_body["casehub_dataset_ids"] == ["dataset-1"]
-    state = json.loads(config.state_file.read_text(encoding="utf-8"))
-    assert state["platform_task_id"] == "task-created"
-    assert state["status"] == "ov_wait"
