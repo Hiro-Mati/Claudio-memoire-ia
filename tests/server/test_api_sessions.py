@@ -436,7 +436,7 @@ async def test_get_session_context_includes_incomplete_archive_messages(
         f"/api/v1/sessions/{session_id}/messages",
         json=_message_request("user", content="Archived seed"),
     )
-    commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     assert commit_resp.status_code == 200
 
     ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
@@ -496,7 +496,7 @@ async def test_get_session_context_stops_at_newest_failed_archive(
         f"/api/v1/sessions/{session_id}/messages",
         json=_message_request("user", content="Archived seed"),
     )
-    commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     assert commit_resp.status_code == 200
 
     ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
@@ -1169,7 +1169,7 @@ async def test_delete_session(client: httpx.AsyncClient):
         json=_message_request("user", content="ensure persisted"),
     )
     # Compress to persist
-    commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     await _wait_for_task(client, commit_resp.json()["result"]["task_id"])
 
     resp = await client.delete(f"/api/v1/sessions/{session_id}")
@@ -1187,8 +1187,8 @@ async def test_compress_session(client: httpx.AsyncClient):
         json=_message_request("user", content="Hello"),
     )
 
-    # Default wait=False: returns accepted with task_id
-    resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    # wait=False returns accepted with task_id.
+    resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
@@ -1217,7 +1217,7 @@ async def test_commit_updates_archive_metadata_before_background_task(client: ht
     assert before_result["commit_count"] == 0
     assert before_result["last_commit_at"] == ""
 
-    commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     assert commit_resp.status_code == 200
     commit_result = commit_resp.json()["result"]
     assert commit_result["archived"] is True
@@ -1294,7 +1294,7 @@ async def test_get_session_context_endpoint_returns_trimmed_latest_archive_and_m
         f"/api/v1/sessions/{session_id}/messages",
         json=_message_request("user", content="archived message"),
     )
-    commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     task_id = commit_resp.json()["result"]["task_id"]
     await _wait_for_task(client, task_id)
 
@@ -1367,7 +1367,7 @@ async def test_get_session_archive_endpoint_returns_archive_details(
         f"/api/v1/sessions/{session_id}/messages",
         json=_message_request("assistant", content="archived answer"),
     )
-    commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     task_id = commit_resp.json()["result"]["task_id"]
     await _wait_for_task(client, task_id)
 
@@ -1405,7 +1405,7 @@ async def test_commit_failed_when_long_term_extraction_fails_does_not_block_next
         f"/api/v1/sessions/{session_id}/messages",
         json=_message_request("user", content="first round"),
     )
-    commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     task_id = commit_resp.json()["result"]["task_id"]
     task = await _wait_for_task(client, task_id)
     # Any Phase 2 step failing fails the whole archive (no partial state).
@@ -1430,7 +1430,7 @@ async def test_commit_failed_when_long_term_extraction_fails_does_not_block_next
         f"/api/v1/sessions/{session_id}/messages",
         json=_message_request("user", content="second round"),
     )
-    resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
@@ -1459,7 +1459,7 @@ async def test_commit_failed_when_summary_fails_does_not_block_next_commit(
             f"/api/v1/sessions/{session_id}/messages",
             json=_message_request("user", content="first round"),
         )
-        commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+        commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
         task_id = commit_resp.json()["result"]["task_id"]
         task = await _wait_for_task(client, task_id)
         assert task["status"] == "failed"
@@ -1476,7 +1476,7 @@ async def test_commit_failed_when_summary_fails_does_not_block_next_commit(
         f"/api/v1/sessions/{session_id}/messages",
         json=_message_request("user", content="second round"),
     )
-    resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"

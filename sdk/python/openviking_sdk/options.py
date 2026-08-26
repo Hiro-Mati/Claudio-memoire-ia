@@ -146,6 +146,8 @@ class BatchAddMessagesOptions(_ExtraOptions, total=False):
 
 
 class CommitSessionOptions(_ExtraOptions, total=False):
+    wait: bool
+    timeout: float
     retention_mode: Literal["turn_budget"]
     keep_recent_turn_count: int
     retained_message_token_budget: int

@@ -364,6 +364,8 @@ type BatchAddMessagesOptions struct {
 
 // CommitSessionOptions controls CommitSession.
 type CommitSessionOptions struct {
+	Wait                       *bool
+	Timeout                    *float64
 	KeepRecentCount            *int
 	RetentionMode              string
 	KeepRecentTurnCount        *int

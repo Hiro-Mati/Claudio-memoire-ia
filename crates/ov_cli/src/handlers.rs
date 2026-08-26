@@ -587,12 +587,16 @@ pub async fn handle_session(cmd: SessionCommands, ctx: CliContext) -> Result<()>
             session_id,
             event_tags,
             no_event_tags,
+            no_wait,
+            timeout,
         } => {
             commands::session::commit_session(
                 &client,
                 &session_id,
                 &event_tags,
                 no_event_tags,
+                !no_wait,
+                timeout,
                 ctx.output_format,
                 ctx.compact,
             )

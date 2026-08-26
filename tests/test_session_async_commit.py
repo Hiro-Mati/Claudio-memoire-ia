@@ -46,12 +46,14 @@ async def _new_session_with_one_message(client: httpx.AsyncClient) -> str:
     return session_id
 
 
-async def test_commit_endpoint_returns_accepted_with_task_id(api_client):
-    """Commit endpoint should return status=accepted with a task_id."""
+async def test_commit_endpoint_returns_accepted_with_task_id_when_wait_is_false(api_client):
+    """Asynchronous commit returns accepted with a task_id."""
     client, service = api_client
     session_id = await _new_session_with_one_message(client)
 
-    resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    resp = await client.post(
+        f"/api/v1/sessions/{session_id}/commit", json={"wait": False}
+    )
 
     assert resp.status_code == 200
     body = resp.json()

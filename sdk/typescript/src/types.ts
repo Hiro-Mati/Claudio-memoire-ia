@@ -245,6 +245,10 @@ export interface BatchAddMessagesOptions {
 }
 /** Session commit and turn-retention options. */
 export interface CommitSessionOptions {
+  /** Wait for this commit task to finish; defaults to true on the server. */
+  wait?: boolean;
+  /** Maximum seconds to wait for this commit task when wait is true. */
+  timeout?: number;
   keepRecentCount?: number;
   retentionMode?: "turn_budget";
   keepRecentTurnCount?: number;

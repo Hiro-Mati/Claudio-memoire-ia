@@ -150,6 +150,12 @@ func (c *Client) CommitSession(ctx context.Context, sessionID string, opts *Comm
 		opts = &CommitSessionOptions{}
 	}
 	payload := map[string]any{}
+	if opts.Wait != nil {
+		payload["wait"] = *opts.Wait
+	}
+	if opts.Timeout != nil {
+		payload["timeout"] = *opts.Timeout
+	}
 	if opts.KeepRecentCount != nil {
 		payload["keep_recent_count"] = *opts.KeepRecentCount
 	}

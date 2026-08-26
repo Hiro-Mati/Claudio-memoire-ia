@@ -19,6 +19,7 @@ from openviking.server.responses import error_response
 from openviking.server.telemetry import run_operation
 from openviking.telemetry import TelemetryRequest
 from openviking.utils.image_search import is_viking_uri
+from openviking_cli.exceptions import DeadlineExceededError, FailedPreconditionError, ProcessingError
 from openviking_cli.utils import get_logger
 
 router = APIRouter(prefix="/api/v1/sessions", tags=["sessions"])
@@ -608,6 +609,18 @@ class CommitRequest(BaseModel):
             "(default 10); compact path passes 0 to archive everything."
         ),
     )
+    wait: bool = Field(
+        default=True,
+        description=(
+            "Wait for this commit task to finish. Set false to return after the "
+            "archive has been persisted and the background task has been queued."
+        ),
+    )
+    timeout: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="Maximum seconds to wait for this commit task when wait=true.",
+    )
     retention_mode: Optional[Literal["turn_budget"]] = Field(
         default=None,
         description=(
@@ -643,6 +656,8 @@ class CommitRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_turn_retention_opt_in(self) -> "CommitRequest":
+        if not self.wait and self.timeout is not None:
+            raise ValueError("timeout requires wait=true")
         if self.retention_mode is None and any(
             value is not None
             for value in (
@@ -655,6 +670,59 @@ class CommitRequest(BaseModel):
                 "retention_mode='turn_budget' is required when Turn retention fields are set"
             )
         return self
+
+
+async def _wait_for_commit_task(
+    accepted: Dict[str, Any],
+    ctx: RequestContext,
+    timeout: Optional[float],
+) -> Dict[str, Any]:
+    """Wait only for the task created by this commit request."""
+    from openviking.service.task_tracker import TaskStatus, get_task_tracker
+
+    task_id = str(accepted["task_id"])
+    try:
+        task = await get_task_tracker().wait(
+            task_id,
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+            timeout=timeout,
+        )
+    except TimeoutError as exc:
+        error = DeadlineExceededError("session commit", timeout)
+        error.details.update(
+            {
+                "task_id": task_id,
+                "session_id": accepted.get("session_id"),
+                "archive_uri": accepted.get("archive_uri"),
+                "poll_url": f"/api/v1/tasks/{task_id}",
+            }
+        )
+        raise error from exc
+
+    if task.status == TaskStatus.COMPLETED:
+        result = dict(task.result or {})
+        result.update(
+            {
+                "status": "completed",
+                "task_id": task_id,
+                "session_id": result.get("session_id") or accepted.get("session_id"),
+                "archive_uri": result.get("archive_uri") or accepted.get("archive_uri"),
+            }
+        )
+        return result
+
+    details = {
+        "task_id": task_id,
+        "session_id": accepted.get("session_id"),
+        "archive_uri": accepted.get("archive_uri"),
+        "poll_url": f"/api/v1/tasks/{task_id}",
+    }
+    if task.status == TaskStatus.FAILED:
+        error = ProcessingError(task.error or "Session commit failed", source="session_commit")
+        error.details.update(details)
+        raise error
+    raise FailedPreconditionError("Session commit was cancelled", details=details)
 
 
 @router.post("/{session_id}/commit")
@@ -692,9 +760,12 @@ async def commit_session(
             **commit_kwargs,
         ),
     )
+    result = execution.result
+    if body.wait and result.get("task_id"):
+        result = await _wait_for_commit_task(result, _ctx, body.timeout)
     return Response(
         status="ok",
-        result=execution.result,
+        result=result,
         telemetry=execution.telemetry,
     ).model_dump(exclude_none=True)
 

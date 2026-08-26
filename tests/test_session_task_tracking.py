@@ -15,7 +15,7 @@ from openviking.server.auth.plugins import DevAuthPlugin
 from openviking.server.config import ServerConfig
 from openviking.server.dependencies import set_service
 from openviking.service.core import OpenVikingService
-from openviking.service.task_tracker import get_task_tracker
+from openviking.service.task_tracker import TaskStatus, get_task_tracker
 
 
 @pytest_asyncio.fixture
@@ -125,14 +125,14 @@ def _make_tracked_commit(behavior="instant", result_overrides=None, gate=None, s
 # ── Commit returns task_id ──
 
 
-async def test_commit_returns_task_id(api_client):
-    """Commit should return a task_id for polling."""
+async def test_commit_with_no_wait_returns_task_id(api_client):
+    """wait=false preserves the asynchronous accepted response."""
     client, service = api_client
     session_id = await _new_session_with_message(client)
 
     service.sessions.commit_async = _make_tracked_commit()
 
-    resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     assert resp.status_code == 200
     body = resp.json()
     assert body["result"]["status"] == "accepted"
@@ -140,6 +140,84 @@ async def test_commit_returns_task_id(api_client):
 
     # Let background task complete
     await asyncio.sleep(0.2)
+
+
+async def test_commit_waits_for_its_own_task_and_returns_final_result(api_client):
+    """The default commit response waits for this request's task only."""
+    client, service = api_client
+    session_id = await _new_session_with_message(client)
+
+    service.sessions.commit_async = _make_tracked_commit(
+        result_overrides={"memories_extracted": {"event": 2}}
+    )
+
+    resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+
+    assert resp.status_code == 200
+    result = resp.json()["result"]
+    assert result["status"] == "completed"
+    assert result["memories_extracted"] == {"event": 2}
+    assert result["task_id"]
+
+
+async def test_commit_wait_does_not_wait_for_another_commit_task(api_client):
+    """The default wait targets the new task, not the task queue as a whole."""
+    client, service = api_client
+    blocked_session_id = await _new_session_with_message(client)
+    session_id = await _new_session_with_message(client)
+    gate = asyncio.Event()
+    started = asyncio.Event()
+
+    service.sessions.commit_async = _make_tracked_commit(
+        behavior="gated", gate=gate, started=started
+    )
+    blocked_resp = await client.post(
+        f"/api/v1/sessions/{blocked_session_id}/commit", json={"wait": False}
+    )
+    blocked_task_id = blocked_resp.json()["result"]["task_id"]
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    service.sessions.commit_async = _make_tracked_commit()
+    resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+
+    assert resp.status_code == 200
+    assert resp.json()["result"]["status"] == "completed"
+    blocked_task = await get_task_tracker().get(blocked_task_id)
+    assert blocked_task is not None
+    assert blocked_task.status in (TaskStatus.PENDING, TaskStatus.RUNNING)
+
+    gate.set()
+    completed = await get_task_tracker().wait(blocked_task_id, timeout=2.0)
+    assert completed.status == TaskStatus.COMPLETED
+
+
+async def test_commit_wait_timeout_leaves_its_task_running(api_client):
+    """A request timeout stops waiting without cancelling the queued commit."""
+    client, service = api_client
+    session_id = await _new_session_with_message(client)
+    gate = asyncio.Event()
+    started = asyncio.Event()
+    service.sessions.commit_async = _make_tracked_commit(
+        behavior="gated", gate=gate, started=started
+    )
+
+    resp = await client.post(
+        f"/api/v1/sessions/{session_id}/commit",
+        json={"timeout": 0.01},
+    )
+
+    assert resp.status_code == 504
+    details = resp.json()["error"]["details"]
+    task_id = details["task_id"]
+    assert details["session_id"] == session_id
+    assert await asyncio.wait_for(started.wait(), timeout=2.0) is True
+    task = await get_task_tracker().get(task_id)
+    assert task is not None
+    assert task.status in (TaskStatus.PENDING, TaskStatus.RUNNING)
+
+    gate.set()
+    completed = await get_task_tracker().wait(task_id, timeout=2.0)
+    assert completed.status == TaskStatus.COMPLETED
 
 
 # ── Task lifecycle: pending → running → completed ──
@@ -161,7 +239,7 @@ async def test_task_lifecycle_success(api_client):
     )
 
     # Fire background commit
-    resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     task_id = resp.json()["result"]["task_id"]
 
     # Wait for commit to start
@@ -197,7 +275,7 @@ async def test_task_lifecycle_failure(api_client):
         result_overrides={"error": "LLM provider timeout"},
     )
 
-    resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     task_id = resp.json()["result"]["task_id"]
 
     await asyncio.sleep(0.2)
@@ -222,12 +300,12 @@ async def test_duplicate_commit_returns_second_task(api_client):
     service.sessions.commit_async = _make_tracked_commit(behavior="gated", gate=gate)
 
     # First commit
-    resp1 = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    resp1 = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     assert resp1.json()["result"]["status"] == "accepted"
     task_id_1 = resp1.json()["result"]["task_id"]
 
     # Second commit should also be accepted
-    resp2 = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    resp2 = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     assert resp2.status_code == 200
     assert resp2.json()["result"]["status"] == "accepted"
     task_id_2 = resp2.json()["result"]["task_id"]
@@ -255,7 +333,7 @@ async def test_list_tasks(api_client):
 
     service.sessions.commit_async = _make_tracked_commit()
 
-    await client.post(f"/api/v1/sessions/{session_id}/commit")
+    await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     await asyncio.sleep(0.2)
 
     resp = await client.get("/api/v1/tasks", params={"task_type": "session_commit"})
@@ -271,7 +349,7 @@ async def test_list_tasks_filter_status(api_client):
     service.sessions.commit_async = _make_tracked_commit()
 
     session_id = await _new_session_with_message(client)
-    await client.post(f"/api/v1/sessions/{session_id}/commit")
+    await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     await asyncio.sleep(0.2)
 
     # completed tasks
@@ -294,7 +372,7 @@ async def test_error_sanitized_in_task(api_client):
         result_overrides={"error": "Auth failed with key sk-ant-api03-DAqSsuperSecretKey123"},
     )
 
-    resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
+    resp = await client.post(f"/api/v1/sessions/{session_id}/commit", json={"wait": False})
     task_id = resp.json()["result"]["task_id"]
 
     await asyncio.sleep(0.2)

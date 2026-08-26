@@ -1476,6 +1476,12 @@ enum SessionCommands {
         /// Do not apply the session's default event tags to this commit
         #[arg(long = "no-event-tags", conflicts_with = "event_tags")]
         no_event_tags: bool,
+        /// Return after the commit has been queued instead of waiting for completion
+        #[arg(long = "no-wait", conflicts_with = "timeout")]
+        no_wait: bool,
+        /// Maximum seconds to wait for this commit to complete
+        #[arg(long, value_parser = config::parse_positive_timeout, value_name = "seconds")]
+        timeout: Option<f64>,
     },
 }
 

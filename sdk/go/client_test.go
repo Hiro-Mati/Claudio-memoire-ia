@@ -776,6 +776,26 @@ func TestSessionSendsLatestMessageAndRetentionFields(t *testing.T) {
 	}
 }
 
+func TestCommitSessionSendsExplicitWaitOptions(t *testing.T) {
+	var body map[string]any
+	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body = readJSONBody(t, r)
+		writeOK(t, w, map[string]any{"status": "ok"})
+	}))
+	defer closeServer()
+
+	if _, err := client.CommitSession(context.Background(), "session-1", &CommitSessionOptions{
+		Wait:    Bool(true),
+		Timeout: Float64(12.5),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if body["wait"] != true || body["timeout"] != 12.5 {
+		t.Fatalf("commit body = %#v", body)
+	}
+}
+
 func TestCreateSessionSendsExtra(t *testing.T) {
 	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body := readJSONBody(t, r)

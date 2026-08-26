@@ -1493,11 +1493,14 @@ class AsyncHTTPClient:
         )
         if event_tags is not _SESSION_CONFIG_UNSET:
             payload["extraction_metadata"] = {"event": {"tags": event_tags}}
+        wait = payload.get("wait", True)
+        timeout = payload.get("timeout")
         session_path = self._path_segment(session_id)
         response = await self._request(
             "POST",
             f"/api/v1/sessions/{session_path}/commit",
             json=payload,
+            **self._wait_request_kwargs(wait=wait, timeout=timeout),
         )
         return self._handle_response_data(response).get("result", {})
 

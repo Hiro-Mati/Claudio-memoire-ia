@@ -389,6 +389,8 @@ pub async fn commit_session(
     session_id: &str,
     event_tags: &[String],
     no_event_tags: bool,
+    wait: bool,
+    timeout: Option<f64>,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
@@ -400,7 +402,14 @@ pub async fn commit_session(
     } else {
         Some(event_tags)
     };
-    let body = event_tags_body(tags);
+    let mut body = event_tags_body(tags);
+    let object = body
+        .as_object_mut()
+        .expect("session commit request body must be an object");
+    object.insert("wait".to_string(), json!(wait));
+    if let Some(timeout) = timeout {
+        object.insert("timeout".to_string(), json!(timeout));
+    }
     let response: serde_json::Value = client.post(&path, &body).await?;
     output_success(&response, output_format, compact);
     Ok(())
