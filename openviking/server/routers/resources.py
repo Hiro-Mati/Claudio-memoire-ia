@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Resource endpoints for OpenViking HTTP Server."""
 
+import logging
+import time
+
 from typing import Any, Dict, Literal, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
@@ -23,6 +26,7 @@ from openviking.telemetry import TelemetryRequest
 from openviking_cli.exceptions import InvalidArgumentError
 
 router = APIRouter(prefix="/api/v1", tags=["resources"])
+logger = logging.getLogger(__name__)
 
 
 class AddResourceRequest(BaseModel):
@@ -175,13 +179,21 @@ async def temp_upload(
     """
     signed = getattr(request.state, "signed_upload", None)
     effective_upload_mode = upload_mode or request.app.state.config.temp_upload.default_mode
+    logger.info(
+        "[TempUpload] Handler entered: signed=%s mode=%s filename=%s",
+        signed is not None,
+        effective_upload_mode,
+        file.filename or "-",
+    )
 
     async def _upload() -> dict[str, Any]:
         store = TempUploadStore.build(request.app.state.config)
         temp_file_id = await store.save_upload(file, effective_upload_mode, _ctx)
         if signed is None:
             return {"temp_file_id": temp_file_id}
-        return await ingest_temp_upload(
+        ingest_started_at = time.monotonic()
+        logger.info("[TempUpload] Signed ingest start: temp_file_id=%s", temp_file_id)
+        result = await ingest_temp_upload(
             store,
             temp_file_id,
             _ctx,
@@ -192,6 +204,12 @@ async def temp_upload(
             tag_mode=signed.tag_mode,
             parse_mode=signed.parse_mode,
         )
+        logger.info(
+            "[TempUpload] Signed ingest completed: temp_file_id=%s elapsed_ms=%.1f",
+            temp_file_id,
+            (time.monotonic() - ingest_started_at) * 1000.0,
+        )
+        return result
 
     try:
         execution = await run_operation(

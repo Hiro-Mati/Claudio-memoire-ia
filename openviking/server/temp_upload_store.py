@@ -29,6 +29,11 @@ _SHARED_UPLOAD_ROOT = "viking://upload"
 logger = logging.getLogger(__name__)
 
 
+def _log_account_id(ctx: RequestContext) -> str:
+    """Return a safe account label for diagnostic logs."""
+    return str(getattr(ctx, "account_id", "-"))
+
+
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f)
@@ -158,11 +163,27 @@ class TempUploadStore:
         upload_mode: str,
         ctx: RequestContext,
     ) -> str:
+        started_at = time.monotonic()
+        logger.info(
+            "[TempUpload] Save start: mode=%s account=%s filename=%s",
+            upload_mode,
+            _log_account_id(ctx),
+            getattr(upload_file, "filename", None) or "-",
+        )
         if upload_mode == "local":
-            return await self._save_local(upload_file)
-        if upload_mode == "shared":
-            return await self._save_shared(upload_file, ctx)
-        raise InvalidArgumentError("upload_mode must be 'local' or 'shared'.")
+            temp_file_id = await self._save_local(upload_file)
+        elif upload_mode == "shared":
+            temp_file_id = await self._save_shared(upload_file, ctx)
+        else:
+            raise InvalidArgumentError("upload_mode must be 'local' or 'shared'.")
+        logger.info(
+            "[TempUpload] Save completed: mode=%s account=%s temp_file_id=%s elapsed_ms=%.1f",
+            upload_mode,
+            _log_account_id(ctx),
+            temp_file_id,
+            (time.monotonic() - started_at) * 1000.0,
+        )
+        return temp_file_id
 
     async def resolve_for_consume(
         self,
@@ -212,9 +233,23 @@ class TempUploadStore:
         return temp_filename
 
     async def _save_shared(self, upload_file: Any, ctx: RequestContext) -> str:
+        cleanup_started_at = time.monotonic()
+        logger.info("[TempUpload] Shared cleanup start: account=%s", ctx.account_id)
         await self._cleanup_shared_uploads(ctx)
+        logger.info(
+            "[TempUpload] Shared cleanup completed: account=%s elapsed_ms=%.1f",
+            ctx.account_id,
+            (time.monotonic() - cleanup_started_at) * 1000.0,
+        )
+        stream_started_at = time.monotonic()
         temp_path, total_size = await _stream_upload_to_local_temp(
             upload_file, self.temp_cfg.shared_max_size_bytes
+        )
+        logger.info(
+            "[TempUpload] Shared local stream completed: account=%s bytes=%s elapsed_ms=%.1f",
+            ctx.account_id,
+            total_size,
+            (time.monotonic() - stream_started_at) * 1000.0,
         )
         upload_id = _new_shared_upload_id()
         temp_file_id = f"shared_{upload_id}"
@@ -236,8 +271,28 @@ class TempUploadStore:
 
         try:
             content = await asyncio.to_thread(Path(temp_path).read_bytes)
+            content_write_started_at = time.monotonic()
+            logger.info(
+                "[TempUpload] Shared VFS content write start: account=%s bytes=%s uri=%s",
+                ctx.account_id,
+                total_size,
+                content_uri,
+            )
             await vfs.write_file_bytes(content_uri, content, ctx=internal_ctx)
+            logger.info(
+                "[TempUpload] Shared VFS content write completed: account=%s uri=%s elapsed_ms=%.1f",
+                ctx.account_id,
+                content_uri,
+                (time.monotonic() - content_write_started_at) * 1000.0,
+            )
+            meta_write_started_at = time.monotonic()
             await vfs.write_file(meta_uri, json.dumps(meta, ensure_ascii=False), ctx=internal_ctx)
+            logger.info(
+                "[TempUpload] Shared VFS meta write completed: account=%s uri=%s elapsed_ms=%.1f",
+                ctx.account_id,
+                meta_uri,
+                (time.monotonic() - meta_write_started_at) * 1000.0,
+            )
             return temp_file_id
         except Exception:
             with suppress(Exception):
@@ -376,6 +431,7 @@ class TempUploadStore:
 
         now = time.time()
         cutoff = now - self.temp_cfg.ttl_seconds
+        removed_count = 0
         logger.debug(
             "Shared temp upload cleanup account=%s ttl_seconds=%s upload_count=%s "
             "now=%s cutoff=%s",
@@ -417,7 +473,14 @@ class TempUploadStore:
                     exc_info=True,
                 )
             else:
+                removed_count += 1
                 logger.debug("Shared temp upload cleanup removed uri=%s", uri)
+        logger.info(
+            "[TempUpload] Shared cleanup summary: account=%s upload_count=%s removed_count=%s",
+            ctx.account_id,
+            len(uploads),
+            removed_count,
+        )
 
     def _cleanup_local_temp_files(self, temp_dir: Path) -> None:
         if self.temp_cfg.ttl_seconds == 0:
