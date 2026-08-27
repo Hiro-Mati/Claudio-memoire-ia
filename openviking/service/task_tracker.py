@@ -213,6 +213,11 @@ class TaskTracker:
 
     async def _finalize_before_ack(self, metadata: QueueTaskMetadata) -> None:
         """Persist the terminal state before QueueFS removes the last recovery message."""
+        logger.info(
+            "[TaskTracker] Finalize before ack start: task_id=%s work_id=%s",
+            metadata.task_id,
+            metadata.work_id,
+        )
         await self._dispatcher.run(
             lambda: self._finalize_task_on_owner(
                 metadata.task_id,
@@ -697,11 +702,16 @@ class TaskTracker:
         user_id: Optional[str] = None,
     ) -> None:
         if self._work_index.has_work(task_id):
+            logger.info("[TaskTracker] Finalize skipped because task still has work: task_id=%s", task_id)
             return
         async with self._task_locks.acquire(task_id):
             task = await self._load_for_update(task_id, account_id, user_id)
             if task and task.status in _ACTIVE_STATUSES:
                 if self._work_index.has_work(task_id):
+                    logger.info(
+                        "[TaskTracker] Finalize skipped after task lock because task has work: task_id=%s",
+                        task_id,
+                    )
                     return
                 updated = deepcopy(task)
                 if updated.status != TaskStatus.CANCELLING:
@@ -719,7 +729,17 @@ class TaskTracker:
                 updated.stage = updated.status.value
                 updated.updated_at = self._next_updated_at(task)
                 updated.auth = {}
+                logger.info(
+                    "[TaskTracker] Finalize persist start: task_id=%s status=%s",
+                    task_id,
+                    updated.status.value,
+                )
                 await self._persist_and_publish("update", updated)
+                logger.info(
+                    "[TaskTracker] Finalize persist completed: task_id=%s status=%s",
+                    task_id,
+                    updated.status.value,
+                )
                 self._work_index.clear_failure(task_id)
                 logger.info("[TaskTracker] Task %s %s", task_id, updated.status.value)
 

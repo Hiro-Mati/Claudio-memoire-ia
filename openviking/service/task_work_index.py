@@ -18,6 +18,11 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Iterable, Iterator, Mapping, Optional
 from uuid import uuid4
 
+from openviking_cli.utils.logger import get_logger
+
+
+logger = get_logger(__name__)
+
 TASK_WORK_ID_FIELD = "_task_work_id"
 
 
@@ -252,6 +257,12 @@ class TaskWorkIndex:
         if not became_idle:
             return metadata
 
+        logger.info(
+            "[TaskWorkIndex] Last task work settled before ack: task_id=%s queue=%s work_id=%s",
+            metadata.task_id,
+            queue_name,
+            metadata.work_id,
+        )
         callback = self._finalize_before_ack
         if callback is None:
             return metadata

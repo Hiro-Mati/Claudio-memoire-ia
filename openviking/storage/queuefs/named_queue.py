@@ -274,10 +274,29 @@ class NamedQueue:
             return
         ack_file = f"{self.path}/ack"
         prepared = None
+        metadata = (
+            extract_task_metadata(message)
+            if self._task_work_index is not None and message is not None
+            else None
+        )
+        logger.info(
+            "[QueueFS] Ack start: queue=%s msg_id=%s task_id=%s work_id=%s",
+            self.name,
+            msg_id,
+            metadata.task_id if metadata is not None else "-",
+            metadata.work_id if metadata is not None else "-",
+        )
         try:
             if self._task_work_index is not None and message is not None:
                 prepared = await self._task_work_index.prepare_ack(self.name, message)
             await self._async_agfs.write(ack_file, msg_id.encode("utf-8"))
+            logger.info(
+                "[QueueFS] Ack completed: queue=%s msg_id=%s task_id=%s work_id=%s",
+                self.name,
+                msg_id,
+                metadata.task_id if metadata is not None else "-",
+                metadata.work_id if metadata is not None else "-",
+            )
         except asyncio.CancelledError:
             if self._task_work_index is not None and prepared is not None:
                 self._task_work_index.rollback_ack(self.name, prepared)
@@ -285,7 +304,14 @@ class NamedQueue:
         except Exception as e:
             if self._task_work_index is not None and prepared is not None:
                 self._task_work_index.rollback_ack(self.name, prepared)
-            logger.warning(f"[NamedQueue] Ack failed for {self.name} msg_id={msg_id}: {e}")
+            logger.warning(
+                "[QueueFS] Ack failed: queue=%s msg_id=%s task_id=%s work_id=%s error=%s",
+                self.name,
+                msg_id,
+                metadata.task_id if metadata is not None else "-",
+                metadata.work_id if metadata is not None else "-",
+                e,
+            )
 
     async def _read_queue_message(self) -> Optional[Dict[str, Any]]:
         """Read and remove one message from the AGFS queue; return parsed dict or None.
