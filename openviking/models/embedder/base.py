@@ -11,6 +11,7 @@ from threading import Lock
 from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar, Union
 
 from openviking.telemetry import get_current_telemetry
+from openviking.service.task_work_index import get_task_context
 from openviking.utils.embedding_input import (
     resolve_embedding_max_input_tokens,
     truncate_embedding_input,
@@ -264,9 +265,32 @@ class EmbedderBase(ABC):
     ) -> T:
         async def _wrapped() -> T:
             semaphore = _get_async_embed_semaphore(self.max_concurrent)
+            task_context = get_task_context()
+            task_id = task_context.task_id if task_context else ""
             wait_started = time.monotonic()
+            if logger:
+                logger.info(
+                    "%s waiting for embedding concurrency slot task_id=%s provider=%s "
+                    "model=%s limit=%d",
+                    operation_name,
+                    task_id,
+                    self.provider,
+                    self.model_name,
+                    self.max_concurrent,
+                )
             await semaphore.acquire()
             wait_elapsed = time.monotonic() - wait_started
+            if logger:
+                logger.info(
+                    "%s acquired embedding concurrency slot task_id=%s provider=%s "
+                    "model=%s limit=%d wait_ms=%.2f",
+                    operation_name,
+                    task_id,
+                    self.provider,
+                    self.model_name,
+                    self.max_concurrent,
+                    wait_elapsed * 1000,
+                )
             telemetry = get_current_telemetry()
             telemetry.set("embedding.async.max_concurrent", self.max_concurrent)
             telemetry.set("embedding.async.wait_ms", round(wait_elapsed * 1000, 3))

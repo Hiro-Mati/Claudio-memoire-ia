@@ -592,6 +592,13 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 "task_id": task_metadata.task_id if task_metadata else "",
                 "work_id": task_metadata.work_id if task_metadata else "",
             }
+            logger.info(
+                "[Embedding] Dequeued queue work: task_id=%s work_id=%s embedding_id=%s uri=%s",
+                log_context["task_id"],
+                log_context["work_id"],
+                log_context["embedding_id"],
+                log_context["uri"],
+            )
             inserted_data = embedding_msg.context_data
             account_id = inserted_data.get("account_id", "default")
             user = UserIdentifier(account_id=account_id, user_id="default")
@@ -828,6 +835,17 @@ class TextEmbeddingHandler(DequeueHandlerBase):
 
                 # Write to vector database
                 try:
+                    logger.info(
+                        "[Embedding] Starting vector DB upsert: task_id=%s work_id=%s "
+                        "embedding_id=%s uri=%s",
+                        log_context["task_id"],
+                        log_context["work_id"],
+                        log_context["embedding_id"],
+                        log_context["uri"],
+                    )
+                    import time as _time
+
+                    _upsert_t0 = _time.monotonic()
                     raw_upsert_options = inserted_data.pop("_upsert_options", {})
                     upsert_options = normalize_upsert_options(
                         {**raw_upsert_options, "partial_update": True}
@@ -850,6 +868,16 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         options=upsert_options,
                     )
                     record_id = result
+                    logger.info(
+                        "[Embedding] Vector DB upsert completed: task_id=%s work_id=%s "
+                        "embedding_id=%s uri=%s elapsed_s=%.3f record_id=%s",
+                        log_context["task_id"],
+                        log_context["work_id"],
+                        log_context["embedding_id"],
+                        log_context["uri"],
+                        _time.monotonic() - _upsert_t0,
+                        bool(record_id),
+                    )
                     if record_id:
                         logger.debug("Successfully wrote embedding: uri=%s", uri)
                 except CollectionNotFoundError as db_err:
