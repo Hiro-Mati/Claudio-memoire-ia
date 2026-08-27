@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 import uuid
@@ -62,6 +63,14 @@ class RequestIdMiddleware:
         request_id, invalid = _resolve_request_id(scope)
         scope.setdefault("state", {})["request_id"] = request_id
         method = scope["method"]
+        source = next(
+            (
+                value.decode("latin-1")
+                for name, value in scope["headers"]
+                if name.lower() == b"x-openviking-access-source"
+            ),
+            "-",
+        )
         status_code = 500
 
         async def send_with_request_id(message: Message) -> None:
@@ -79,6 +88,20 @@ class RequestIdMiddleware:
 
         with bind_log_request_id(request_id):
             try:
+                if scope["path"] not in _IGNORED_COMPLETION_ROUTES:
+                    _completion_logger.info(
+                        "HTTP request started method=%s path=%s source=%s pid=%s",
+                        method,
+                        scope["path"],
+                        source,
+                        os.getpid(),
+                        extra={
+                            "http_method": method,
+                            "http_path": scope["path"],
+                            "request_source": source,
+                            "process_id": os.getpid(),
+                        },
+                    )
                 if invalid:
                     response = JSONResponse(
                         status_code=400,
