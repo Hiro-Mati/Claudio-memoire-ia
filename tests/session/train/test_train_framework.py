@@ -1746,8 +1746,8 @@ class FakeSessionCommitClient:
         self.task_poll_counts = {}
         self.tasks = []
 
-    async def create_session(self, *, session_id, memory_policy=None):
-        self.created_sessions.append((session_id, memory_policy))
+    async def create_session(self, *, session_id, options=None):
+        self.created_sessions.append((session_id, options))
 
     async def get_session(self, session_id, *, auto_create=False):
         return {"session_id": session_id, "message_count": len(self.messages.get(session_id, []))}
@@ -1817,8 +1817,10 @@ async def test_session_commit_policy_trainer_records_commit_trace_id():
         (
             commit_result["session_id"],
             {
-                "memory_types": ["cases", "trajectories", "experiences"],
-                "working_memory": {"enabled": False},
+                "memory_policy": {
+                    "memory_types": ["cases", "trajectories", "experiences"],
+                    "working_memory": {"enabled": False},
+                },
             },
         )
     ]
@@ -2183,10 +2185,10 @@ async def test_session_commit_policy_trainer_retries_transient_create_session():
     async def fake_sleep(delay):
         sleep_delays.append(delay)
 
-    async def flaky_create_session(*, session_id, memory_policy=None):
+    async def flaky_create_session(*, session_id, options=None):
         if transient_errors:
             raise transient_errors.pop(0)
-        await original_create_session(session_id=session_id, memory_policy=memory_policy)
+        await original_create_session(session_id=session_id, options=options)
 
     client.create_session = flaky_create_session
     trainer = SessionCommitPolicyTrainer(
@@ -2203,7 +2205,10 @@ async def test_session_commit_policy_trainer_retries_transient_create_session():
 
     assert sleep_delays == [0.5, 1.0, 2.0, 2.0]
     assert len(client.created_sessions) == 1
-    assert client.created_sessions[0] == ("retry-session", {"memory_types": ["experiences"]})
+    assert client.created_sessions[0] == (
+        "retry-session",
+        {"memory_policy": {"memory_types": ["experiences"]}},
+    )
 
 
 @pytest.mark.asyncio
@@ -2216,7 +2221,7 @@ async def test_session_commit_policy_trainer_does_not_retry_nontransient_create_
     async def fake_sleep(delay):
         sleep_delays.append(delay)
 
-    async def failing_create_session(*, session_id, memory_policy=None):
+    async def failing_create_session(*, session_id, options=None):
         raise RuntimeError("bad request")
 
     client.create_session = failing_create_session

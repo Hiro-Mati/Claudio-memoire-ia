@@ -314,7 +314,7 @@ class SessionCommitPolicyTrainer:
             try:
                 await self.client.create_session(
                     session_id=session_id,
-                    memory_policy=memory_policy,
+                    options={"memory_policy": memory_policy},
                 )
                 return
             except Exception as exc:
