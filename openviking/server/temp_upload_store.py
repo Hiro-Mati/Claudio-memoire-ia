@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -28,6 +29,30 @@ _SHARED_UPLOAD_ROOT = "viking://upload"
 logger = logging.getLogger(__name__)
 
 
+def _write_json(path: Path, data: dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+
+def _write_bytes(path: str, content: bytes) -> None:
+    with open(path, "wb") as f:
+        f.write(content)
+
+
+def _open_binary_for_write(path: str | Path):
+    return open(path, "wb")
+
+
+def _close_file(file_obj: Any) -> None:
+    file_obj.close()
+
+
+def _create_temp_file(*, prefix: str, suffix: str) -> str:
+    fd, temp_path = tempfile.mkstemp(prefix=prefix, suffix=suffix)
+    os.close(fd)
+    return temp_path
+
+
 @dataclass
 class ResolvedTempUpload:
     mode: str
@@ -38,7 +63,7 @@ class ResolvedTempUpload:
     async def cleanup(self) -> None:
         if self.mode == "shared" and self.local_path:
             with suppress(FileNotFoundError):
-                os.unlink(self.local_path)
+                await asyncio.to_thread(os.unlink, self.local_path)
 
 
 def get_temp_upload_config(server_config: ServerConfig) -> TempUploadConfig:
@@ -81,26 +106,34 @@ def _shared_upload_created_at(upload_id: str) -> Optional[float]:
 
 async def _stream_upload_to_local_temp(upload_file: Any, max_size_bytes: int) -> tuple[str, int]:
     suffix = Path(upload_file.filename or "upload.tmp").suffix or ".tmp"
-    fd, temp_path = tempfile.mkstemp(prefix="ov_http_upload_", suffix=suffix)
-    os.close(fd)
+    temp_path = await asyncio.to_thread(
+        _create_temp_file, prefix="ov_http_upload_", suffix=suffix
+    )
     total = 0
+    f = None
     try:
-        with open(temp_path, "wb") as f:
-            while True:
-                chunk = await upload_file.read(_CHUNK_SIZE)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > max_size_bytes:
-                    raise InvalidArgumentError(
-                        f"Upload exceeds size limit ({max_size_bytes} bytes)."
-                    )
-                f.write(chunk)
+        f = await asyncio.to_thread(_open_binary_for_write, temp_path)
+        while True:
+            chunk = await upload_file.read(_CHUNK_SIZE)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_size_bytes:
+                raise InvalidArgumentError(
+                    f"Upload exceeds size limit ({max_size_bytes} bytes)."
+                )
+            # UploadFile reads already yield to the event loop.  Local disk writes do
+            # not, so run each bounded write in the default executor rather than
+            # stalling the Core worker event loop on slow local storage.
+            await asyncio.to_thread(f.write, chunk)
         return temp_path, total
     except Exception:
         with suppress(FileNotFoundError):
-            os.unlink(temp_path)
+            await asyncio.to_thread(os.unlink, temp_path)
         raise
+    finally:
+        if f is not None:
+            await asyncio.to_thread(_close_file, f)
 
 
 class TempUploadStore:
@@ -138,33 +171,35 @@ class TempUploadStore:
     ) -> ResolvedTempUpload:
         shared_id = _parse_shared_temp_file_id(temp_file_id)
         if shared_id is None:
-            return self._resolve_local(temp_file_id)
+            return await asyncio.to_thread(self._resolve_local, temp_file_id)
         return await self._resolve_shared(temp_file_id, shared_id, ctx)
 
     async def _save_local(self, upload_file: Any) -> str:
         config = get_openviking_config()
         temp_dir = config.storage.get_upload_temp_dir()
-        self._cleanup_local_temp_files(temp_dir)
+        await asyncio.to_thread(self._cleanup_local_temp_files, temp_dir)
 
         file_ext = Path(upload_file.filename).suffix if upload_file.filename else ".tmp"
         temp_filename = f"upload_{uuid.uuid4().hex}{file_ext}"
         temp_file_path = temp_dir / temp_filename
 
         total = 0
-        with open(temp_file_path, "wb") as f:
+        f = await asyncio.to_thread(_open_binary_for_write, temp_file_path)
+        try:
             while True:
                 chunk = await upload_file.read(_CHUNK_SIZE)
                 if not chunk:
                     break
                 total += len(chunk)
                 if total > self.temp_cfg.shared_max_size_bytes:
-                    f.close()
                     with suppress(FileNotFoundError):
-                        temp_file_path.unlink()
+                        await asyncio.to_thread(temp_file_path.unlink)
                     raise InvalidArgumentError(
                         f"Upload exceeds size limit ({self.temp_cfg.shared_max_size_bytes} bytes)."
                     )
-                f.write(chunk)
+                await asyncio.to_thread(f.write, chunk)
+        finally:
+            await asyncio.to_thread(_close_file, f)
 
         if upload_file.filename:
             meta_path = temp_dir / f"{temp_filename}.ov_upload.meta"
@@ -172,8 +207,7 @@ class TempUploadStore:
                 "original_filename": upload_file.filename,
                 "upload_time": time.time(),
             }
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(meta, f)
+            await asyncio.to_thread(_write_json, meta_path, meta)
 
         return temp_filename
 
@@ -201,8 +235,7 @@ class TempUploadStore:
         }
 
         try:
-            with open(temp_path, "rb") as f:
-                content = f.read()
+            content = await asyncio.to_thread(Path(temp_path).read_bytes)
             await vfs.write_file_bytes(content_uri, content, ctx=internal_ctx)
             await vfs.write_file(meta_uri, json.dumps(meta, ensure_ascii=False), ctx=internal_ctx)
             return temp_file_id
@@ -216,7 +249,7 @@ class TempUploadStore:
             raise
         finally:
             with suppress(FileNotFoundError):
-                os.unlink(temp_path)
+                await asyncio.to_thread(os.unlink, temp_path)
 
     def _resolve_local(self, temp_file_id: str) -> ResolvedTempUpload:
         upload_temp_dir = get_openviking_config().storage.get_upload_temp_dir()
@@ -282,15 +315,15 @@ class TempUploadStore:
             raise PermissionDeniedError("Temporary upload is invalid: content missing.")
 
         file_ext = meta.get("file_ext") or ".tmp"
-        fd, temp_path = tempfile.mkstemp(prefix="ov_shared_upload_", suffix=file_ext)
-        os.close(fd)
+        temp_path = await asyncio.to_thread(
+            _create_temp_file, prefix="ov_shared_upload_", suffix=file_ext
+        )
         try:
             content = await vfs.read_file_bytes(content_uri, ctx=internal_ctx)
-            with open(temp_path, "wb") as f:
-                f.write(content)
+            await asyncio.to_thread(_write_bytes, temp_path, content)
         except Exception:
             with suppress(FileNotFoundError):
-                os.unlink(temp_path)
+                await asyncio.to_thread(os.unlink, temp_path)
             raise
         return ResolvedTempUpload(
             mode="shared",
