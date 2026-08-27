@@ -4,9 +4,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
+import contextlib
 import os
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -81,6 +84,7 @@ _CREATE_ALLOWED_EXTENSIONS = frozenset(
 _BATCH_MAX_OPERATIONS = 256
 _BATCH_MAX_FILE_BYTES = 8 * 1024 * 1024
 _BATCH_MAX_TOTAL_BYTES = 16 * 1024 * 1024
+_CONTENT_WRITE_QUEUE_SNAPSHOT_INTERVAL_SECONDS = 30.0
 
 # Subtrees directly under a user root that OpenViking manages itself; only
 # memories/, resources/, and plain files may be written under a user root.
@@ -115,6 +119,80 @@ class ContentWriteCoordinator:
     def __init__(self, viking_fs: VikingFS, vikingdb: Any = None):
         self._viking_fs = viking_fs
         self._vikingdb = vikingdb
+
+    async def _log_content_write_queue_snapshot(
+        self,
+        *,
+        task_id: str,
+        uri: str,
+        processing_mode: ProcessingMode,
+        task_tracker: Any,
+        wait_started_at: float,
+    ) -> None:
+        """Log the local QueueFS state while a synchronous write is waiting.
+
+        This is diagnostic only: task completion remains owned by TaskTracker and
+        its task-work index.  In ``queuefs.backend=memory`` mode these counts are
+        scoped to the Core worker that serves this request.
+        """
+        try:
+            queue_manager = get_queue_manager()
+            statuses = await queue_manager.check_status()
+            queues = {}
+            for queue_name in (queue_manager.EMBEDDING, queue_manager.SEMANTIC):
+                status = statuses.get(queue_name)
+                if status is None:
+                    continue
+                queues[queue_name] = {
+                    "pending": status.pending,
+                    "in_progress": status.in_progress,
+                    "processed": status.processed,
+                    "requeue_count": status.requeue_count,
+                    "error_count": status.error_count,
+                }
+            logger.info(
+                "[ContentWrite] Task wait queue snapshot: task_id=%s uri=%s "
+                "processing_mode=%s wait_seconds=%.1f task_has_work=%s "
+                "queue_mount_point=%s queues=%s",
+                task_id,
+                uri,
+                processing_mode,
+                time.monotonic() - wait_started_at,
+                task_tracker.has_work(task_id),
+                queue_manager.mount_point,
+                queues,
+            )
+        except Exception:
+            # Queue inspection must never change the write outcome or hide its
+            # original timeout/failure.  Keep the exception details for diagnosis.
+            logger.warning(
+                "[ContentWrite] Failed to collect task wait queue snapshot: "
+                "task_id=%s uri=%s",
+                task_id,
+                uri,
+                exc_info=True,
+            )
+
+    async def _monitor_content_write_task_wait(
+        self,
+        *,
+        task_id: str,
+        uri: str,
+        processing_mode: ProcessingMode,
+        task_tracker: Any,
+        wait_started_at: float,
+    ) -> None:
+        """Emit periodic QueueFS snapshots after the initial snapshot."""
+        while True:
+            await asyncio.sleep(_CONTENT_WRITE_QUEUE_SNAPSHOT_INTERVAL_SECONDS)
+            await self._log_content_write_queue_snapshot(
+                task_id=task_id,
+                uri=uri,
+                processing_mode=processing_mode,
+                task_tracker=task_tracker,
+                wait_started_at=wait_started_at,
+            )
+            await asyncio.sleep(_CONTENT_WRITE_QUEUE_SNAPSHOT_INTERVAL_SECONDS)
 
     async def write(
         self,
@@ -886,12 +964,35 @@ class ContentWriteCoordinator:
                         processing_mode,
                         timeout,
                     )
-                    completed_task = await task_tracker.wait(
-                        task_id,
-                        account_id=ctx.account_id,
-                        user_id=ctx.user.user_id,
-                        timeout=timeout,
+                    wait_started_at = time.monotonic()
+                    await self._log_content_write_queue_snapshot(
+                        task_id=task_id,
+                        uri=uri,
+                        processing_mode=processing_mode,
+                        task_tracker=task_tracker,
+                        wait_started_at=wait_started_at,
                     )
+                    monitor_task = asyncio.create_task(
+                        self._monitor_content_write_task_wait(
+                            task_id=task_id,
+                            uri=uri,
+                            processing_mode=processing_mode,
+                            task_tracker=task_tracker,
+                            wait_started_at=wait_started_at,
+                        ),
+                        name=f"content-write-queue-monitor:{task_id}",
+                    )
+                    try:
+                        completed_task = await task_tracker.wait(
+                            task_id,
+                            account_id=ctx.account_id,
+                            user_id=ctx.user.user_id,
+                            timeout=timeout,
+                        )
+                    finally:
+                        monitor_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await monitor_task
                 except TimeoutError as exc:
                     raise DeadlineExceededError("content write task", timeout) from exc
                 queue_status = (

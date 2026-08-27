@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -55,6 +55,7 @@ class _FakeTaskTracker:
         self.complete = AsyncMock()
         self.fail = AsyncMock()
         self.wait = AsyncMock(return_value=SimpleNamespace(status=status, error=error))
+        self.has_work = Mock(return_value=True)
 
 
 class _FakeRequestWaitTracker:
@@ -66,6 +67,32 @@ class _FakeRequestWaitTracker:
     def build_queue_status(self, telemetry_id):
         del telemetry_id
         return self.queue_status
+
+
+class _FakeQueueManager:
+    EMBEDDING = "Embedding"
+    SEMANTIC = "Semantic"
+    mount_point = "/queue"
+
+    def __init__(self):
+        self.check_status = AsyncMock(
+            return_value={
+                self.EMBEDDING: SimpleNamespace(
+                    pending=7,
+                    in_progress=2,
+                    processed=13,
+                    requeue_count=1,
+                    error_count=0,
+                ),
+                self.SEMANTIC: SimpleNamespace(
+                    pending=3,
+                    in_progress=1,
+                    processed=9,
+                    requeue_count=2,
+                    error_count=1,
+                ),
+            }
+        )
 
 
 def _sidecar(level=ContextLevel.ABSTRACT, body="Original body."):
@@ -83,6 +110,47 @@ def _sidecar(level=ContextLevel.ABSTRACT, body="Original body."):
             },
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_content_write_task_wait_queue_snapshot_logs_local_queue_status(monkeypatch):
+    fake_fs = _FakeVikingFS()
+    task_tracker = _FakeTaskTracker()
+    queue_manager = _FakeQueueManager()
+    log_info = Mock()
+    monkeypatch.setattr(content_write_module, "get_queue_manager", lambda: queue_manager)
+    monkeypatch.setattr(content_write_module.logger, "info", log_info)
+    coordinator = ContentWriteCoordinator(viking_fs=fake_fs)
+
+    await coordinator._log_content_write_queue_snapshot(
+        task_id="content-write-1",
+        uri="viking://resources/demo.md",
+        processing_mode="vectors_only",
+        task_tracker=task_tracker,
+        wait_started_at=content_write_module.time.monotonic(),
+    )
+
+    queue_manager.check_status.assert_awaited_once_with()
+    task_tracker.has_work.assert_called_once_with("content-write-1")
+    assert log_info.call_args.args[0].startswith(
+        "[ContentWrite] Task wait queue snapshot:"
+    )
+    assert log_info.call_args.args[-1] == {
+        "Embedding": {
+            "pending": 7,
+            "in_progress": 2,
+            "processed": 13,
+            "requeue_count": 1,
+            "error_count": 0,
+        },
+        "Semantic": {
+            "pending": 3,
+            "in_progress": 1,
+            "processed": 9,
+            "requeue_count": 2,
+            "error_count": 1,
+        },
+    }
 
 
 @pytest.fixture
