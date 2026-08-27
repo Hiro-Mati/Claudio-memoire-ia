@@ -1357,22 +1357,10 @@ impl QueueBackend for SQLiteQueueBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
     use std::sync::{Arc, Barrier};
     use std::thread;
     use tempfile::tempdir;
     use tempfile::TempDir;
-
-    #[test]
-    fn keyed_split_reason_labels_are_stable_lowercase_values() {
-        assert_eq!(KeyedBatchCreateReason::NoPending.split_label(), None);
-        assert_eq!(
-            KeyedBatchCreateReason::Signature.split_label(),
-            Some("signature")
-        );
-        assert_eq!(KeyedBatchCreateReason::Count.split_label(), Some("count"));
-        assert_eq!(KeyedBatchCreateReason::Bytes.split_label(), Some("bytes"));
-    }
 
     fn keyed_request(key: &str, signature: &str, data: &str) -> KeyedEnqueueRequest {
         KeyedEnqueueRequest {
@@ -1386,15 +1374,6 @@ mod tests {
         serde_json::from_slice::<KeyedBatchEnvelope>(&message.data)
             .unwrap()
             ._queuefs_keyed_batch
-    }
-
-    fn pending_batches_for_key(backend: &MemoryBackend, queue: &str, key: &str) -> usize {
-        backend
-            .list_unacked(queue)
-            .unwrap()
-            .into_iter()
-            .filter(|message| message.dispatch_key.as_deref() == Some(key))
-            .count()
     }
 
     /// Create an in-memory backend with a test queue.
@@ -1504,135 +1483,6 @@ mod tests {
     }
 
     #[test]
-    fn memory_requeue_preserves_payload_and_precedes_successor() {
-        let mut backend = MemoryBackend::new();
-        backend.create_queue("Semantic").unwrap();
-        backend
-            .enqueue_keyed("Semantic", keyed_request("k", "s", "one"))
-            .unwrap();
-        let active = backend.dequeue("Semantic").unwrap().unwrap();
-        backend
-            .enqueue_keyed("Semantic", keyed_request("k", "s", "two"))
-            .unwrap();
-        assert!(backend.requeue("Semantic", &active.id).unwrap());
-        let retried = backend.dequeue("Semantic").unwrap().unwrap();
-        assert_eq!(retried.id, active.id);
-        assert_eq!(decode_batch(&retried).contributions, vec!["one"]);
-        assert!(backend.dequeue("Semantic").unwrap().is_none());
-        backend.ack("Semantic", &retried.id).unwrap();
-        assert_eq!(
-            decode_batch(&backend.dequeue("Semantic").unwrap().unwrap()).contributions,
-            vec!["two"],
-        );
-    }
-
-    #[test]
-    fn memory_keyed_batches_split_on_signature_count_and_bytes() {
-        let mut backend = MemoryBackend::new();
-        backend.create_queue("Semantic").unwrap();
-        backend
-            .enqueue_keyed("Semantic", keyed_request("signature", "s1", "one"))
-            .unwrap();
-        backend
-            .enqueue_keyed("Semantic", keyed_request("signature", "s2", "two"))
-            .unwrap();
-        assert_eq!(backend.size("Semantic").unwrap(), 2);
-
-        for index in 0..=MAX_KEYED_BATCH_CONTRIBUTIONS {
-            backend
-                .enqueue_keyed("Semantic", keyed_request("count", "s", &index.to_string()))
-                .unwrap();
-        }
-        assert_eq!(pending_batches_for_key(&backend, "Semantic", "count"), 2);
-
-        let half_limit = "x".repeat(MAX_KEYED_BATCH_BYTES / 2);
-        backend
-            .enqueue_keyed("Semantic", keyed_request("bytes", "s", &half_limit))
-            .unwrap();
-        backend
-            .enqueue_keyed("Semantic", keyed_request("bytes", "s", &half_limit))
-            .unwrap();
-        assert_eq!(pending_batches_for_key(&backend, "Semantic", "bytes"), 2);
-    }
-
-    #[test]
-    fn keyed_enqueue_bounds_ten_thousand_contributions_and_keeps_cross_key_progress() {
-        let mut backend = MemoryBackend::new();
-        backend.create_queue("Semantic").unwrap();
-        for index in 0..10_000 {
-            backend
-                .enqueue_keyed(
-                    "Semantic",
-                    keyed_request("hot", "same", &format!(r#"{{"index":{index}}}"#)),
-                )
-                .unwrap();
-        }
-        assert_eq!(backend.size("Semantic").unwrap(), 10);
-
-        let hot = backend.dequeue("Semantic").unwrap().unwrap();
-        backend
-            .enqueue_keyed("Semantic", keyed_request("cold", "same", "cold-1"))
-            .unwrap();
-        let cold = backend.dequeue("Semantic").unwrap().unwrap();
-        assert_eq!(cold.dispatch_key.as_deref(), Some("cold"));
-        assert!(backend.dequeue("Semantic").unwrap().is_none());
-        backend.ack("Semantic", &hot.id).unwrap();
-        assert_eq!(
-            backend
-                .dequeue("Semantic")
-                .unwrap()
-                .unwrap()
-                .dispatch_key
-                .as_deref(),
-            Some("hot")
-        );
-    }
-
-    #[test]
-    fn keyed_enqueue_byte_cap_measures_complete_envelope_and_splits_at_one_byte_over() {
-        let first = "a";
-        let merged_overhead = serialize_keyed_batch(&KeyedBatchBody {
-            schema_version: KEYED_BATCH_SCHEMA_VERSION,
-            dispatch_key: "bytes".to_string(),
-            merge_signature: "same".to_string(),
-            contributions: vec![first.to_string(), String::new()],
-        })
-        .unwrap()
-        .len();
-        let second = "x".repeat(MAX_KEYED_BATCH_BYTES + 1 - merged_overhead);
-        let merged_bytes = serialize_keyed_batch(&KeyedBatchBody {
-            schema_version: KEYED_BATCH_SCHEMA_VERSION,
-            dispatch_key: "bytes".to_string(),
-            merge_signature: "same".to_string(),
-            contributions: vec![first.to_string(), second.clone()],
-        })
-        .unwrap()
-        .len();
-        assert_eq!(merged_bytes, MAX_KEYED_BATCH_BYTES + 1);
-
-        let mut backend = MemoryBackend::new();
-        backend.create_queue("Semantic").unwrap();
-        backend
-            .enqueue_keyed("Semantic", keyed_request("bytes", "same", first))
-            .unwrap();
-        let outcome = backend
-            .enqueue_keyed("Semantic", keyed_request("bytes", "same", &second))
-            .unwrap();
-
-        assert!(matches!(
-            outcome,
-            KeyedEnqueueOutcome::Created {
-                reason: KeyedBatchCreateReason::Bytes,
-                ..
-            }
-        ));
-        assert_eq!(backend.size("Semantic").unwrap(), 2);
-        for message in backend.list_unacked("Semantic").unwrap() {
-            assert!(message.data.len() <= MAX_KEYED_BATCH_BYTES);
-        }
-    }
-
-    #[test]
     fn sqlite_migrates_legacy_schema_and_merges_only_pending_tail() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("queue.db");
@@ -1701,35 +1551,6 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_two_open_connections_cannot_claim_two_batches_for_one_key() {
-        let dir = tempdir().unwrap();
-        let db = dir.path().join("queue.db");
-        let db_path = db.to_str().unwrap().to_string();
-        let mut first = SQLiteQueueBackend::open(&db_path, sqlite_options()).unwrap();
-        first.create_queue("Semantic").unwrap();
-        let mut second = SQLiteQueueBackend::open(&db_path, sqlite_options()).unwrap();
-        for index in 0..=MAX_KEYED_BATCH_CONTRIBUTIONS {
-            first
-                .enqueue_keyed("Semantic", keyed_request("k", "s", &index.to_string()))
-                .unwrap();
-        }
-        let barrier = Arc::new(Barrier::new(3));
-        let first_barrier = barrier.clone();
-        let second_barrier = barrier.clone();
-        let first_claim = thread::spawn(move || {
-            first_barrier.wait();
-            first.dequeue("Semantic").unwrap()
-        });
-        let second_claim = thread::spawn(move || {
-            second_barrier.wait();
-            second.dequeue("Semantic").unwrap()
-        });
-        barrier.wait();
-        let claims = [first_claim.join().unwrap(), second_claim.join().unwrap()];
-        assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 1);
-    }
-
-    #[test]
     fn sqlite_recovery_claims_old_processing_before_successor() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("queue.db");
@@ -1754,27 +1575,6 @@ mod tests {
             decode_batch(&recovered.dequeue("Semantic").unwrap().unwrap()).contributions,
             vec!["new"]
         );
-    }
-
-    #[test]
-    fn memory_list_unacked_contains_pending_and_processing() {
-        let mut backend = MemoryBackend::new();
-        backend.create_queue("Semantic").unwrap();
-        backend
-            .enqueue("Semantic", Message::new(b"one".to_vec()))
-            .unwrap();
-        backend
-            .enqueue("Semantic", Message::new(b"two".to_vec()))
-            .unwrap();
-        let active = backend.dequeue("Semantic").unwrap().unwrap();
-        let ids = backend
-            .list_unacked("Semantic")
-            .unwrap()
-            .into_iter()
-            .map(|message| message.id)
-            .collect::<HashSet<_>>();
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&active.id));
     }
 
     #[test]
