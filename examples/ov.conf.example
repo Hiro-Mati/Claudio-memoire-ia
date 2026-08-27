@@ -157,6 +157,7 @@
         "provider": "openai-codex",
         "model": "gpt-5.3-codex",
         "api_base": "https://chatgpt.com/backend-api/codex",
+        "reasoning_effort": "xhigh",
         "temperature": 0.0,
         "max_retries": 2,
     },
@@ -307,6 +308,9 @@
             "extract_frontmatter": true,
             "include_metadata": true,
             "max_heading_depth": 3,
+        },
+        "anydoc": {
+            "enabled": true,
         },
         "html": {
             "extract_text_only": false,

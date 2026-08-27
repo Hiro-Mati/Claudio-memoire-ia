@@ -14,8 +14,8 @@ const STOPWORDS = new Set([
 ]);
 const USER_RESERVED_DIRS = new Set(["memories", "skills"]);
 const SOURCES = [
-  { type: "memory", uri: "viking://user/memories", bucket: "memories" },
-  { type: "skill", uri: "viking://user/skills", bucket: "skills" },
+  { type: "memory", uri: "viking://~/memories", bucket: "memories" },
+  { type: "skill", uri: "viking://~/skills", bucket: "skills" },
 ];
 const DEFAULT_CONTEXT_LIMIT = 10;
 const DEFAULT_CONTEXT_MAX_TOKENS = 1600;
@@ -164,10 +164,9 @@ export function contextRequestTimeoutMs(cfg = {}, body = {}) {
   // `query_expansion` defaults to "auto" server-side, so only an explicit "off"
   // takes the expansion fuse back out of the budget.
   const wantsExpansion = Boolean(body.session_id) && body.query_expansion !== "off";
-  if (!wantsRewrite && !wantsExpansion) return undefined;
-
   const configured = Number(cfg.recallContextTimeoutMs);
   if (Number.isFinite(configured) && configured > 0) return Math.max(1000, Math.floor(configured));
+  if (!wantsRewrite && !wantsExpansion) return undefined;
   const floor = wantsRewrite ? SERVER_REWRITE_REQUEST_TIMEOUT_MS : EXPANSION_REQUEST_TIMEOUT_MS;
   return Math.max(Number(cfg.timeoutMs) || 0, floor);
 }
@@ -272,6 +271,11 @@ async function resolveUserSpace(fetchJSON, actorPeerId = "") {
 
 async function resolveTargetUri(fetchJSON, targetUri, actorPeerId = "") {
   const trimmed = targetUri.trim().replace(/\/+$/, "");
+  // viking://~ is the home alias: the server expands it to the caller's own user
+  // space, so it needs no client-side rewrite.
+  if (trimmed === "viking://~" || trimmed.startsWith("viking://~/")) return trimmed;
+  // Legacy compat: uid-less viking://user/<reserved> URIs may still sit in plugin
+  // configs. Newer servers reject them, so rewrite to an explicit-uid URI here.
   const m = trimmed.match(/^viking:\/\/user(?:\/(.*))?$/);
   if (!m) return trimmed;
   const rawRest = (m[1] ?? "").trim();

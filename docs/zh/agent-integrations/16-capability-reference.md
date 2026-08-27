@@ -94,7 +94,7 @@ per-harness 章节（档案卡）只写差异；所有共享事实均在本章�
 | 4 | `list` | 列目录（函数名 `ls`，注册名显式改写为 `list`） | `recursive=False`（`:423`） |
 | 5 | `tree` | 递归目录树 | `level_limit=3, node_limit=1000, include_abstract=False`（`:449`） |
 | 6 | `remember` | 写长期记忆 | 内部建一次性会话 `mcp-store-<uuid12>` 并立即 `commit_async`（`:504-523`）——这是 MCP 面唯一的 commit 入口；MCP 没有显式 commit 工具 |
-| 7 | `write` | 写 `viking://` 文件 | `mode=replace\|append\|create`，replace 遇 NotFound 自动降级 create；新建文件扩展名白名单 `.md .txt .json .yaml .yml .toml .py .js .ts`；可写域 `resources/user/agent`；用户根下 `skills/ peers/ privacy/ sessions/` 只读；已存在的 `.abstract.md/.overview.md` sidecar 可改正文，但公共 API 不能创建（`:529`；`content_write.py:60-81`） |
+| 7 | `write` | 写 `viking://` 文件 | `mode=replace\|append\|create`：replace 覆盖或在缺失时创建，append 追加或在缺失时创建，create 仅创建缺失文件且已存在时返回冲突；显式 create 的文件扩展名白名单为 `.md .txt .json .yaml .yml .toml .py .js .ts`；可写域 `resources/user/agent`；用户根下 `skills/ peers/ privacy/ sessions/` 只读；已存在的 `.abstract.md/.overview.md` sidecar 可改正文，但公共 API 不能创建（`:529`；`content_write.py:60-81`） |
 | 8 | `edit` | 精确字符串替换 | `old_string` 空/0 命中/多命中且非 replace_all 均报错，且文件内容不变（`:569`） |
 | 9 | `add_resource` | 资源摄取（远程 URL / 本地文件签名上传 / Connector） | `watch_interval` 单位为分钟（0=不 watch）；本地路径分支返回签名上传 URL（TTL 默认 600s），上传后自动入库，无需二次调用（`:723-947`） |
 | 10 | `list_watches` | 列 watch 订阅，商业版尚未支持 | scheduler 未运行时返回错误串（`:958`） |
@@ -232,7 +232,7 @@ JS 系 harness 的召回逻辑均由 `recall-core.mjs` 中的三级降级链处�
 
 1. **context face**：调用 `POST /api/v1/search/search`，参数设定为 `mode:"context"` 且 `purpose:"coding"`。其核心设计原则为"只声明意图，机制交服务端"：对于 `quotas`/`max_tokens`/`query_expansion`/`rewrite_max_bullets` 等参数，仅在用户显式配置时（带有 configured 哨兵字段）才会发送，否则直接采用服务端的默认设定。
 2. **legacy `/recall`**：若 context face 请求返回 400/422 错误，且响应报文包含 `extra`/`mode`/`unexpected` 等特征字段，则判定对接了旧版服务端。此时会在本地写入 6 小时的负缓存（路径为 `~/.openviking/state/context-face.json`，该文件全机共享，一旦被任一 harness 标记，同机所有 JS 系 harness 均会跳过 context face 阶段）。随后降级调用已弃用的 `/api/v1/search/recall` 接口；若 `peer_scope` 被拒，则去掉该参数重试一次。
-3. **raw find 兜底**：并发请求 `viking://user/memories` 与 `viking://user/skills`，调用两次 `POST /search/find`（注意：resources 被刻意排除在自动召回之外，资源类文档由模型主动调用 `search` 获取）。客户端收到结果后进行本地重排（权重规则为：leaf +0.12 / 时间意图 +0.10 / 偏好意图 +0.08 / 词面重叠 ≤0.2）、去重，最后按客户端 token 预算装填。`recallTokenBudget`、`recallMaxContentChars` 与 `recallPreferAbstract` 三个旋钮只在这一级生效；而在 context face 下，注入预算由服务端 `max_tokens`（默认 1600）决定。
+3. **raw find 兜底**：并发请求 `viking://~/memories` 与 `viking://~/skills`，调用两次 `POST /search/find`（注意：resources 被刻意排除在自动召回之外，资源类文档由模型主动调用 `search` 获取）。客户端收到结果后进行本地重排（权重规则为：leaf +0.12 / 时间意图 +0.10 / 偏好意图 +0.08 / 词面重叠 ≤0.2）、去重，最后按客户端 token 预算装填。`recallTokenBudget`、`recallMaxContentChars` 与 `recallPreferAbstract` 三个旋钮只在这一级生效；而在 context face 下，注入预算由服务端 `max_tokens`（默认 1600）决定。
 
 服务端在处理 session_id 时，分为两条截然不同的执行路径：
 
@@ -560,7 +560,7 @@ MCP `write` / REST `content/write` 的三道 guard（`content_write.py`）：可
 - **集成文档**：[Hermes Agent](./05-hermes.md)
 - **形态**：Hermes bundled MemoryProvider（Python 单文件实现，共 3725 行，随 Hermes 一同发布）。通过 `httpx` 直连，无需额外安装插件。提供 6 工具及 10+ 生命周期 hook（prefetch/sync_turn/on_session_end/on_session_switch/on_memory_write/…）。基线为发行版 `e12626b3`（= brew 2026.7.7.2）。
 - **能力亮点**：具备最全面的资源摄取面——`viking_add_resource` 支持 HTTP、Git、SSH、`file://`、本地文件 temp_upload 以及本地目录 zip 打包上传（跳过 symlink + 越界文件）；`viking_remember` 直写记忆文件（不依赖 session commit/抽取）；支持本地服务端自启（当 endpoint 位于本地且不可达时，通过 `subprocess.Popen openviking-server` 拉起）；支持 trusted 补身份重试；无论正常退出还是接收到 Ctrl+C、SIGTERM、SIGHUP 信号，均能保证完成 commit（详见 [§3.3.3](#_3-3-3-关闭方式-×-harness-终局矩阵)）。
-- **行为要点**：在召回上，仅有 `search/search` 的首选路径携带 session_id 并落到路径 B（`mode="deep"`；而 `auto`/`fast` 走 `/find` 且不带 session_id，详见 [§3.2.2](#_3-2-2-判定矩阵)）。`queue_prefetch` 为同步实现，无预热；subagent 传入 `skip_memory=True` 时不接 OV（详见 [§3.3.5](#_3-3-5-subagent-会话对照)）。无 profile 注入/statusline/slash；commit 恒 keep 0，drain 不净则本次不 commit；进程内队列不落盘。session id 格式为 `%Y%m%d_%H%M%S_<hex6>`。召回参数：6 条/阈值 0.15/字符预算 4000/总超时 4s。记忆 URI 为 `viking://user/peers/{agent}/memories/{subdir}/mem_<uuid12>.md`。退出机制包含 SIGTERM grace 1.5s 与退出看门狗 30s。互补路径支持 `openviking-server ingest hermes`（离线重放，默认关，详见 [§7](#_7-附录-非-coding-集成速览) E）。
+- **行为要点**：在召回上，仅有 `search/search` 的首选路径携带 session_id 并落到路径 B（`mode="deep"`；而 `auto`/`fast` 走 `/find` 且不带 session_id，详见 [§3.2.2](#_3-2-2-判定矩阵)）。`queue_prefetch` 为同步实现，无预热；subagent 传入 `skip_memory=True` 时不接 OV（详见 [§3.3.5](#_3-3-5-subagent-会话对照)）。无 profile 注入/statusline/slash；commit 恒 keep 0，drain 不净则本次不 commit；进程内队列不落盘。session id 格式为 `%Y%m%d_%H%M%S_<hex6>`。召回参数：6 条/阈值 0.15/字符预算 4000/总超时 4s。记忆 URI 为 `viking://~/peers/{agent}/memories/{subdir}/mem_<uuid12>.md`。退出机制包含 SIGTERM grace 1.5s 与退出看门狗 30s。互补路径支持 `openviking-server ingest hermes`（离线重放，默认关，详见 [§7](#_7-附录-非-coding-集成速览) E）。
 - **配置**：通过 `OPENVIKING_ENDPOINT`（非 `_URL`）、8 个 `OPENVIKING_RECALL_*` env 以及 `config.yaml` 进行配置。在 `use_ovcli_config` 模式下，系统会清空 `.env` 里的对应变量。
 - **维度索引**：工具面 [§1.1](#_1-1-主动工具面-agentic-调用能力) ｜召回 [§3.2](#_3-2-自动召回与注入) ｜commit [§3.3.2](#_3-3-2-常规-commit-触发条件)/[§3.3.3](#_3-3-3-关闭方式-×-harness-终局矩阵) ｜删除 [§3.5](#_3-5-写入与删除的类型边界)。
 

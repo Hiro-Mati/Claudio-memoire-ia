@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Search endpoints for OpenViking HTTP Server."""
 
+import asyncio
 import math
 from typing import Any, Dict, List, Literal, Optional, Sequence, Union
 
@@ -139,6 +140,7 @@ class FindRequest(BaseModel):
     time_field: Optional[TimeField] = None
     level: Optional[Union[int, str, List[int]]] = None
     retrieval_purpose: RetrievalPurpose = "agent_recall"
+    read_content: bool = False
     telemetry: TelemetryRequest = False
 
 
@@ -201,6 +203,7 @@ class SearchRequest(BaseModel):
     time_field: Optional[TimeField] = None
     level: Optional[Union[int, str, List[int]]] = None
     retrieval_purpose: RetrievalPurpose = "agent_recall"
+    read_content: bool = False
     telemetry: TelemetryRequest = False
 
     mode: Literal["list", "context"] = "list"
@@ -228,10 +231,41 @@ class SearchRequest(BaseModel):
                 )
             return self
 
+        if self.read_content:
+            raise ValueError("read_content is only supported in mode='list'")
         if self.target_uri:
             raise ValueError("target_uri is not supported in mode='context'")
         _reject_unknown_quota_and_detail(self.quotas, self.detail)
         return self
+
+
+async def _inline_read_content(
+    result: Any,
+    *,
+    service: Any,
+    ctx: RequestContext,
+) -> Any:
+    """Attach visible file content to ranked hits when it can be read."""
+    if not isinstance(result, dict):
+        return result
+
+    hits = [
+        hit
+        for category in ("memories", "resources", "skills")
+        for hit in result.get(category, [])
+        if isinstance(hit, dict) and isinstance(hit.get("uri"), str)
+    ]
+    semaphore = asyncio.Semaphore(10)
+
+    async def _read(hit: Dict[str, Any]) -> None:
+        async with semaphore:
+            try:
+                hit["content"] = await service.fs.read_visible(hit["uri"], ctx=ctx)
+            except Exception:
+                pass
+
+    await asyncio.gather(*(_read(hit) for hit in hits))
+    return result
 
 
 class RecallRequest(BaseModel):
@@ -325,6 +359,8 @@ async def find(
     result = execution.result
     if hasattr(result, "to_dict"):
         result = result.to_dict(include_provenance=request.include_provenance)
+    if request.read_content:
+        result = await _inline_read_content(result, service=service, ctx=_ctx)
     result = _sanitize_floats(result)
     return Response(
         status="ok",
@@ -443,6 +479,8 @@ async def search(
     result = execution.result
     if hasattr(result, "to_dict"):
         result = result.to_dict(include_provenance=request.include_provenance)
+    if request.read_content:
+        result = await _inline_read_content(result, service=service, ctx=_ctx)
     result = _sanitize_floats(result)
     return Response(
         status="ok",

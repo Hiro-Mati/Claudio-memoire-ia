@@ -135,11 +135,11 @@ Once connected, OpenViking exposes 15 tools:
 |------|-------------|----------------|
 | `find` | Fast semantic retrieval without session context | `query`, `target_uri` (optional), `limit`, `min_score`, `level` (optional), `context_type` (optional) |
 | `search` | Deep semantic retrieval; `mode="context"` assembles injection-ready context and replaces the former `recall` tool | `query`, `mode` (`list` or `context`), `target_uri` (list mode only), `session_id` (optional), `limit`, `min_score`, `level` (list mode), `context_type` (optional), plus context-mode `quotas`, `purpose`, `max_tokens`, `detail` or `detail_by_category`, `dedup_turns`, `exclude_uris`, `peer_scope`, scalar `other_peer_penalty` or `other_peer_penalties` by category, and `rewrite` (`off` or `auto`) |
-| `read` | Read one or more `viking://` URIs | `uris` (single string or array) |
+| `read` | Read one or more `viking://` URIs. PNG, JPEG, GIF, and WebP return native MCP image content; WAV, MP3, FLAC, OGG, and M4A return native audio content. Video is not supported because MCP has no standard video content block | `uris` (single string or array) |
 | `list` | List entries under a `viking://` directory | `uri`, `recursive` (optional) |
 | `tree` | Show the recursive directory tree under a `viking://` URI, indented by depth — use when you need a full picture of the file tree (prefer `list` for a single level, `glob` for filename patterns) | `uri` (optional), `level_limit` (default 3), `node_limit` (default 1000), `include_abstract` (optional — also show each file's summary) |
 | `remember` | Store messages into long-term memory (triggers extraction) | `messages` (list of `{role, content}`) |
-| `write` | Write text to a `viking://` file (create/overwrite/append). Parent directories are created automatically; use `read` first to see current content before overwriting, and prefer `edit` for changing part of an existing file | `uri`, `content`, `mode` (optional: `replace` default — creates the file if missing, `append`, `create` — fail if it exists), `wait` (optional, block until re-indexed), `timeout` (optional) |
+| `write` | Write text to a `viking://` file (create/overwrite/append). Parent directories are created automatically; use `read` first to see current content before overwriting, and prefer `edit` for changing part of an existing file | `uri`, `content`, `mode` (optional: `replace` default — overwrites or creates if missing; `append` — appends or creates if missing; `create` — fails if it exists), `wait` (optional, block until re-indexed), `timeout` (optional) |
 | `edit` | Replace an exact string with new text in an existing `viking://` file — for targeted changes instead of a full rewrite. The file is left unchanged if `old_string` is not found, or matches multiple times while `replace_all` is false | `uri`, `old_string`, `new_string`, `replace_all` (optional), `wait` (optional, block until re-indexed), `timeout` (optional) |
 | `add_resource` | Add a local file or URL as a resource (local files trigger a progressive upload flow) | `path`, `temp_file_id` (optional), `description` (optional), `watch_interval` (optional, minutes — auto-refresh cadence for remote URLs), `processing_mode` (optional: `semantic_and_vectors` default, or `vectors_only` to skip VLM semantic understanding and only vectorize current files), `to` (optional, target `viking://resources/...` URI; if omitted when `watch_interval > 0`, the watch auto-binds to the resource's created URI), `args` (optional parser-specific options, including `{"parse_mode":"no_split"}` to parse each source document into one Markdown body, `{"feishu_access_token":"u-..."}` for one-time Feishu user-token imports, or `{"feishu_access_token":"u-...","feishu_refresh_token":"r-..."}` for Feishu user-token watches) |
 | `list_watches` | List watch tasks (auto-refresh subscriptions) visible to the current agent. Each entry shows target URI, refresh interval (minutes), active/paused status, and next scheduled execution time | none |
@@ -149,11 +149,17 @@ Once connected, OpenViking exposes 15 tools:
 | `forget` | Delete any `viking://` URI (use `search` to find it first; pass `recursive=true` to delete a directory) | `uri`, `recursive` (optional) |
 | `health` | Check OpenViking service health | none |
 
-For MCP tools, `viking://user` is the authenticated user's workspace. For example,
-`viking://user/notes/todo.md` resolves to
-`viking://user/<current-user>/notes/todo.md`, regardless of the file name or
-extension. Canonical URIs containing that exact current user id are also accepted;
-MCP does not use this shorthand for cross-user access.
+To address your own workspace from an MCP tool, use the home alias `viking://~`. It
+expands to `viking://user/<current-user>` on every control plane (REST API, `ov` CLI,
+SDKs, and MCP alike), so `viking://~/notes/todo.md` resolves to
+`viking://user/<current-user>/notes/todo.md`. Responses always echo the expanded
+canonical URI, and those canonical URIs are accepted as tool input as well.
+
+The uid-less spelling `viking://user/<segment>/...` (`memories`, `resources`, `skills`,
+`peers`, `privacy`, `sessions`) is no longer accepted; such calls fail with an error that
+points at the `viking://~/...` replacement. `viking://user` on its own is the container of
+user spaces, not a shortcut to yours. See
+[Viking URI](../concepts/04-viking-uri.md) for details.
 
 > **Note**: MCP exposes the minimum closure for watch management (`list_watches` + `cancel_watch`). Pause / resume / trigger and the unified `update` verb are intentionally not exposed here — use the REST `/api/v1/watches/*` endpoints or the `ov task watch` CLI for those operations.
 

@@ -31,9 +31,11 @@ from openviking.session.memory.case_aggregation import (
 )
 from openviking.session.memory.dataclass import (
     MemoryFile,
+    MemoryOperationSkipCode,
     MemoryTypeSchema,
     ResolvedOperation,
     ResolvedOperations,
+    SkippedMemoryOperation,
     StoredLink,
 )
 from openviking.session.memory.experience_lifecycle import (
@@ -55,7 +57,7 @@ from openviking.session.memory.utils.resource_refs import (
 )
 from openviking.session.memory.utils.template_utils import TemplateUtils
 from openviking.session.memory.utils.uri import numbered_uri, render_template
-from openviking.storage.semantic_sidecar import freshness_metadata, render_semantic_sidecar
+from openviking.storage.abstract_overview import freshness_metadata, render_abstract_overview
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import tracer
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
@@ -896,6 +898,7 @@ class MemoryUpdateResult:
         self.edited_uris: List[str] = []
         self.deleted_uris: List[str] = []
         self.archived_uris: List[str] = []
+        self.skipped_operations: List[SkippedMemoryOperation] = []
         self.errors: List[Tuple[str, Exception]] = []
         # Parsed post-write files are execution-only.  Reuse them for resource
         # ref sync and vectorization instead of reading the same file again.
@@ -919,6 +922,9 @@ class MemoryUpdateResult:
 
     def add_error(self, uri: str, error: Exception) -> None:
         self.errors.append((uri, error))
+
+    def add_skipped(self, operation: SkippedMemoryOperation) -> None:
+        self.skipped_operations.append(operation)
 
     def summary(self) -> str:
         return (
@@ -1083,6 +1089,32 @@ class MemoryUpdater:
                 continue
             has_unresolved_upserts = True
             error_target = f"{resolved_op.memory_type}(page_id={resolved_op.page_id})"
+            resolution_skip = getattr(resolved_op, "resolution_skip", None)
+            if resolution_skip is not None:
+                # Reporting-only: the operation remains unresolved, preserving
+                # the legacy delete-suppression behavior for direct mixed batches.
+                skipped = SkippedMemoryOperation(
+                    memory_type=resolved_op.memory_type,
+                    page_id=resolved_op.page_id,
+                    reason_code=resolution_skip.reason_code,
+                    reason=resolution_skip.reason,
+                    source=resolved_op.source,
+                )
+                result.add_skipped(skipped)
+                message = (
+                    "Skipping memory operation by resolution policy: "
+                    f"memory_type={resolved_op.memory_type} "
+                    f"page_id={resolved_op.page_id} "
+                    f"reason_code={resolution_skip.reason_code.value}"
+                )
+                if resolution_skip.reason_code in {
+                    MemoryOperationSkipCode.INVALID_PEER_ID,
+                    MemoryOperationSkipCode.INVALID_RANGES,
+                }:
+                    logger.warning(message)
+                else:
+                    tracer.info(message)
+                continue
             resolution_error = ValueError("Missing resolved URI")
             result.add_error(error_target, resolution_error)
             tracer.error(
@@ -2238,7 +2270,7 @@ class MemoryUpdater:
         try:
             await viking_fs.write_file(
                 overview_path,
-                render_semantic_sidecar(
+                render_abstract_overview(
                     ContextLevel.OVERVIEW,
                     directory,
                     rendered,
@@ -2252,6 +2284,16 @@ class MemoryUpdater:
                 ),
                 ctx=ctx,
                 lease_ref=lease_ref,
+            )
+            from openviking.utils.embedding_utils import vectorize_directory_meta
+
+            await vectorize_directory_meta(
+                uri=directory,
+                abstract="",
+                overview=rendered,
+                context_type="memory",
+                ctx=ctx,
+                include_abstract=False,
             )
             return True
         except Exception as e:
