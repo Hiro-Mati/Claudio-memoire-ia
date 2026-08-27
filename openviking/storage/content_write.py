@@ -878,6 +878,14 @@ class ContentWriteCoordinator:
             lock_released = True
             if task_tracker is not None and task_id is not None:
                 try:
+                    logger.info(
+                        "[ContentWrite] Waiting for task work: task_id=%s uri=%s "
+                        "processing_mode=%s timeout=%s",
+                        task_id,
+                        uri,
+                        processing_mode,
+                        timeout,
+                    )
                     completed_task = await task_tracker.wait(
                         task_id,
                         account_id=ctx.account_id,

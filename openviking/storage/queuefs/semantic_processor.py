@@ -33,7 +33,7 @@ from openviking.parse.parsers.media.utils import (
 )
 from openviking.prompts import render_prompt
 from openviking.server.identity import RequestContext, Role
-from openviking.service.task_work_index import detach_task_context
+from openviking.service.task_work_index import detach_task_context, extract_task_metadata
 from openviking.storage.abstract_overview import (
     AbstractOverviewFormatError,
     AbstractOverviewWriteResult,
@@ -230,7 +230,17 @@ class SemanticProcessor(DequeueHandlerBase):
         data: Optional[Dict[str, Any]],
         error: Exception,
     ) -> None:
+        task_metadata = extract_task_metadata(data)
         try:
+            logger.warning(
+                "[Semantic] Re-enqueueing after retryable failure: task_id=%s work_id=%s "
+                "semantic_id=%s uri=%s error=%s",
+                task_metadata.task_id if task_metadata else "",
+                task_metadata.work_id if task_metadata else "",
+                msg.id,
+                msg.uri,
+                error,
+            )
             await self._reenqueue_semantic_msg(msg)
             self._merge_request_stats(msg.telemetry_id, requeue_count=1)
             get_request_wait_tracker().record_semantic_requeue(msg.telemetry_id)
@@ -332,6 +342,14 @@ class SemanticProcessor(DequeueHandlerBase):
 
             assert data is not None
             msg = SemanticMsg.from_dict(data)
+            task_metadata = extract_task_metadata(data)
+            logger.info(
+                "[Semantic] Starting queue work: task_id=%s work_id=%s semantic_id=%s uri=%s",
+                task_metadata.task_id if task_metadata else "",
+                task_metadata.work_id if task_metadata else "",
+                msg.id,
+                msg.uri,
+            )
             if VikingURI(msg.uri).parent is None:
                 logger.warning("Skipping semantic generation for root URI: %s", msg.uri)
                 if msg.telemetry_id and msg.id:
@@ -373,7 +391,12 @@ class SemanticProcessor(DequeueHandlerBase):
                 self._circuit_breaker.check()
             except CircuitBreakerOpen:
                 logger.warning(
-                    f"Circuit breaker is open, re-enqueueing semantic message: {msg.uri}"
+                    "[Semantic] Circuit breaker re-enqueue: task_id=%s work_id=%s "
+                    "semantic_id=%s uri=%s",
+                    task_metadata.task_id if task_metadata else "",
+                    task_metadata.work_id if task_metadata else "",
+                    msg.id,
+                    msg.uri,
                 )
                 await self._reenqueue_semantic_msg(msg)
                 self._merge_request_stats(msg.telemetry_id, requeue_count=1)

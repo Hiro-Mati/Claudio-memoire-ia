@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 from openviking.core.context import ContextType, ResourceContentType
 from openviking.models.embedder.base import embed_compat
 from openviking.server.identity import RequestContext, Role
+from openviking.service.task_work_index import extract_task_metadata
 from openviking.storage.errors import (
     CollectionNotFoundError,
     EmbeddingConfigurationError,
@@ -579,11 +580,18 @@ class TextEmbeddingHandler(DequeueHandlerBase):
             return None
 
         embedding_msg: Optional[EmbeddingMsg] = None
+        task_metadata = extract_task_metadata(data)
         report_success = False
         report_error_args: Optional[tuple[str, Optional[Dict[str, Any]]]] = None
         request_failed_message: Optional[str] = None
         try:
             embedding_msg = EmbeddingMsg.from_json(data["data"])
+            log_context = {
+                "embedding_id": embedding_msg.id,
+                "uri": embedding_msg.context_data.get("uri", ""),
+                "task_id": task_metadata.task_id if task_metadata else "",
+                "work_id": task_metadata.work_id if task_metadata else "",
+            }
             inserted_data = embedding_msg.context_data
             account_id = inserted_data.get("account_id", "default")
             user = UserIdentifier(account_id=account_id, user_id="default")
@@ -617,6 +625,15 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     self._log_breaker_open_reenqueue_summary()
                     if self._vikingdb.has_queue_manager:
                         wait = self._circuit_breaker.retry_after
+                        logger.warning(
+                            "[Embedding] Circuit breaker re-enqueue: task_id=%s work_id=%s "
+                            "embedding_id=%s uri=%s retry_after_s=%.3f",
+                            log_context["task_id"],
+                            log_context["work_id"],
+                            log_context["embedding_id"],
+                            log_context["uri"],
+                            wait,
+                        )
                         if wait > 0:
                             await asyncio.sleep(wait)
                         await self._vikingdb.enqueue_embedding_msg(embedding_msg)
@@ -651,6 +668,14 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     try:
                         import time as _time
 
+                        logger.info(
+                            "[Embedding] Starting provider call: task_id=%s work_id=%s "
+                            "embedding_id=%s uri=%s",
+                            log_context["task_id"],
+                            log_context["work_id"],
+                            log_context["embedding_id"],
+                            log_context["uri"],
+                        )
                         _embed_t0 = _time.monotonic()
                         result = await embed_compat(
                             self._embedder,
@@ -658,6 +683,15 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                             is_query=False,
                         )
                         _embed_elapsed = _time.monotonic() - _embed_t0
+                        logger.info(
+                            "[Embedding] Provider call completed: task_id=%s work_id=%s "
+                            "embedding_id=%s uri=%s elapsed_s=%.3f",
+                            log_context["task_id"],
+                            log_context["work_id"],
+                            log_context["embedding_id"],
+                            log_context["uri"],
+                            _embed_elapsed,
+                        )
                         try:
                             from openviking.metrics.datasources import EmbeddingEventDataSource
 
@@ -716,6 +750,15 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         self._circuit_breaker.record_failure(embed_err)
                         if self._vikingdb.has_queue_manager:
                             try:
+                                logger.warning(
+                                    "[Embedding] Re-enqueueing after retryable failure: "
+                                    "task_id=%s work_id=%s embedding_id=%s uri=%s error=%s",
+                                    log_context["task_id"],
+                                    log_context["work_id"],
+                                    log_context["embedding_id"],
+                                    log_context["uri"],
+                                    embed_err,
+                                )
                                 await self._vikingdb.enqueue_embedding_msg(embedding_msg)
                                 self._merge_request_stats(
                                     embedding_msg.telemetry_id,
