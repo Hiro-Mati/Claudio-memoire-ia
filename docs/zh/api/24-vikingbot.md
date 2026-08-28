@@ -147,11 +147,11 @@ data: {"event":"response","data":{"content":"当前知识库包含……","respo
 **HTTP API**
 
 ```
-POST /bot/v1/compile
+POST /api/v1/compile
 ```
 
 ```bash
-curl -X POST http://localhost:1933/bot/v1/compile \
+curl -X POST http://localhost:1933/api/v1/compile \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key" \
   -d '{
@@ -192,6 +192,8 @@ HTTP 接口返回 `202 Accepted`：
 }
 ```
 
+`POST /bot/v1/compile` 保留为兼容入口，返回同一个 OV Task ID。
+
 ### compile_status()
 
 获取任务当前状态；任务进入终态后还会返回结果或错误。任务仅对创建它的 principal 可见；任务不存在或属于其他 principal 时均返回 `404`。
@@ -199,11 +201,11 @@ HTTP 接口返回 `202 Accepted`：
 **HTTP API**
 
 ```
-GET /bot/v1/compile/{task_id}
+GET /api/v1/tasks/{task_id}
 ```
 
 ```bash
-curl http://localhost:1933/bot/v1/compile/cmp_01abc \
+curl http://localhost:1933/api/v1/tasks/cmp_01abc \
   -H "X-API-Key: your-key"
 ```
 
@@ -253,11 +255,11 @@ ov task cancel cmp_01abc
 **HTTP API**
 
 ```http
-POST /bot/v1/compile/{task_id}/cancel
+POST /api/v1/tasks/{task_id}/cancel
 ```
 
 ```bash
-curl -X POST http://localhost:1933/bot/v1/compile/cmp_01abc/cancel \
+curl -X POST http://localhost:1933/api/v1/tasks/cmp_01abc/cancel \
   -H "X-API-Key: your-key"
 ```
 
@@ -265,13 +267,14 @@ curl -X POST http://localhost:1933/bot/v1/compile/cmp_01abc/cancel \
 
 | Status | 常见 Stage |
 |--------|------------|
-| `accepted` | `queued` |
-| `running` | `loading_skill`、`collecting_context`、`agent`、`rendering` |
-| `committing` | `writing`、`refreshing`、`salvaging` |
+| `pending` | `queued` |
+| `running` | 外部服务返回的执行 Stage，例如 `agent`、`writing` |
 | `cancelling` | 收敛当前进程内工作和清理资源 |
 | `completed` | `completed`、`salvaged` |
-| `failed` | 失败发生时的 Stage；响应包含 `error.code` 和 `error.message` |
+| `failed` | 失败发生时的 Stage；响应包含 `error` |
 | `cancelled` | `cancelled` |
+
+旧的 `/bot/v1/compile/{task_id}` 查询和取消路径继续保留，响应维持原 Compile 结构。
 
 ### feedback()
 

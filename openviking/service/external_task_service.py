@@ -1,0 +1,368 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""Durable execution of asynchronous tasks owned by external services."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Mapping, Protocol
+from uuid import uuid4
+
+from openviking.server.identity import RequestContext
+from openviking.service.task_tracker import TaskRecord, TaskStatus, get_task_tracker
+from openviking.service.task_tracker_concurrency import run_to_completion
+from openviking.storage.queuefs import QueueManager, get_queue_manager
+from openviking_cli.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+_ACTIVE_STATUSES = frozenset({"pending", "running", "cancelling"})
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+
+class ExternalTaskError(RuntimeError):
+    """A classified provider failure used by the durable retry loop."""
+
+    def __init__(self, code: str, message: str, *, transient: bool) -> None:
+        super().__init__(message)
+        self.code = code
+        self.transient = transient
+
+
+@dataclass(frozen=True)
+class ExternalTaskSnapshot:
+    """Provider-independent state returned by an external task API."""
+
+    status: str
+    stage: str | None = None
+    result: dict[str, Any] | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+class ExternalTaskProvider(Protocol):
+    """Adapter contract for one external asynchronous task type."""
+
+    task_type: str
+    task_id_prefix: str
+
+    @property
+    def poll_interval_seconds(self) -> float: ...
+
+    async def submit(
+        self,
+        ov_task_id: str,
+        payload: Mapping[str, Any],
+        connection: Mapping[str, Any],
+    ) -> str: ...
+
+    async def get(
+        self,
+        external_task_id: str,
+        connection: Mapping[str, Any],
+    ) -> ExternalTaskSnapshot: ...
+
+    async def cancel(
+        self,
+        external_task_id: str,
+        connection: Mapping[str, Any],
+    ) -> ExternalTaskSnapshot: ...
+
+
+class ExternalTaskService:
+    """Own OV task state while registered providers perform the actual work."""
+
+    def __init__(self) -> None:
+        self._providers: dict[str, ExternalTaskProvider] = {}
+
+    def register(self, provider: ExternalTaskProvider) -> None:
+        if provider.task_type in self._providers:
+            raise ValueError(f"External task provider already registered: {provider.task_type}")
+        self._providers[provider.task_type] = provider
+
+    def _provider(self, task_type: str) -> ExternalTaskProvider:
+        provider = self._providers.get(task_type)
+        if provider is None:
+            raise ExternalTaskError(
+                "UNAVAILABLE",
+                f"External task provider is not registered: {task_type}",
+                transient=False,
+            )
+        return provider
+
+    async def create(
+        self,
+        task_type: str,
+        *,
+        resource_id: str | None,
+        payload: Mapping[str, Any],
+        connection: Mapping[str, Any],
+        ctx: RequestContext,
+    ) -> TaskRecord:
+        provider = self._provider(task_type)
+        tracker = get_task_tracker()
+        task = await tracker.create(
+            task_type,
+            resource_id=resource_id,
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+            task_id=f"{provider.task_id_prefix}{uuid4().hex}",
+            meta={"request": dict(payload)},
+            auth={"openviking_connection": dict(connection)},
+        )
+        enqueued = False
+        try:
+            await get_queue_manager().enqueue(
+                QueueManager.EXTERNAL_TASK,
+                {
+                    "task_id": task.task_id,
+                    "account_id": ctx.account_id,
+                    "user_id": ctx.user.user_id,
+                },
+            )
+            enqueued = True
+            await tracker.update_stage(
+                task.task_id,
+                "queued",
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
+            )
+        except BaseException:
+            if not enqueued:
+                await tracker.fail(
+                    task.task_id,
+                    "Failed to enqueue external task",
+                    account_id=ctx.account_id,
+                    user_id=ctx.user.user_id,
+                )
+            raise
+        return task
+
+    async def execute(self, task_id: str, account_id: str, user_id: str) -> None:
+        tracker = get_task_tracker()
+        task = await tracker.get(task_id, account_id=account_id, user_id=user_id)
+        if task is None or task.status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }:
+            return
+        # The outcome is persisted before QueueFS ACK removes the owned work.
+        # After a crash in that window, let the recovered delivery ACK without
+        # resubmitting credentials that have already been cleared.
+        if task.result is not None or task.error is not None:
+            return
+
+        provider = self._provider(task.task_type)
+        payload = task.meta.get("request")
+        if not isinstance(payload, dict):
+            await tracker.fail(
+                task_id,
+                "INVALID_ARGUMENT: External task request is missing",
+                account_id=account_id,
+                user_id=user_id,
+            )
+            return
+        connection = await self._connection(task_id, account_id, user_id)
+        external_task_id: str | None = None
+        try:
+            await tracker.start(
+                task_id,
+                account_id=account_id,
+                user_id=user_id,
+                stage="submitting",
+            )
+            external_task_id = await self._retry(
+                lambda: provider.submit(task_id, payload, connection),
+                task_id=task_id,
+                operation_name="submit",
+                poll_interval=provider.poll_interval_seconds,
+            )
+            while True:
+                snapshot = await self._retry(
+                    lambda: provider.get(external_task_id, connection),
+                    task_id=task_id,
+                    operation_name="poll",
+                    poll_interval=provider.poll_interval_seconds,
+                )
+                if await self._apply_snapshot(
+                    snapshot,
+                    task_id=task_id,
+                    account_id=account_id,
+                    user_id=user_id,
+                ):
+                    return
+                await asyncio.sleep(provider.poll_interval_seconds)
+        except ExternalTaskError as exc:
+            await tracker.fail(
+                task_id,
+                self._format_error(exc.code, str(exc)),
+                account_id=account_id,
+                user_id=user_id,
+            )
+        except asyncio.CancelledError:
+            if not tracker.is_cancellation_requested(task_id):
+                raise
+            await run_to_completion(
+                lambda: self._cancel_external(
+                    provider,
+                    ov_task_id=task_id,
+                    payload=payload,
+                    connection=connection,
+                    external_task_id=external_task_id,
+                )
+            )
+            raise
+
+    async def cancel_recovered(self, task_id: str, account_id: str, user_id: str) -> None:
+        tracker = get_task_tracker()
+        task = await tracker.get(task_id, account_id=account_id, user_id=user_id)
+        if task is None or task.stage in {None, "queued"}:
+            return
+        payload = task.meta.get("request")
+        if not isinstance(payload, dict):
+            raise ExternalTaskError(
+                "INVALID_ARGUMENT",
+                "External task request is missing",
+                transient=False,
+            )
+        await self._cancel_external(
+            self._provider(task.task_type),
+            ov_task_id=task_id,
+            payload=payload,
+            connection=await self._connection(task_id, account_id, user_id),
+            external_task_id=None,
+        )
+
+    async def _connection(self, task_id: str, account_id: str, user_id: str) -> dict[str, Any]:
+        auth = await get_task_tracker().get_task_auth(
+            task_id,
+            account_id=account_id,
+            user_id=user_id,
+        )
+        connection = auth.get("openviking_connection")
+        return dict(connection) if isinstance(connection, dict) else {}
+
+    async def _apply_snapshot(
+        self,
+        snapshot: ExternalTaskSnapshot,
+        *,
+        task_id: str,
+        account_id: str,
+        user_id: str,
+    ) -> bool:
+        tracker = get_task_tracker()
+        if snapshot.status in _ACTIVE_STATUSES:
+            await tracker.update_stage(
+                task_id,
+                snapshot.stage or snapshot.status,
+                account_id=account_id,
+                user_id=user_id,
+            )
+            return False
+        if snapshot.status == "completed":
+            if snapshot.result is None:
+                raise ExternalTaskError(
+                    "INVALID_RESPONSE",
+                    "Completed external task did not include a result",
+                    transient=False,
+                )
+            await tracker.complete(
+                task_id,
+                snapshot.result,
+                account_id=account_id,
+                user_id=user_id,
+            )
+            return True
+        if snapshot.status == "failed":
+            await tracker.fail(
+                task_id,
+                self._format_error(
+                    snapshot.error_code or "UNKNOWN",
+                    snapshot.error_message or "External task failed",
+                ),
+                account_id=account_id,
+                user_id=user_id,
+            )
+            return True
+        if snapshot.status == "cancelled":
+            await tracker.record_cancelled(
+                task_id,
+                account_id=account_id,
+                user_id=user_id,
+            )
+            return True
+        raise ExternalTaskError(
+            "INVALID_RESPONSE",
+            f"Unknown external task status: {snapshot.status}",
+            transient=False,
+        )
+
+    async def _cancel_external(
+        self,
+        provider: ExternalTaskProvider,
+        *,
+        ov_task_id: str,
+        payload: Mapping[str, Any],
+        connection: Mapping[str, Any],
+        external_task_id: str | None,
+    ) -> None:
+        if external_task_id is None:
+            external_task_id = await self._retry(
+                lambda: provider.submit(ov_task_id, payload, connection),
+                task_id=ov_task_id,
+                operation_name="recover before cancel",
+                poll_interval=provider.poll_interval_seconds,
+            )
+        snapshot = await self._retry(
+            lambda: provider.cancel(external_task_id, connection),
+            task_id=ov_task_id,
+            operation_name="cancel",
+            poll_interval=provider.poll_interval_seconds,
+        )
+        while snapshot.status not in _TERMINAL_STATUSES:
+            await asyncio.sleep(provider.poll_interval_seconds)
+            snapshot = await self._retry(
+                lambda: provider.get(external_task_id, connection),
+                task_id=ov_task_id,
+                operation_name="poll cancellation",
+                poll_interval=provider.poll_interval_seconds,
+            )
+
+    @staticmethod
+    async def _retry(
+        action: Callable[[], Awaitable[Any]],
+        *,
+        task_id: str,
+        operation_name: str,
+        poll_interval: float,
+    ) -> Any:
+        delay = max(poll_interval, 0.2)
+        while True:
+            try:
+                return await action()
+            except ExternalTaskError as exc:
+                if not exc.transient:
+                    raise
+                logger.warning(
+                    "External task %s will retry task=%s code=%s: %s",
+                    operation_name,
+                    task_id,
+                    exc.code,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30.0)
+
+    @staticmethod
+    def _format_error(code: str, message: str) -> str:
+        return f"{code}: {message}"
+
+
+__all__ = [
+    "ExternalTaskError",
+    "ExternalTaskProvider",
+    "ExternalTaskService",
+    "ExternalTaskSnapshot",
+]

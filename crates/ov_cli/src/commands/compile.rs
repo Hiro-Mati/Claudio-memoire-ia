@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::client::{CompileAccepted, CompileResult, CompileTaskStatus, HttpClient};
+use serde_json::Value;
+
+use crate::client::{CompileAccepted, CompileResult, HttpClient};
 use crate::error::{Error, Result};
 use crate::output::{OutputFormat, output_success};
 
@@ -45,23 +47,23 @@ pub async fn run(
                 accepted.task_id
             )));
         }
-        let status = client.get_compile(&accepted.task_id).await?;
-        match status.status.as_str() {
+        let task = client.get_task(&accepted.task_id).await?;
+        let status = task
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match status {
             "completed" => {
-                render_completed(&status, output_format, compact);
+                render_completed(&task, output_format, compact)?;
                 return Ok(());
             }
             "failed" => {
-                let error = status.error.unwrap_or(crate::client::CompileErrorInfo {
-                    code: "UNKNOWN".into(),
-                    message: "Compile task failed".into(),
-                });
-                return Err(Error::api_response(
-                    Some(error.code),
-                    error.message,
-                    None,
-                    500,
-                ));
+                let error = task
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("UNKNOWN: Compile task failed");
+                let (code, message) = error.split_once(": ").unwrap_or(("UNKNOWN", error));
+                return Err(Error::api_response(Some(code.into()), message, None, 500));
             }
             "cancelled" => {
                 return Err(Error::api_response(
@@ -113,27 +115,17 @@ fn render_accepted(value: &CompileAccepted, format: OutputFormat, compact: bool)
     }
 }
 
-fn render_completed(value: &CompileTaskStatus, format: OutputFormat, compact: bool) {
+fn render_completed(value: &Value, format: OutputFormat, compact: bool) -> Result<()> {
     if matches!(format, OutputFormat::Json) {
         output_success(value, format, compact);
-        return;
+        return Ok(());
     }
-    let result = value
-        .result
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| CompileResult {
-            from_uris: Vec::new(),
-            to: String::new(),
-            skill: String::new(),
-            okf_version: "0.1".into(),
-            created: Vec::new(),
-            updated: Vec::new(),
-            unchanged: Vec::new(),
-            page_count: 0,
-            link_count: 0,
-            warnings: Vec::new(),
-        });
+    let result: CompileResult = serde_json::from_value(
+        value
+            .get("result")
+            .cloned()
+            .ok_or_else(|| Error::Parse("completed Compile task has no result".into()))?,
+    )?;
     println!("to: {}", result.to);
     println!("created: {}", result.created.len());
     println!("updated: {}", result.updated.len());
@@ -143,6 +135,7 @@ fn render_completed(value: &CompileTaskStatus, format: OutputFormat, compact: bo
     for warning in result.warnings {
         eprintln!("warning: {warning}");
     }
+    Ok(())
 }
 
 #[cfg(test)]

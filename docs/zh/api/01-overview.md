@@ -449,6 +449,7 @@ JSON 输出 - 错误：
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
+| POST | `/api/v1/compile` | 创建由 OV 托管的 Compile 任务 |
 | GET | `/api/v1/tasks/{task_id}` | 获取后台任务 |
 | POST | `/api/v1/tasks/{task_id}/cancel` | 取消后台任务 |
 | GET | `/api/v1/tasks` | 列出后台任务 |
@@ -505,9 +506,9 @@ JSON 输出 - 错误：
 | POST | `/bot/v1/chat` | VikingBot 非流式对话 |
 | POST | `/bot/v1/chat/stream` | VikingBot 流式对话 |
 | POST | `/bot/v1/feedback` | 提交 VikingBot 回答反馈 |
-| POST | `/bot/v1/compile` | 启动 Skill 驱动的 Compile 任务 |
-| GET | `/bot/v1/compile/{task_id}` | 获取 Compile 任务状态 |
-| POST | `/bot/v1/compile/{task_id}/cancel` | 取消 Compile 任务 |
+| POST | `/bot/v1/compile` | Compile 创建兼容入口 |
+| GET | `/bot/v1/compile/{task_id}` | Compile 状态兼容入口 |
+| POST | `/bot/v1/compile/{task_id}/cancel` | Compile 取消兼容入口 |
 
 ---
 

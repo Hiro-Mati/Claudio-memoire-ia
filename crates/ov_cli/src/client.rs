@@ -119,12 +119,6 @@ pub struct CompileAccepted {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CompileErrorInfo {
-    pub code: String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompileResult {
     #[serde(rename = "from")]
     pub from_uris: Vec<String>,
@@ -141,19 +135,6 @@ pub struct CompileResult {
     pub link_count: usize,
     #[serde(default)]
     pub warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CompileTaskStatus {
-    pub task_id: String,
-    pub status: String,
-    pub stage: String,
-    pub created_at: String,
-    pub updated_at: String,
-    #[serde(default)]
-    pub result: Option<CompileResult>,
-    #[serde(default)]
-    pub error: Option<CompileErrorInfo>,
 }
 
 #[derive(serde::Serialize)]
@@ -367,11 +348,7 @@ impl HttpClient {
             reason,
             runtime_timeout_seconds,
         };
-        self.post("/bot/v1/compile", &body).await
-    }
-
-    pub async fn get_compile(&self, task_id: &str) -> Result<CompileTaskStatus> {
-        self.get(&format!("/bot/v1/compile/{task_id}"), &[]).await
+        self.post("/api/v1/compile", &body).await
     }
 
     pub async fn read(&self, uri: &str) -> Result<String> {
@@ -1218,20 +1195,12 @@ impl HttpClient {
     // ============ Task Methods ============
 
     pub async fn get_task(&self, task_id: &str) -> Result<serde_json::Value> {
-        let path = if task_id.starts_with("cmp_") {
-            format!("/bot/v1/compile/{task_id}")
-        } else {
-            format!("/api/v1/tasks/{task_id}")
-        };
+        let path = format!("/api/v1/tasks/{task_id}");
         self.get(&path, &[]).await
     }
 
     pub async fn cancel_task(&self, task_id: &str) -> Result<serde_json::Value> {
-        let path = if task_id.starts_with("cmp_") {
-            format!("/bot/v1/compile/{task_id}/cancel")
-        } else {
-            format!("/api/v1/tasks/{task_id}/cancel")
-        };
+        let path = format!("/api/v1/tasks/{task_id}/cancel");
         self.post(&path, &serde_json::json!({})).await
     }
 
@@ -2323,7 +2292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_methods_route_compile_ids_to_compile_endpoints() {
+    async fn task_methods_use_generic_task_endpoints_for_compile_ids() {
         let (base_url, status_request_rx) = spawn_request_capture_server().await;
         let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
         client
@@ -2333,7 +2302,7 @@ mod tests {
         let status_request = status_request_rx
             .await
             .expect("status request should be captured");
-        assert!(status_request.starts_with("GET /bot/v1/compile/cmp_1 "));
+        assert!(status_request.starts_with("GET /api/v1/tasks/cmp_1 "));
 
         let (base_url, cancel_request_rx) = spawn_request_capture_server().await;
         let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
@@ -2344,7 +2313,7 @@ mod tests {
         let cancel_request = cancel_request_rx
             .await
             .expect("cancel request should be captured");
-        assert!(cancel_request.starts_with("POST /bot/v1/compile/cmp_1/cancel "));
+        assert!(cancel_request.starts_with("POST /api/v1/tasks/cmp_1/cancel "));
     }
 
     #[tokio::test]

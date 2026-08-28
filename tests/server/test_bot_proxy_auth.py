@@ -3,7 +3,6 @@
 
 """Regression tests for bot proxy endpoint auth enforcement."""
 
-import json
 from types import SimpleNamespace
 
 import httpx
@@ -11,9 +10,15 @@ import pytest
 from fastapi import FastAPI
 
 import openviking.server.routers.bot as bot_router_module
+import openviking.server.routers.compile as compile_router_module
+import openviking.service.compile_service as compile_service_module
 from openviking.server.auth.plugins import DevAuthPlugin, TrustedAuthPlugin
 from openviking.server.config import ServerConfig
 from openviking.server.identity import AuthMode
+from openviking.service.compile_service import CompileAccepted, CompileService
+from openviking.service.external_task_service import ExternalTaskService
+from openviking.service.task_tracker import TaskRecord, TaskStatus
+from openviking_cli.utils.config.open_viking_config import CompileApiConfig
 
 
 def test_set_bot_api_key_updates_module_state():
@@ -223,69 +228,51 @@ async def test_chat_proxy_forwards_trusted_request_without_root_api_key(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_compile_proxy_forwards_create_and_status_identity(monkeypatch):
-    forwarded = []
+async def test_compile_routes_use_ov_owned_task_and_forward_identity(monkeypatch):
+    calls = {}
+    running = TaskRecord(
+        task_id="cmp_1",
+        task_type="compile",
+        status=TaskStatus.RUNNING,
+        stage="agent",
+        account_id="acct",
+        user_id="alice",
+    )
+    cancelling = TaskRecord(
+        task_id="cmp_1",
+        task_type="compile",
+        status=TaskStatus.CANCELLING,
+        stage="agent",
+        account_id="acct",
+        user_id="alice",
+    )
 
-    class FakeResponse:
-        def __init__(self, payload, status_code=200):
-            self._payload = payload
-            self.status_code = status_code
-            self.text = json.dumps(payload)
-
-        @property
-        def is_success(self):
-            return 200 <= self.status_code < 300
-
-        def json(self):
-            return self._payload
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
-        async def post(self, url, json, headers, timeout):
-            forwarded.append(("POST", url, json, headers, timeout))
-            if url.endswith("/cancel"):
-                return FakeResponse(
-                    {
-                        "task_id": "cmp_1",
-                        "status": "cancelled",
-                        "stage": "cancelled",
-                        "created_at": "2026-07-20T00:00:00Z",
-                        "updated_at": "2026-07-20T00:00:02Z",
-                    }
-                )
-            return FakeResponse(
-                {
-                    "task_id": "cmp_1",
-                    "status": "accepted",
-                    "to": "viking://resources/wiki",
-                },
-                202,
+    class FakeCompileService:
+        async def create(self, body, *, connection, ctx):
+            calls["request"] = body.model_dump(mode="json", by_alias=True)
+            calls["connection"] = connection
+            calls["owner"] = (ctx.account_id, ctx.user.user_id)
+            return CompileAccepted(
+                task_id="cmp_1",
+                to="viking://resources/wiki",
             )
 
-        async def get(self, url, headers, timeout):
-            forwarded.append(("GET", url, None, headers, timeout))
-            return FakeResponse(
-                {
-                    "task_id": "cmp_1",
-                    "status": "running",
-                    "stage": "agent",
-                    "created_at": "2026-07-20T00:00:00Z",
-                    "updated_at": "2026-07-20T00:00:01Z",
-                }
-            )
+        async def get_owned_task(self, task_id, ctx):
+            calls["get"] = (task_id, ctx.account_id, ctx.user.user_id)
+            return running
 
-    monkeypatch.setattr(bot_router_module, "BOT_API_URL", "http://127.0.0.1:18790")
-    monkeypatch.setattr(bot_router_module, "BOT_API_KEY", "gateway-secret")
-    monkeypatch.setattr(bot_router_module, "_create_bot_proxy_client", lambda: FakeClient())
+        async def cancel_owned_task(self, task_id, ctx):
+            calls["cancel"] = (task_id, ctx.account_id, ctx.user.user_id)
+            return cancelling
+
+    service = SimpleNamespace(compile=FakeCompileService())
+    monkeypatch.setattr(compile_router_module, "get_service", lambda: service)
+    monkeypatch.setattr(bot_router_module, "get_service", lambda: service)
 
     app = FastAPI()
     app.state.config = ServerConfig(auth_mode="trusted", host="127.0.0.1", port=1944)
     app.state.auth_plugin = TrustedAuthPlugin()
+    app.include_router(compile_router_module.router)
     app.include_router(bot_router_module.router, prefix="/bot/v1")
     transport = httpx.ASGITransport(app=app)
     headers = {
@@ -295,7 +282,7 @@ async def test_compile_proxy_forwards_create_and_status_identity(monkeypatch):
     }
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         created = await client.post(
-            "/bot/v1/compile",
+            "/api/v1/compile",
             headers=headers,
             json={
                 "from": ["viking://resources/source"],
@@ -312,81 +299,75 @@ async def test_compile_proxy_forwards_create_and_status_identity(monkeypatch):
     assert created.status_code == 202
     assert created.json()["result"]["task_id"] == "cmp_1"
     assert status_response.json()["result"]["stage"] == "agent"
-    assert cancel_response.json()["result"]["status"] == "cancelled"
-    post = forwarded[0]
-    assert post[1].endswith("/bot/v1/compile")
-    assert post[2]["openviking_connection"]["api_key"] == "active-user-key"
-    get = forwarded[1]
-    assert get[1].endswith("/bot/v1/compile/cmp_1")
-    assert get[3]["X-Gateway-Token"] == "gateway-secret"
-    assert get[3]["X-API-Key"] == "active-user-key"
-    assert get[3]["X-OpenViking-Account"] == "acct"
-    assert get[3]["X-OpenViking-User"] == "alice"
-    cancel = forwarded[2]
-    assert cancel[1].endswith("/bot/v1/compile/cmp_1/cancel")
-    assert cancel[2] == {}
-    assert cancel[3]["X-Gateway-Token"] == "gateway-secret"
-    assert cancel[3]["X-API-Key"] == "active-user-key"
+    assert cancel_response.json()["result"]["status"] == "cancelling"
+    assert calls["connection"]["api_key"] == "active-user-key"
+    assert calls["connection"]["server_url"] == "http://127.0.0.1:1944"
+    assert calls["owner"] == ("acct", "alice")
+    assert calls["get"] == ("cmp_1", "acct", "alice")
+    assert calls["cancel"] == ("cmp_1", "acct", "alice")
 
 
 @pytest.mark.asyncio
-async def test_compile_proxy_supports_no_key_dev_mode(monkeypatch):
+async def test_compile_api_client_sends_user_connection_and_idempotency_key(monkeypatch):
     forwarded = {}
 
     class FakeResponse:
         status_code = 202
-        text = '{"task_id":"cmp_dev"}'
         is_success = True
 
         @staticmethod
         def json():
             return {
-                "task_id": "cmp_dev",
+                "task_id": "external_cmp_1",
                 "status": "accepted",
                 "to": "viking://resources/wiki",
             }
 
     class FakeClient:
+        def __init__(self, **kwargs):
+            forwarded["client"] = kwargs
+
         async def __aenter__(self):
             return self
 
         async def __aexit__(self, exc_type, exc, tb):
             return None
 
-        async def post(self, url, json, headers, timeout):
-            from vikingbot.compile.models import CompileRequest
-
-            CompileRequest.model_validate(json)
-            forwarded.update(url=url, body=json, headers=headers, timeout=timeout)
+        async def request(self, method, url, headers, json):
+            forwarded.update(method=method, url=url, body=json, headers=headers)
             return FakeResponse()
 
-    monkeypatch.setattr(bot_router_module, "BOT_API_URL", "http://127.0.0.1:18790")
-    monkeypatch.setattr(bot_router_module, "BOT_API_KEY", "")
-    monkeypatch.setattr(bot_router_module, "_create_bot_proxy_client", lambda: FakeClient())
+    monkeypatch.setattr(compile_service_module.httpx, "AsyncClient", FakeClient)
+    service = CompileService(
+        CompileApiConfig(
+            enable=True,
+            host="https://compile.example.com",
+            api_key="compile-service-key",
+        ),
+        ExternalTaskService(),
+    )
+    external_task_id = await service.submit(
+        "cmp_ov_1",
+        {
+            "from": ["viking://resources/source"],
+            "to": "viking://resources/wiki",
+            "skill": "viking://agent/skills/wiki",
+        },
+        {
+            "server_url": "https://ov.example.com",
+            "api_key": "active-user-key",
+            "account_id": "acct",
+            "user_id": "alice",
+        },
+    )
 
-    app = FastAPI()
-    app.state.config = ServerConfig(auth_mode="dev", host="127.0.0.1", port=1944)
-    app.state.auth_plugin = DevAuthPlugin()
-    app.include_router(bot_router_module.router, prefix="/bot/v1")
-
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app),
-        base_url="http://testserver",
-    ) as client:
-        response = await client.post(
-            "/bot/v1/compile",
-            json={
-                "from": ["viking://resources/source"],
-                "to": "viking://resources/wiki",
-                "skill": "viking://agent/skills/wiki",
-            },
-        )
-
-    assert response.status_code == 202
-    assert forwarded["url"].endswith("/bot/v1/compile")
-    assert "user_id" not in forwarded["body"]
-    assert "openviking_connection" not in forwarded["body"]
-    assert "X-API-Key" not in forwarded["headers"]
+    assert external_task_id == "external_cmp_1"
+    assert forwarded["method"] == "POST"
+    assert forwarded["url"] == "https://compile.example.com/bot/v1/compile"
+    assert forwarded["headers"]["Authorization"] == "Bearer compile-service-key"
+    assert forwarded["headers"]["Idempotency-Key"] == "cmp_ov_1"
+    assert forwarded["headers"]["X-API-Key"] == "active-user-key"
+    assert forwarded["body"]["openviking_connection"]["api_key"] == "active-user-key"
 
 
 @pytest.mark.asyncio

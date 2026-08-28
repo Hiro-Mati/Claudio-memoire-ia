@@ -2,9 +2,11 @@
 
 | 项目 | 信息 |
 | --- | --- |
-| 状态 | 待实现 |
+| 状态 | 历史设计，现行方案见下方说明 |
 | 目标版本 | v1 |
-| 更新日期 | 2026-07-20 |
+| 更新日期 | 2026-08-28 |
+
+> 本文保留最初由 VikingBot 直接托管任务的历史设计。现行方案由 OpenViking 托管 TaskRecord、QueueFS、查询和取消，外部 Server 只负责执行；整体流程和接口以 [外部 Compile Server 对接说明](./external-compile-server-api.md) 为准。
 
 ## 1. 概述
 

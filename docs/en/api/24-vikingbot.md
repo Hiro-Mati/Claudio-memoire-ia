@@ -150,11 +150,11 @@ Start an asynchronous, Skill-driven Compile task. VikingBot loads the selected S
 **HTTP API**
 
 ```
-POST /bot/v1/compile
+POST /api/v1/compile
 ```
 
 ```bash
-curl -X POST http://localhost:1933/bot/v1/compile \
+curl -X POST http://localhost:1933/api/v1/compile \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key" \
   -d '{
@@ -195,6 +195,8 @@ The HTTP endpoint returns `202 Accepted`:
 }
 ```
 
+`POST /bot/v1/compile` remains available as a compatibility endpoint and returns the same OV task ID.
+
 ### compile_status()
 
 Get the current state and, for a terminal task, its result or error. A task is visible only to the principal that created it; a missing task and a task owned by another principal both return `404`.
@@ -202,11 +204,11 @@ Get the current state and, for a terminal task, its result or error. A task is v
 **HTTP API**
 
 ```
-GET /bot/v1/compile/{task_id}
+GET /api/v1/tasks/{task_id}
 ```
 
 ```bash
-curl http://localhost:1933/bot/v1/compile/cmp_01abc \
+curl http://localhost:1933/api/v1/tasks/cmp_01abc \
   -H "X-API-Key: your-key"
 ```
 
@@ -256,11 +258,11 @@ ov task cancel cmp_01abc
 **HTTP API**
 
 ```http
-POST /bot/v1/compile/{task_id}/cancel
+POST /api/v1/tasks/{task_id}/cancel
 ```
 
 ```bash
-curl -X POST http://localhost:1933/bot/v1/compile/cmp_01abc/cancel \
+curl -X POST http://localhost:1933/api/v1/tasks/cmp_01abc/cancel \
   -H "X-API-Key: your-key"
 ```
 
@@ -268,13 +270,14 @@ Task lifecycle values are:
 
 | Status | Typical stages |
 |--------|----------------|
-| `accepted` | `queued` |
-| `running` | `loading_skill`, `collecting_context`, `agent`, `rendering` |
-| `committing` | `writing`, `refreshing`, `salvaging` |
+| `pending` | `queued` |
+| `running` | Execution stage reported by the external service, such as `agent` or `writing` |
 | `cancelling` | Settling in-process work and resource cleanup |
 | `completed` | `completed`, `salvaged` |
-| `failed` | Stage where the failure occurred; the response contains `error.code` and `error.message` |
+| `failed` | Stage where the failure occurred; the response contains `error` |
 | `cancelled` | `cancelled` |
+
+The legacy `/bot/v1/compile/{task_id}` status and cancellation paths remain available with the original Compile response shape.
 
 ### feedback()
 

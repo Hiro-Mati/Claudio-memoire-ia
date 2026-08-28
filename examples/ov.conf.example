@@ -89,6 +89,14 @@
             "file_vectorization_concurrency": 8
         },
         "session_commit": {"max_concurrent": 8},
+        "external_task": {"max_concurrent": 10},
+    },
+    "compile_api": {
+        "enable": false,
+        "host": "https://compile.example.com",
+        "api_key": "$OPENVIKING_COMPILE_API_KEY",
+        "http_timeout_seconds": 10,
+        "poll_interval_ms": 3000,
     },
     "reindex": {
         "file_vectorization_concurrency": 8

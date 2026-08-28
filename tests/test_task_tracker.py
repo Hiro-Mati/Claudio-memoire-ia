@@ -137,7 +137,7 @@ async def test_start_task(tracker: TaskTracker):
     assert retrieved.status == TaskStatus.RUNNING
 
 
-async def test_update_stage(tracker: TaskTracker):
+async def test_update_stage_and_record_owner_cancelled(tracker: TaskTracker):
     task = await tracker.create("add_resource", **_owner_kwargs())
     await tracker.start(task.task_id, stage="queued")
     await tracker.update_stage(task.task_id, "parsing")
@@ -145,6 +145,12 @@ async def test_update_stage(tracker: TaskTracker):
     assert retrieved is not None
     assert retrieved.status == TaskStatus.RUNNING
     assert retrieved.stage == "parsing"
+
+    await tracker.record_cancelled(task.task_id)
+    cancelled = await tracker.get(task.task_id)
+    assert cancelled is not None
+    assert cancelled.status == TaskStatus.CANCELLED
+    assert cancelled.stage == "cancelled"
 
 
 async def test_complete_task(tracker: TaskTracker):
@@ -296,10 +302,9 @@ async def test_list_can_hide_internal_tasks_before_limit(tracker: TaskTracker):
     internal = await tracker.create("add_resource", meta={"internal": True}, **_owner_kwargs())
 
     assert [task.task_id for task in await tracker.list_tasks(limit=1)] == [internal.task_id]
-    assert [
-        task.task_id
-        for task in await tracker.list_tasks(limit=1, include_internal=False)
-    ] == [visible.task_id]
+    assert [task.task_id for task in await tracker.list_tasks(limit=1, include_internal=False)] == [
+        visible.task_id
+    ]
 
 
 async def test_list_order_most_recent_first(tracker: TaskTracker):
