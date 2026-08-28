@@ -9,6 +9,7 @@ import binascii
 import os
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from openviking.core.namespace import (
@@ -24,6 +25,7 @@ from openviking.resource.processing_mode import (
     normalize_processing_mode,
 )
 from openviking.resource.watch_storage import is_watch_task_control_uri
+from openviking.parse.parsers.upload_utils import is_text_file
 from openviking.server.identity import RequestContext
 from openviking.session.memory.memory_updater import MemoryUpdater
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
@@ -131,6 +133,19 @@ class ContentWriteCoordinator:
         normalized_uri = self._validate_uri_path(uri, field_name="uri")
         self._ensure_content_write_policy(normalized_uri)
         await self._viking_fs._ensure_access(normalized_uri, ctx, action=AclAction.WRITE)
+
+        if self._is_vectors_only_replace_fast_path(
+            uri=normalized_uri,
+            mode=mode,
+            processing_mode=processing_mode,
+        ):
+            return await self._replace_vectors_only_without_fs_reads(
+                uri=normalized_uri,
+                content=content,
+                ctx=ctx,
+                wait=wait,
+                timeout=timeout,
+            )
 
         if mode == "create":
             return await self._create_and_write(
@@ -711,6 +726,82 @@ class ContentWriteCoordinator:
             result["overview_status"] = overview_status
         return result
 
+    @staticmethod
+    def _is_vectors_only_replace_fast_path(
+        *, uri: str, mode: str, processing_mode: ProcessingMode
+    ) -> bool:
+        """Return whether this write can skip every storage read and lookup.
+
+        The fast path deliberately makes ``replace`` a blind overwrite for
+        ordinary resource and skill files.  Callers that require an existence
+        check should use the normal write path.
+        """
+        return (
+            mode == "replace"
+            and processing_mode == VECTORS_ONLY
+            and context_type_for_uri(uri) in {"resource", "skill"}
+            and not is_abstract_overview_uri(uri)
+            and is_text_file(uri.rsplit("/", 1)[-1])
+        )
+
+    async def _replace_vectors_only_without_fs_reads(
+        self,
+        *,
+        uri: str,
+        content: str,
+        ctx: RequestContext,
+        wait: bool,
+        timeout: Optional[float],
+    ) -> Dict[str, Any]:
+        """Overwrite one object and enqueue its vector input without rereading it.
+
+        This executes exactly one VikingFS operation, ``write_file``.  The
+        embedding message carries the written content, so neither this request
+        nor the embedding worker needs to stat/read the object afterwards.
+        """
+        parent = VikingURI(uri).parent
+        if parent is None:
+            raise InvalidArgumentError(f"could not resolve write parent for {uri}")
+
+        written_bytes = len(content.encode("utf-8"))
+        telemetry_id = get_current_telemetry().telemetry_id
+        if wait and telemetry_id:
+            get_request_wait_tracker().register_request(telemetry_id)
+
+        try:
+            await self._viking_fs.write_file(uri, content, ctx=ctx)
+            vector_enqueued = await self._vectorize_written_file(
+                uri=uri,
+                context_type=context_type_for_uri(uri),
+                ctx=ctx,
+                inline_content=content,
+                updated_at=datetime.now(timezone.utc),
+            )
+            queue_status = (
+                await self._wait_for_request(telemetry_id=telemetry_id, timeout=timeout)
+                if wait
+                else None
+            )
+            vector_status = (
+                self._refresh_statuses(wait=wait, queue_status=queue_status)[1]
+                if vector_enqueued
+                else "skipped"
+            )
+            return self._build_write_result(
+                uri=uri,
+                root_uri=parent.uri,
+                context_type=context_type_for_uri(uri),
+                mode="replace",
+                written_bytes=written_bytes,
+                wait=wait,
+                queue_status=queue_status,
+                semantic_status="skipped",
+                vector_status=vector_status,
+            )
+        finally:
+            if wait and telemetry_id:
+                get_request_wait_tracker().cleanup(telemetry_id)
+
     def _build_tags_result(
         self,
         *,
@@ -926,6 +1017,8 @@ class ContentWriteCoordinator:
         context_type: str,
         ctx: RequestContext,
         creator_acl_grant: CreatorAclGrant | None = None,
+        inline_content: Optional[str] = None,
+        updated_at: Optional[datetime] = None,
     ) -> bool:
         parent = VikingURI(uri).parent
         if parent is None:
@@ -938,6 +1031,8 @@ class ContentWriteCoordinator:
             context_type=context_type,
             ctx=ctx,
             creator_acl_grant=creator_acl_grant,
+            inline_content=inline_content,
+            updated_at=updated_at,
         )
 
     async def _vectorize_abstract_overview(self, *, uri: str, ctx: RequestContext) -> bool:

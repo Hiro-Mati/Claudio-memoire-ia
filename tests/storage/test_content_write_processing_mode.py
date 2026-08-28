@@ -42,6 +42,39 @@ class _FakeVikingFS:
     def _uri_to_path(self, uri, ctx=None):
         return f"/fake/{uri}"
 
+    async def _ensure_access(self, uri, ctx, action=None):
+        del uri, ctx, action
+
+
+@pytest.mark.asyncio
+async def test_vectors_only_replace_fast_path_only_writes_object_and_enqueues_inline_content(
+    monkeypatch, ctx
+):
+    fake_fs = _FakeVikingFS()
+    fake_fs.stat = AsyncMock(side_effect=AssertionError("fast path must not stat"))
+    fake_fs.read_file = AsyncMock(side_effect=AssertionError("fast path must not read"))
+    vectorize_file = AsyncMock(return_value=True)
+    monkeypatch.setattr(content_write_module, "vectorize_file", vectorize_file)
+
+    result = await ContentWriteCoordinator(viking_fs=fake_fs).write(
+        uri="viking://resources/project/demo.md",
+        content="new content",
+        ctx=ctx,
+        mode="replace",
+        processing_mode="vectors_only",
+    )
+
+    fake_fs.write_file.assert_awaited_once_with(
+        "viking://resources/project/demo.md", "new content", ctx=ctx
+    )
+    fake_fs.stat.assert_not_awaited()
+    fake_fs.read_file.assert_not_awaited()
+    vectorize_file.assert_awaited_once()
+    assert vectorize_file.await_args.kwargs["inline_content"] == "new content"
+    assert result["root_uri"] == "viking://resources/project"
+    assert result["semantic_status"] == "skipped"
+    assert result["vector_status"] == "queued"
+
 
 def _sidecar(level=ContextLevel.ABSTRACT, body="Original body."):
     return render_abstract_overview(

@@ -189,6 +189,33 @@ async def test_vectorize_file_uses_summary_first(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_vectorize_file_uses_inline_content_without_reading_or_stating(monkeypatch):
+    queue = DummyQueue()
+    fs = DummyFS("must not be read")
+    monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: DummyQueueManager(queue))
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: fs)
+    monkeypatch.setattr(
+        embedding_utils,
+        "get_openviking_config",
+        lambda: types.SimpleNamespace(
+            embedding=types.SimpleNamespace(text_source="content_only", max_input_tokens=1000)
+        ),
+    )
+
+    await embedding_utils.vectorize_file(
+        file_path="viking://resources/project/demo.md",
+        summary_dict={"name": "demo.md", "summary": ""},
+        parent_uri="viking://resources/project",
+        ctx=DummyReq(),
+        inline_content="written inline",
+    )
+
+    assert queue.items[0].message == "written inline"
+    assert queue.items[0].context_data["_content_inline"] is True
+    assert fs.read_file_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_vectorize_image_downsamples_large_embedding_input(monkeypatch):
     queue = DummyQueue()
     original = _jpeg_bytes(80, 220)

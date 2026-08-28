@@ -576,6 +576,12 @@ class TextEmbeddingHandler(DequeueHandlerBase):
         ctx: RequestContext,
     ) -> str:
         inserted_data = embedding_msg.context_data
+        if inserted_data.get("_content_inline"):
+            return (
+                embedding_msg.message[:VIKINGDB_CONTENT_MAX_SIZE]
+                if isinstance(embedding_msg.message, str)
+                else inserted_data["abstract"][:VIKINGDB_CONTENT_MAX_SIZE]
+            )
         if inserted_data.get("is_leaf") and inserted_data.get("context_type") in (
             ContextType.RESOURCE.value,
             ContextType.SKILL.value,

@@ -508,6 +508,8 @@ async def vectorize_file(
     scalar_override: Optional[Dict[str, Any]] = None,
     ingest_options: IngestOptions | None = None,
     creator_acl_grant: CreatorAclGrant | None = None,
+    inline_content: str | None = None,
+    updated_at: datetime | None = None,
 ) -> bool:
     """
     Vectorize a single file.
@@ -531,11 +533,15 @@ async def vectorize_file(
         # Cap below the bytes_row 65535-byte abstract-scalar limit (#2774 parity).
         summary = _truncate_abstract_bytes(summary)
 
-        created_at, updated_at = await _resolve_context_timestamps(
-            file_path,
-            ctx,
-            preserve_existing_created_at=preserve_existing_created_at,
-        )
+        if inline_content is None:
+            created_at, resolved_updated_at = await _resolve_context_timestamps(
+                file_path,
+                ctx,
+                preserve_existing_created_at=preserve_existing_created_at,
+            )
+        else:
+            resolved_updated_at = updated_at or datetime.now(timezone.utc)
+            created_at = resolved_updated_at
         context = Context(
             uri=file_path,
             parent_uri=parent_uri,
@@ -543,19 +549,33 @@ async def vectorize_file(
             abstract=summary,
             context_type=context_type,
             created_at=created_at,
-            updated_at=updated_at,
+            updated_at=resolved_updated_at,
             user=ctx.user,
             account_id=ctx.account_id,
             owner_space=owner_space_for_uri(file_path),
         )
 
-        content_type = await _resolve_resource_content_type(file_path, file_name, viking_fs, ctx)
+        content_type = (
+            get_resource_content_type(file_name)
+            if inline_content is not None
+            else await _resolve_resource_content_type(file_path, file_name, viking_fs, ctx)
+        )
         embedding_cfg = get_openviking_config().embedding
         configured_text_source = embedding_cfg.text_source
         effective_text_source = TEXT_SOURCE_SUMMARY_ONLY if use_summary else configured_text_source
         embed_summary = bool(summary and effective_text_source in SUMMARY_TEXT_SOURCES)
 
-        if content_type in (ResourceContentType.AUDIO, ResourceContentType.VIDEO):
+        if inline_content is not None and (
+            content_type == ResourceContentType.TEXT or is_text_file(file_name)
+        ):
+            context.set_vectorize(
+                Vectorize(
+                    text=truncate_embedding_input(
+                        inline_content, embedding_cfg.max_input_tokens
+                    )
+                )
+            )
+        elif content_type in (ResourceContentType.AUDIO, ResourceContentType.VIDEO):
             effective_text = summary or file_name
             context.abstract = effective_text
             context.set_vectorize(Vectorize(text=effective_text))
@@ -629,6 +649,8 @@ async def vectorize_file(
 
         _apply_scalar_overrides(embedding_msg, scalar_override)
         _apply_ingest_options(embedding_msg, ingest_options)
+        if inline_content is not None:
+            embedding_msg.context_data["_content_inline"] = True
         enqueued = await _enqueue_embedding_message(
             embedding_queue,
             embedding_msg,

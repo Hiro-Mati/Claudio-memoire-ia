@@ -535,6 +535,39 @@ async def test_embedding_handler_materialize_content_keeps_inline(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_embedding_handler_materialize_content_uses_inline_resource_write_without_fs_read(
+    monkeypatch
+):
+    class _DummyVikingDB:
+        is_closing = False
+
+    class _UnexpectedFS:
+        async def read_file(self, uri, *, ctx):
+            raise AssertionError(f"inline content must not read {uri}")
+
+    embedder = _DummyEmbedder()
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: _DummyConfig(embedder),
+    )
+    monkeypatch.setattr("openviking.storage.viking_fs.get_viking_fs", lambda: _UnexpectedFS())
+    handler = TextEmbeddingHandler(_DummyVikingDB())
+    msg = EmbeddingMsg(
+        "written inline",
+        {
+            "uri": "viking://resources/project/demo.md",
+            "abstract": "",
+            "is_leaf": True,
+            "context_type": "resource",
+            "_content_inline": True,
+        },
+    )
+    ctx = RequestContext(user=UserIdentifier("default", "default"), role=Role.ROOT)
+
+    assert await handler._materialize_content(msg, ctx) == "written inline"
+
+
+@pytest.mark.asyncio
 async def test_embedding_handler_propagates_account_id_on_error(monkeypatch):
     class _DummyVikingDB:
         is_closing = False
