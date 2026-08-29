@@ -206,7 +206,12 @@ def acl_ancestors(uri: str) -> list[str]:
 
 
 def has_implicit_manage(ctx: RequestContext, uri: str) -> bool:
-    return is_acl_uri(uri) and ctx.role == Role.ADMIN
+    # root and admin implicitly hold MANAGE on any ACL-scoped URI, so they skip
+    # the per-URI ACL resolution short-circuit. root ranks above admin (see
+    # Role._BUILTIN_RANK) and is already all-access in namespace visibility
+    # checks; without this it would still pass ACL checks but pay an extra ACL
+    # lookup per request.
+    return is_acl_uri(uri) and ctx.role in (Role.ADMIN, Role.ROOT)
 
 
 def acl_allows(acl: EffectiveAcl, ctx: RequestContext, action: AclAction) -> bool:
