@@ -71,12 +71,15 @@ class OpenVikingService:
         self,
         path: Optional[str] = None,
         user: Optional[UserIdentifier] = None,
+        *,
+        acl_enabled: bool = False,
     ):
         """Initialize OpenViking service.
 
         Args:
             path: Local storage path (overrides ov.conf storage path).
             user: Username for session management.
+            acl_enabled: Enable resource ACL enforcement and metadata lookups.
         """
         # Initialize config from ov.conf
         config = initialize_openviking_config(
@@ -85,6 +88,7 @@ class OpenVikingService:
         )
         self._config = config
         self._user = user or UserIdentifier(config.default_account, config.default_user)
+        self._acl_enabled = acl_enabled
 
         # Infrastructure
         self._agfs_client: Optional[Any] = None
@@ -185,10 +189,7 @@ class OpenVikingService:
         self._vikingdb_manager = VikingDBManager(
             vectordb_config=config.vectordb, queue_manager=self._queue_manager
         )
-        self._vikingdb_manager.acl_manager = AclManager(
-            self._vikingdb_manager,
-            auto_protect_new_content=self._auto_protect_new_content,
-        )
+        self._configure_acl_manager()
 
         # Configure queues if QueueManager is available.
         # Workers are NOT started here — start() is called after VikingFS is initialized
@@ -198,6 +199,20 @@ class OpenVikingService:
 
         # PathLock has been moved to Rust ragfs; Python-layer LockManager is no longer needed.
         set_task_tracker(config.build_task_tracker(self._agfs_client))
+
+    def _configure_acl_manager(self) -> None:
+        """Attach ACL support only when enabled by the server runtime."""
+        if self._vikingdb_manager is None:
+            raise RuntimeError("VikingDBManager not initialized")
+        if self._acl_enabled:
+            self._vikingdb_manager.acl_manager = AclManager(
+                self._vikingdb_manager,
+                auto_protect_new_content=self._auto_protect_new_content,
+            )
+            logger.info("Resource ACL enforcement enabled")
+            return
+        self._vikingdb_manager.acl_manager = None
+        logger.info("Resource ACL enforcement disabled")
 
     def _build_ragfs_binding_config(self) -> Any:
         """Build the single runtime binding config from OpenViking storage + encryption settings."""

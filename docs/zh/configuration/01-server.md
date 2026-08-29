@@ -240,6 +240,7 @@ Search 和 Find 请求的默认 `limit` 为 `10`，可以在每次 API 或 SDK �
     "port": 1933,
     "workers": 1,
     "auth_mode": "dev",
+    "acl_enabled": false,
     "cors_origins": ["http://localhost:5173"],
     "profile_enabled": false,
     "temp_upload": {
@@ -259,6 +260,7 @@ Search 和 Find 请求的默认 `limit` 为 `10`，可以在每次 API 或 SDK �
 | `timeout_keep_alive` | integer（秒） | `5` | 空闲 HTTP keep-alive 超时；应调大到超过上游空闲连接寿命 |
 | `auth_mode` | `dev`、`api_key`、`trusted` / `null` | `null` | 鉴权模式；空值根据 `root_api_key` 自动判断 |
 | `root_api_key` | string / `null` | `null` | Root API Key；配置后默认启用 `api_key` 模式 |
+| `acl_enabled` | boolean | `false` | 是否启用资源 ACL 校验及 ACL 元数据查询；修改后需要重启服务 |
 | `cors_origins` | string[] | `["*"]` | 允许的跨域来源 |
 | `profile_enabled` | boolean | `false` | 是否允许请求返回性能 profile |
 | `with_bot` | boolean | `false` | 是否启用 VikingBot API 代理 |

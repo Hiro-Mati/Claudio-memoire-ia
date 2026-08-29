@@ -325,3 +325,8 @@ async def test_initialize_runtime_state_loads_api_key_manager(monkeypatch):
     assert service._initialized is True
     assert app.state.api_key_manager is not None
     assert app.state.api_key_manager.loaded is True
+
+
+def test_acl_is_disabled_by_default_and_can_be_enabled():
+    assert ServerConfig().acl_enabled is False
+    assert ServerConfig(acl_enabled=True).acl_enabled is True

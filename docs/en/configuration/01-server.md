@@ -240,6 +240,7 @@ This setting controls queue-job concurrency. It is separate from `vlm.media.max_
     "port": 1933,
     "workers": 1,
     "auth_mode": "dev",
+    "acl_enabled": false,
     "cors_origins": ["http://localhost:5173"],
     "profile_enabled": false,
     "temp_upload": {
@@ -259,6 +260,7 @@ This setting controls queue-job concurrency. It is separate from `vlm.media.max_
 | `timeout_keep_alive` | integer (seconds) | `5` | Idle HTTP keep-alive timeout; raise it above the upstream's idle-connection lifetime |
 | `auth_mode` | `dev`, `api_key`, `trusted` / `null` | `null` | Auth mode; null is inferred from `root_api_key` |
 | `root_api_key` | string / `null` | `null` | Root key; setting it defaults auth to `api_key` |
+| `acl_enabled` | boolean | `false` | Enable resource ACL enforcement and ACL metadata lookups; requires a server restart |
 | `cors_origins` | string[] | `["*"]` | Allowed origins |
 | `profile_enabled` | boolean | `false` | Allow performance profiles |
 | `with_bot` | boolean | `false` | Enable the VikingBot API proxy |

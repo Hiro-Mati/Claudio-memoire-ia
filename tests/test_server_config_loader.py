@@ -95,6 +95,14 @@ def test_load_server_config_defaults_timeout_keep_alive(tmp_path):
     assert config.timeout_keep_alive == 5
 
 
+def test_load_server_config_defaults_acl_disabled_and_accepts_opt_in(tmp_path):
+    config_path = tmp_path / "ov.conf"
+    config_path.write_text(json.dumps({"server": {"acl_enabled": True}}))
+
+    assert ServerConfig().acl_enabled is False
+    assert load_server_config(str(config_path)).acl_enabled is True
+
+
 def test_load_server_config_rejects_legacy_queuefs_scope(tmp_path):
     config_path = tmp_path / "ov.conf"
     config_path.write_text(json.dumps({"server": {"queuefs_scope": "process"}}))

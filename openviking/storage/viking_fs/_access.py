@@ -271,7 +271,7 @@ class _AccessMixin:
         self, uri: str, ctx: Optional[RequestContext]
     ) -> RequestContext:
         if self.acl_manager is None:
-            raise RuntimeError("ACL is not initialized")
+            raise FailedPreconditionError("ACL is disabled by server configuration")
         real_ctx = self._ctx_or_default(ctx)
         self._safe_uri_parts(uri)
         acl_ancestors(uri)

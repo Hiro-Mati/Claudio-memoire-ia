@@ -3,7 +3,7 @@
 """Focused tests for core service behavior."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -57,6 +57,35 @@ def test_service_passes_queue_worker_concurrency_to_storage(monkeypatch) -> None
     assert storage_calls[0][1]["max_concurrent_external_parse"] == 9
     assert storage_calls[0][1]["max_concurrent_add_resource"] == 7
     assert storage_calls[0][1]["max_concurrent_session_commit"] == 5
+
+
+def test_acl_is_disabled_by_default() -> None:
+    assert OpenVikingService.__init__.__kwdefaults__["acl_enabled"] is False
+
+    service = OpenVikingService.__new__(OpenVikingService)
+    service._acl_enabled = False
+    service._vikingdb_manager = SimpleNamespace(acl_manager=Mock())
+
+    service._configure_acl_manager()
+
+    assert service._vikingdb_manager.acl_manager is None
+
+
+def test_acl_can_be_enabled_explicitly() -> None:
+    service = OpenVikingService.__new__(OpenVikingService)
+    service._acl_enabled = True
+    service._vikingdb_manager = SimpleNamespace(acl_manager=None)
+    service._auto_protect_new_content = AsyncMock()
+    acl_manager = Mock()
+
+    with patch("openviking.service.core.AclManager", return_value=acl_manager) as factory:
+        service._configure_acl_manager()
+
+    assert service._vikingdb_manager.acl_manager is acl_manager
+    factory.assert_called_once_with(
+        service._vikingdb_manager,
+        auto_protect_new_content=service._auto_protect_new_content,
+    )
 
 
 def _service_with_fs(stat_result: dict) -> tuple[OpenVikingService, AsyncMock]:

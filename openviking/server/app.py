@@ -300,7 +300,7 @@ def create_app(
         nonlocal service
         owns_service = service is None
         if owns_service:
-            service = OpenVikingService()
+            service = OpenVikingService(acl_enabled=config.acl_enabled)
 
         assert service is not None
         _configure_session_runtime(service)

@@ -191,7 +191,9 @@ async def service(temp_dir: Path, monkeypatch):
     fake_embedder_cls = _install_fake_embedder(monkeypatch)
     _install_fake_vlm(monkeypatch)
     svc = OpenVikingService(
-        path=str(temp_dir / "data"), user=UserIdentifier.the_default_user("test_user")
+        path=str(temp_dir / "data"),
+        user=UserIdentifier.the_default_user("test_user"),
+        acl_enabled=True,
     )
     await svc.initialize()
     svc.viking_fs.query_embedder = fake_embedder_cls()
@@ -260,7 +262,9 @@ async def running_server(temp_dir: Path, monkeypatch):
     monkeypatch.setattr("openviking.server.mcp_endpoint.mcp_lifespan", _noop_mcp_lifespan)
 
     svc = OpenVikingService(
-        path=str(temp_dir / "sdk_data"), user=UserIdentifier.the_default_user("sdk_test_user")
+        path=str(temp_dir / "sdk_data"),
+        user=UserIdentifier.the_default_user("sdk_test_user"),
+        acl_enabled=True,
     )
     await svc.initialize()
     svc.viking_fs.query_embedder = fake_embedder_cls()

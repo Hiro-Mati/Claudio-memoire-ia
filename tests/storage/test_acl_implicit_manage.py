@@ -2,8 +2,12 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Unit tests for implicit ACL MANAGE short-circuit by role."""
 
+import pytest
+
 from openviking.server.identity import RequestContext, Role
 from openviking.storage.acl import has_implicit_manage
+from openviking.storage.viking_fs import VikingFS
+from openviking_cli.exceptions import FailedPreconditionError
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -30,3 +34,14 @@ def test_no_implicit_manage_on_non_acl_uri_even_for_root():
     # MANAGE short-circuit never applies regardless of role.
     assert has_implicit_manage(_ctx(Role.ROOT), NON_ACL_URI) is False
     assert has_implicit_manage(_ctx(Role.ADMIN), NON_ACL_URI) is False
+
+
+@pytest.mark.asyncio
+async def test_acl_management_fails_fast_when_acl_is_disabled():
+    fs = VikingFS(agfs=object(), acl_manager=None)
+
+    with pytest.raises(
+        FailedPreconditionError,
+        match="ACL is disabled by server configuration",
+    ):
+        await fs.get_acl(ACL_URI, ctx=_ctx(Role.ROOT))

@@ -339,6 +339,9 @@ class ServerConfig(BaseModel):
     timeout_keep_alive: int = 5
     auth_mode: Optional[str] = None  # If None, auto-detect based on root_api_key
     root_api_key: Optional[str] = None
+    # Global ACL switch. Disabled by default so ordinary filesystem and vector
+    # operations avoid ACL metadata lookups unless an operator opts in.
+    acl_enabled: bool = False
     # OIDC/LDAP authentication configuration
     oidc: Optional[OIDCConfig] = None
     ldap: Optional[LDAPConfig] = None
