@@ -145,11 +145,25 @@ class _OpsMixin:
         """
         from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
 
+        # [TEMP-INSTRUMENTATION: do not commit] per-stage timing for rm().
+        import time as _time
+
+        _t0 = _time.perf_counter()
+        _timings: Dict[str, float] = {}
+
+        def _mark(_name: str, _start: float) -> float:
+            _now = _time.perf_counter()
+            _timings[_name] = (_now - _start) * 1000.0
+            return _now
+
+        _t = _t0
         guard_ctx = replace(self._ctx_or_default(ctx), bypass_acl=True)
         await self._ensure_access(uri, guard_ctx, action=AclAction.MANAGE)
         await self._ensure_access(uri, ctx, action=AclAction.WRITE)
+        _t = _mark("ensure_access", _t)
         path = self._uri_to_path(uri, ctx=ctx)
         target_uri = self._path_to_uri(path, ctx=ctx)
+        _t = _mark("uri_map", _t)
 
         async def _estimate_deleted_count(target_path: str, real_ctx: RequestContext) -> int:
             """Estimate number of nodes to be deleted using vector index."""
@@ -174,16 +188,22 @@ class _OpsMixin:
                 if mapped is not None:
                     raise mapped from exc
                 raise
+            _t = _mark("stat_notfound", _t)
             if recursive:
                 await self._ensure_access(target_uri, ctx, action=AclAction.MANAGE)
             # Path does not exist: clean up any orphan index records and return
             uris_to_delete = await self._collect_uris(path, recursive, ctx=ctx)
+            _t = _mark("collect_uris", _t)
             uris_to_delete.append(target_uri)
             real_ctx = self._ctx_or_default(ctx)
             estimated_count = await _estimate_deleted_count(path, real_ctx)
+            _t = _mark("count", _t)
             await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
+            _t = _mark("vector_delete", _t)
             logger.info(f"[VikingFS] rm target not found, cleaned orphan index: {uri}")
+            self._log_rm_timings(uri, _timings, _t0, uris=len(uris_to_delete), branch="notfound")
             return {"estimated_deleted_count": estimated_count}
+        _t = _mark("stat", _t)
 
         if is_dir:
             await self._ensure_access(target_uri, ctx, action=AclAction.MANAGE)
@@ -207,7 +227,9 @@ class _OpsMixin:
                 lease = await lock_method(path)
             except LockAcquisitionError:
                 raise ResourceBusyError(f"Resource is being processed: {uri}", uri=uri)
+        _t = _mark("lock_acquire", _t)
 
+        _uris_count = 0
         try:
             uris_to_delete = (
                 await self._collect_uris(
@@ -220,11 +242,16 @@ class _OpsMixin:
                 else []
             )
             uris_to_delete.append(target_uri)
+            _uris_count = len(uris_to_delete)
+            _t = _mark("collect_uris", _t)
             if is_dir:
                 await self._ensure_access_many(uris_to_delete, ctx, action=AclAction.MANAGE)
+            _t = _mark("ensure_access_many", _t)
             real_ctx = self._ctx_or_default(ctx)
             estimated_count = await _estimate_deleted_count(path, real_ctx)
+            _t = _mark("count", _t)
             await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
+            _t = _mark("vector_delete", _t)
             try:
                 result = await self._async_agfs.rm(
                     path,
@@ -243,6 +270,7 @@ class _OpsMixin:
                         f"Directory not empty: {uri}. Use recursive=True to delete non-empty directories."
                     )
                 raise
+            _t = _mark("agfs_rm", _t)
             # Add estimated_deleted_count to the result
             if isinstance(result, dict):
                 result["estimated_deleted_count"] = estimated_count
@@ -252,6 +280,31 @@ class _OpsMixin:
         finally:
             if lease_ref is None and lease is not None:
                 await self._async_agfs.pathlock_release(lease)
+                _t = _mark("lock_release", _t)
+            self._log_rm_timings(uri, _timings, _t0, uris=_uris_count, branch="normal")
+
+    def _log_rm_timings(
+        self,
+        uri: str,
+        timings: Dict[str, float],
+        t0: float,
+        *,
+        uris: int,
+        branch: str,
+    ) -> None:
+        """[TEMP-INSTRUMENTATION: do not commit] one-line per-stage timing dump for rm()."""
+        import time as _time
+
+        total_ms = (_time.perf_counter() - t0) * 1000.0
+        stages = " ".join(f"{name}={ms:.1f}ms" for name, ms in timings.items())
+        logger.info(
+            "[VikingFS][rm-timing] uri=%s branch=%s uris=%d total=%.1fms | %s",
+            uri,
+            branch,
+            uris,
+            total_ms,
+            stages,
+        )
 
     async def mv(
         self,
