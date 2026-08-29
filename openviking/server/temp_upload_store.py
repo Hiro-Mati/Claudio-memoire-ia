@@ -329,7 +329,7 @@ class TempUploadStore:
             return temp_file_id
         except Exception:
             with suppress(Exception):
-                await vfs.rm(
+                await vfs.remove_files(
                     f"{_SHARED_UPLOAD_ROOT}/{bucket}/{leaf}",
                     recursive=True,
                     ctx=internal_ctx,
@@ -723,11 +723,14 @@ class TempUploadStore:
 
         Returns True on success, False on failure (logged as a warning). Uses
         ``auto_pathlock=False`` since shared uploads are never concurrently
-        mutated and cleanup is best-effort.
+        mutated and cleanup is best-effort. Deletes AGFS storage only via
+        ``remove_files`` because raw temporary uploads have no vector records.
         """
         started_at = time.monotonic()
         try:
-            await vfs.rm(uri, recursive=True, ctx=internal_ctx, auto_pathlock=False)
+            await vfs.remove_files(
+                uri, recursive=True, ctx=internal_ctx, auto_pathlock=False
+            )
         except Exception:
             logger.warning(
                 "[TempUpload] cleanup remove failed kind=%s uri=%s elapsed_ms=%.1f",

@@ -3,6 +3,10 @@
 """Core filesystem operations mixin for VikingFS."""
 
 import asyncio
+import contextvars
+import functools
+import inspect
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
@@ -36,11 +40,103 @@ from openviking_cli.exceptions import (
 from openviking_cli.utils.uri import VikingURI
 
 
+# [TEMP-INSTRUMENTATION: do not merge] Per-operation stage timings used while
+# diagnosing remote storage latency.  Keeping the mechanics in one place makes
+# the temporary instrumentation easy to remove after the investigation.
+class _OperationTiming:
+    def __init__(self, operation: str, uri: str) -> None:
+        self.operation = operation
+        self.uri = uri
+        self.started_at = time.perf_counter()
+        self.stages: Dict[str, float] = {}
+        self.details: Dict[str, Any] = {}
+
+    def add(self, stage: str, elapsed_ms: float) -> None:
+        self.stages[stage] = self.stages.get(stage, 0.0) + elapsed_ms
+
+    def detail(self, name: str, value: Any) -> None:
+        self.details[name] = value
+
+
+_operation_timing: contextvars.ContextVar[Optional[_OperationTiming]] = contextvars.ContextVar(
+    "vikingfs_operation_timing", default=None
+)
+
+
+async def _timed_stage(stage: str, awaitable: Any) -> Any:
+    timing = _operation_timing.get()
+    started_at = time.perf_counter()
+    try:
+        return await awaitable
+    finally:
+        if timing is not None:
+            timing.add(stage, (time.perf_counter() - started_at) * 1000.0)
+
+
+def _timing_detail(name: str, value: Any) -> None:
+    timing = _operation_timing.get()
+    if timing is not None:
+        timing.detail(name, value)
+
+
+def _timed_operation(func):
+    signature = inspect.signature(func)
+
+    @functools.wraps(func)
+    async def wrapper(self, *args, **kwargs):
+        bound_arguments = signature.bind_partial(self, *args, **kwargs)
+        bound_arguments.apply_defaults()
+        bound = bound_arguments.arguments
+        source = next(
+            (
+                bound[name]
+                for name in ("uri", "temp_uri", "old_uri", "from_uri", "uris")
+                if name in bound
+            ),
+            "-",
+        )
+        uri = f"items={len(source)}" if isinstance(source, list) else str(source)
+        destination = next(
+            (bound[name] for name in ("new_uri", "to_uri", "target_uri") if name in bound),
+            None,
+        )
+        if destination is not None:
+            uri = f"{uri}->{destination}"
+        timing = _OperationTiming(func.__name__, uri)
+        token = _operation_timing.set(timing)
+        status = "ok"
+        try:
+            return await func(self, *args, **kwargs)
+        except BaseException:
+            status = "error"
+            raise
+        finally:
+            _operation_timing.reset(token)
+            total_ms = (time.perf_counter() - timing.started_at) * 1000.0
+            details = " ".join(f"{name}={value}" for name, value in timing.details.items())
+            stages = " ".join(
+                f"{name}={elapsed_ms:.1f}ms"
+                for name, elapsed_ms in timing.stages.items()
+            )
+            logger.info(
+                "[VikingFS][%s-timing] uri=%s status=%s %s total=%.1fms | %s",
+                timing.operation,
+                timing.uri,
+                status,
+                details,
+                total_ms,
+                stages,
+            )
+
+    return wrapper
+
+
 class _OpsMixin:
     """Core filesystem operations (read/write/mkdir/rm/mv/stat/glob/tree/ls/temp)."""
 
     # ========== AGFS Basic Commands ==========
 
+    @_timed_operation
     async def read(
         self,
         uri: str,
@@ -49,7 +145,7 @@ class _OpsMixin:
         ctx: Optional[RequestContext] = None,
     ) -> bytes:
         """Read file"""
-        await self._ensure_access(uri, ctx)
+        await _timed_stage("ensure_access", self._ensure_access(uri, ctx))
         real_ctx = self._ctx_or_default(ctx)
         primary_path = self._uri_to_path(uri, ctx=ctx)
 
@@ -58,10 +154,13 @@ class _OpsMixin:
         # offset/size through and let the Rust layer return the requested slice.
         last_not_found: Optional[Exception] = None
         for path in self._read_paths(uri, ctx=ctx):
-            if not await self._read_path_visible(uri, path, primary_path, real_ctx):
+            if not await _timed_stage(
+                "visibility_check",
+                self._read_path_visible(uri, path, primary_path, real_ctx),
+            ):
                 continue
             try:
-                result = await self._async_agfs.read(path, offset, size)
+                result = await _timed_stage("agfs_read", self._async_agfs.read(path, offset, size))
                 break
             except Exception as exc:
                 if is_not_found_error(exc):
@@ -79,6 +178,7 @@ class _OpsMixin:
 
         return raw
 
+    @_timed_operation
     async def write(
         self,
         uri: str,
@@ -86,14 +186,17 @@ class _OpsMixin:
         ctx: Optional[RequestContext] = None,
     ) -> str:
         """Write file"""
-        await self._ensure_access(uri, ctx, action=AclAction.WRITE)
+        await _timed_stage(
+            "ensure_access", self._ensure_access(uri, ctx, action=AclAction.WRITE)
+        )
         path = self._uri_to_path(uri, ctx=ctx)
         if isinstance(data, str):
             data = data.encode("utf-8")
 
         # Encryption (when configured) happens inside the ragfs layer keyed by account_id.
-        return await self._async_agfs.write(path, data)
+        return await _timed_stage("agfs_write", self._async_agfs.write(path, data))
 
+    @_timed_operation
     async def mkdir(
         self,
         uri: str,
@@ -103,12 +206,22 @@ class _OpsMixin:
         lease_ref: Dict[str, Any] | None = None,
     ) -> None:
         """Create directory."""
-        await self._ensure_access(uri, ctx, action=AclAction.WRITE)
+        await _timed_stage(
+            "ensure_access", self._ensure_access(uri, ctx, action=AclAction.WRITE)
+        )
         path = self._uri_to_path(uri, ctx=ctx)
         # Always ensure parent directories exist before creating this directory
-        await self._ensure_parent_dirs(path, ctx=ctx, lease_ref=lease_ref)
+        await _timed_stage(
+            "ensure_parent_dirs",
+            self._ensure_parent_dirs(path, ctx=ctx, lease_ref=lease_ref),
+        )
         try:
-            await self._async_agfs.mkdir(path, fs_ctx=self._pathlock_fs_ctx(ctx, lease_ref))
+            await _timed_stage(
+                "agfs_mkdir",
+                self._async_agfs.mkdir(
+                    path, fs_ctx=self._pathlock_fs_ctx(ctx, lease_ref)
+                ),
+            )
         except Exception as exc:
             message = str(exc).lower()
             already_exists = "exist" in message or "already" in message
@@ -116,6 +229,7 @@ class _OpsMixin:
                 return
             raise
 
+    @_timed_operation
     async def rm(
         self,
         uri: str,
@@ -145,25 +259,15 @@ class _OpsMixin:
         """
         from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
 
-        # [TEMP-INSTRUMENTATION: do not commit] per-stage timing for rm().
-        import time as _time
-
-        _t0 = _time.perf_counter()
-        _timings: Dict[str, float] = {}
-
-        def _mark(_name: str, _start: float) -> float:
-            _now = _time.perf_counter()
-            _timings[_name] = (_now - _start) * 1000.0
-            return _now
-
-        _t = _t0
         guard_ctx = replace(self._ctx_or_default(ctx), bypass_acl=True)
-        await self._ensure_access(uri, guard_ctx, action=AclAction.MANAGE)
-        await self._ensure_access(uri, ctx, action=AclAction.WRITE)
-        _t = _mark("ensure_access", _t)
+        await _timed_stage(
+            "ensure_access", self._ensure_access(uri, guard_ctx, action=AclAction.MANAGE)
+        )
+        await _timed_stage(
+            "ensure_access", self._ensure_access(uri, ctx, action=AclAction.WRITE)
+        )
         path = self._uri_to_path(uri, ctx=ctx)
         target_uri = self._path_to_uri(path, ctx=ctx)
-        _t = _mark("uri_map", _t)
 
         async def _estimate_deleted_count(target_path: str, real_ctx: RequestContext) -> int:
             """Estimate number of nodes to be deleted using vector index."""
@@ -173,14 +277,16 @@ class _OpsMixin:
             try:
                 target_canonical_uri = self._path_to_uri(target_path, ctx=real_ctx)
                 filter_expr = PathScope("uri", target_canonical_uri, depth=-1)
-                return await vector_store.count(filter=filter_expr, ctx=real_ctx)
+                return await _timed_stage(
+                    "vector_count", vector_store.count(filter=filter_expr, ctx=real_ctx)
+                )
             except Exception as e:
                 logger.warning(f"[VikingFS] Failed to count nodes before delete: {e}")
                 return 0
 
         # Check existence and determine lock strategy
         try:
-            stat = await self._async_agfs.stat(path)
+            stat = await _timed_stage("agfs_stat", self._async_agfs.stat(path))
             is_dir = stat.get("isDir", False) if isinstance(stat, dict) else False
         except Exception as exc:
             if not is_not_found_error(exc):
@@ -188,25 +294,31 @@ class _OpsMixin:
                 if mapped is not None:
                     raise mapped from exc
                 raise
-            _t = _mark("stat_notfound", _t)
             if recursive:
-                await self._ensure_access(target_uri, ctx, action=AclAction.MANAGE)
+                await _timed_stage(
+                    "ensure_access",
+                    self._ensure_access(target_uri, ctx, action=AclAction.MANAGE),
+                )
             # Path does not exist: clean up any orphan index records and return
-            uris_to_delete = await self._collect_uris(path, recursive, ctx=ctx)
-            _t = _mark("collect_uris", _t)
+            uris_to_delete = await _timed_stage(
+                "collect_uris", self._collect_uris(path, recursive, ctx=ctx)
+            )
             uris_to_delete.append(target_uri)
+            _timing_detail("branch", "notfound")
+            _timing_detail("uris", len(uris_to_delete))
             real_ctx = self._ctx_or_default(ctx)
             estimated_count = await _estimate_deleted_count(path, real_ctx)
-            _t = _mark("count", _t)
-            await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
-            _t = _mark("vector_delete", _t)
+            await _timed_stage(
+                "vector_delete", self._delete_from_vector_store(uris_to_delete, ctx=ctx)
+            )
             logger.info(f"[VikingFS] rm target not found, cleaned orphan index: {uri}")
-            self._log_rm_timings(uri, _timings, _t0, uris=len(uris_to_delete), branch="notfound")
             return {"estimated_deleted_count": estimated_count}
-        _t = _mark("stat", _t)
 
         if is_dir:
-            await self._ensure_access(target_uri, ctx, action=AclAction.MANAGE)
+            await _timed_stage(
+                "ensure_access",
+                self._ensure_access(target_uri, ctx, action=AclAction.MANAGE),
+            )
             if not recursive:
                 raise FailedPreconditionError(
                     f"Cannot remove directory without --recursive: {uri}",
@@ -224,40 +336,45 @@ class _OpsMixin:
         lease = lease_ref
         if lease is None and not skip_lock:
             try:
-                lease = await lock_method(path)
+                lease = await _timed_stage("lock_acquire", lock_method(path))
             except LockAcquisitionError:
                 raise ResourceBusyError(f"Resource is being processed: {uri}", uri=uri)
-        _t = _mark("lock_acquire", _t)
-
-        _uris_count = 0
         try:
             uris_to_delete = (
-                await self._collect_uris(
-                    path,
-                    recursive,
-                    ctx=ctx,
-                    strict=is_dir and self.acl_manager is not None,
+                await _timed_stage(
+                    "collect_uris",
+                    self._collect_uris(
+                        path,
+                        recursive,
+                        ctx=ctx,
+                        strict=is_dir and self.acl_manager is not None,
+                    ),
                 )
                 if is_dir
                 else []
             )
             uris_to_delete.append(target_uri)
-            _uris_count = len(uris_to_delete)
-            _t = _mark("collect_uris", _t)
+            _timing_detail("branch", "normal")
+            _timing_detail("uris", len(uris_to_delete))
             if is_dir:
-                await self._ensure_access_many(uris_to_delete, ctx, action=AclAction.MANAGE)
-            _t = _mark("ensure_access_many", _t)
+                await _timed_stage(
+                    "ensure_access_many",
+                    self._ensure_access_many(uris_to_delete, ctx, action=AclAction.MANAGE),
+                )
             real_ctx = self._ctx_or_default(ctx)
             estimated_count = await _estimate_deleted_count(path, real_ctx)
-            _t = _mark("count", _t)
-            await self._delete_from_vector_store(uris_to_delete, ctx=ctx)
-            _t = _mark("vector_delete", _t)
+            await _timed_stage(
+                "vector_delete", self._delete_from_vector_store(uris_to_delete, ctx=ctx)
+            )
             try:
-                result = await self._async_agfs.rm(
-                    path,
-                    recursive=recursive,
-                    fs_ctx=self._pathlock_fs_ctx(ctx, lease),
-                    auto_pathlock=auto_pathlock,
+                result = await _timed_stage(
+                    "agfs_rm",
+                    self._async_agfs.rm(
+                        path,
+                        recursive=recursive,
+                        fs_ctx=self._pathlock_fs_ctx(ctx, lease),
+                        auto_pathlock=auto_pathlock,
+                    ),
                 )
             except AGFSDirectoryNotEmptyError:
                 raise FailedPreconditionError(
@@ -270,7 +387,6 @@ class _OpsMixin:
                         f"Directory not empty: {uri}. Use recursive=True to delete non-empty directories."
                     )
                 raise
-            _t = _mark("agfs_rm", _t)
             # Add estimated_deleted_count to the result
             if isinstance(result, dict):
                 result["estimated_deleted_count"] = estimated_count
@@ -279,33 +395,32 @@ class _OpsMixin:
             return result
         finally:
             if lease_ref is None and lease is not None:
-                await self._async_agfs.pathlock_release(lease)
-                _t = _mark("lock_release", _t)
-            self._log_rm_timings(uri, _timings, _t0, uris=_uris_count, branch="normal")
+                await _timed_stage(
+                    "lock_release", self._async_agfs.pathlock_release(lease)
+                )
 
-    def _log_rm_timings(
+    @_timed_operation
+    async def remove_files(
         self,
         uri: str,
-        timings: Dict[str, float],
-        t0: float,
-        *,
-        uris: int,
-        branch: str,
-    ) -> None:
-        """[TEMP-INSTRUMENTATION: do not commit] one-line per-stage timing dump for rm()."""
-        import time as _time
-
-        total_ms = (_time.perf_counter() - t0) * 1000.0
-        stages = " ".join(f"{name}={ms:.1f}ms" for name, ms in timings.items())
-        logger.info(
-            "[VikingFS][rm-timing] uri=%s branch=%s uris=%d total=%.1fms | %s",
-            uri,
-            branch,
-            uris,
-            total_ms,
-            stages,
+        recursive: bool = False,
+        ctx: Optional[RequestContext] = None,
+        lease_ref: Dict[str, Any] | None = None,
+        auto_pathlock: bool = True,
+    ) -> Dict[str, Any]:
+        """Delete raw AGFS files without ACL or vector-index operations."""
+        path = self._uri_to_path(uri, ctx=ctx)
+        return await _timed_stage(
+            "agfs_rm",
+            self._async_agfs.rm(
+                path,
+                recursive=recursive,
+                fs_ctx=self._pathlock_fs_ctx(ctx, lease_ref),
+                auto_pathlock=auto_pathlock,
+            ),
         )
 
+    @_timed_operation
     async def mv(
         self,
         old_uri: str,
@@ -321,9 +436,15 @@ class _OpsMixin:
 
         acl_manager = self.acl_manager
         guard_ctx = replace(self._ctx_or_default(ctx), bypass_acl=True)
-        await self._ensure_access(old_uri, guard_ctx, action=AclAction.MANAGE)
-        await self._ensure_access(old_uri, ctx, action=AclAction.WRITE)
-        await self._ensure_access(new_uri, ctx, action=AclAction.WRITE)
+        await _timed_stage(
+            "ensure_access", self._ensure_access(old_uri, guard_ctx, action=AclAction.MANAGE)
+        )
+        await _timed_stage(
+            "ensure_access", self._ensure_access(old_uri, ctx, action=AclAction.WRITE)
+        )
+        await _timed_stage(
+            "ensure_access", self._ensure_access(new_uri, ctx, action=AclAction.WRITE)
+        )
         old_path = self._uri_to_path(old_uri, ctx=ctx)
         new_path = self._uri_to_path(new_uri, ctx=ctx)
         target_uri = self._path_to_uri(old_path, ctx=ctx)
@@ -331,7 +452,7 @@ class _OpsMixin:
 
         # Verify source exists and determine type before locking.
         try:
-            stat = await self._async_agfs.stat(old_path)
+            stat = await _timed_stage("agfs_stat", self._async_agfs.stat(old_path))
             is_dir = stat.get("isDir", False) if isinstance(stat, dict) else False
         except Exception as exc:
             if not is_not_found_error(exc):
@@ -342,7 +463,9 @@ class _OpsMixin:
             raise FileNotFoundError(f"mv source not found: {old_uri}") from exc
 
         if is_dir:
-            await self._ensure_access(old_uri, ctx, action=AclAction.MANAGE)
+            await _timed_stage(
+                "ensure_access", self._ensure_access(old_uri, ctx, action=AclAction.MANAGE)
+            )
 
         if not is_dir:
             if new_uri.rstrip("/") != new_uri:
@@ -351,7 +474,9 @@ class _OpsMixin:
                     details={"from_uri": old_uri, "to_uri": new_uri},
                 )
             try:
-                destination_stat = await self._async_agfs.stat(new_path)
+                destination_stat = await _timed_stage(
+                    "agfs_stat_destination", self._async_agfs.stat(new_path)
+                )
             except Exception as exc:
                 if not is_not_found_error(exc):
                     mapped = map_exception(exc, resource=new_uri)
@@ -366,51 +491,66 @@ class _OpsMixin:
                     )
 
         if is_dir:
-            lease = await self._async_agfs.pathlock_acquire_batch(
-                [
-                    {"path": old_path, "kind": "tree"},
-                    {"path": new_path, "kind": "exact"},
-                ],
-                owner_lease_ref=lease_ref,
+            lease = await _timed_stage(
+                "lock_acquire",
+                self._async_agfs.pathlock_acquire_batch(
+                    [
+                        {"path": old_path, "kind": "tree"},
+                        {"path": new_path, "kind": "exact"},
+                    ],
+                    owner_lease_ref=lease_ref,
+                ),
             )
         else:
-            lease = await self._async_agfs.pathlock_acquire_batch(
-                [
-                    {"path": old_path, "kind": "exact"},
-                    {"path": new_path, "kind": "exact"},
-                ],
-                owner_lease_ref=lease_ref,
+            lease = await _timed_stage(
+                "lock_acquire",
+                self._async_agfs.pathlock_acquire_batch(
+                    [
+                        {"path": old_path, "kind": "exact"},
+                        {"path": new_path, "kind": "exact"},
+                    ],
+                    owner_lease_ref=lease_ref,
+                ),
             )
 
         try:
             uris_to_move = (
-                await self._collect_uris(
-                    old_path,
-                    recursive=True,
-                    ctx=ctx,
-                    strict=is_dir and acl_manager is not None,
+                await _timed_stage(
+                    "collect_uris",
+                    self._collect_uris(
+                        old_path,
+                        recursive=True,
+                        ctx=ctx,
+                        strict=is_dir and acl_manager is not None,
+                    ),
                 )
                 if is_dir
                 else []
             )
             uris_to_move.append(target_uri)
             if is_dir:
-                await self._ensure_access_many(uris_to_move, ctx, action=AclAction.MANAGE)
+                await _timed_stage(
+                    "ensure_access_many",
+                    self._ensure_access_many(uris_to_move, ctx, action=AclAction.MANAGE),
+                )
 
             # Check if it's temp directory (files already encrypted)
             is_temp = old_uri.startswith("viking://temp/")
 
             # Copy source to destination. Source must stay intact until vector updates succeed.
             try:
-                await self._copy_for_mv(
-                    old_uri=old_uri,
-                    new_uri=new_uri,
-                    old_path=old_path,
-                    new_path=new_path,
-                    is_dir=is_dir,
-                    is_temp=is_temp,
-                    ctx=ctx,
-                    lease_ref=lease,
+                await _timed_stage(
+                    "copy",
+                    self._copy_for_mv(
+                        old_uri=old_uri,
+                        new_uri=new_uri,
+                        old_path=old_path,
+                        new_path=new_path,
+                        is_dir=is_dir,
+                        is_temp=is_temp,
+                        ctx=ctx,
+                        lease_ref=lease,
+                    ),
                 )
             except Exception as e:
                 if "not found" in str(e).lower():
@@ -428,13 +568,19 @@ class _OpsMixin:
             # Update VectorDB URIs (on failure, clean up the copy)
             vector_mappings: List[tuple[str, str]] = []
             try:
-                vector_mappings = await self._update_vector_store_uris(
-                    uris_to_move, old_uri, new_uri, ctx=ctx
+                vector_mappings = await _timed_stage(
+                    "vector_update",
+                    self._update_vector_store_uris(
+                        uris_to_move, old_uri, new_uri, ctx=ctx
+                    ),
                 )
                 if acl_manager and new_acl_scope:
-                    await acl_manager.refresh_context_subtree(
-                        new_uri,
-                        self._ctx_or_default(ctx),
+                    await _timed_stage(
+                        "acl_refresh",
+                        acl_manager.refresh_context_subtree(
+                            new_uri,
+                            self._ctx_or_default(ctx),
+                        ),
                     )
             except Exception:
                 if vector_mappings:
@@ -463,14 +609,17 @@ class _OpsMixin:
                 raise
 
             # Delete source
-            await self._async_agfs.rm(
-                old_path,
-                recursive=is_dir,
-                fs_ctx=self._pathlock_fs_ctx(ctx, lease),
+            await _timed_stage(
+                "agfs_rm",
+                self._async_agfs.rm(
+                    old_path,
+                    recursive=is_dir,
+                    fs_ctx=self._pathlock_fs_ctx(ctx, lease),
+                ),
             )
             return {}
         finally:
-            await self._async_agfs.pathlock_release(lease)
+            await _timed_stage("lock_release", self._async_agfs.pathlock_release(lease))
 
     async def _copy_for_mv(
         self,
@@ -612,6 +761,7 @@ class _OpsMixin:
         finally:
             await self._async_agfs.pathlock_release(child_lease)
 
+    @_timed_operation
     async def stat(
         self, uri: str, ctx: Optional[RequestContext] = None, skip_count: bool = False
     ) -> Dict[str, Any]:
@@ -636,16 +786,21 @@ class _OpsMixin:
                 Use this when the count field is not needed (e.g. in grep) to avoid
                 an extra VikingDB API call.
         """
-        await self._ensure_access(uri, ctx)
+        await _timed_stage("ensure_access", self._ensure_access(uri, ctx))
         real_ctx = self._ctx_or_default(ctx)
         primary_path = self._uri_to_path(uri, ctx=ctx)
         path = primary_path
         last_not_found: Optional[Exception] = None
         for candidate_path in self._read_paths(uri, ctx=ctx):
-            if not await self._read_path_visible(uri, candidate_path, primary_path, real_ctx):
+            if not await _timed_stage(
+                "visibility_check",
+                self._read_path_visible(uri, candidate_path, primary_path, real_ctx),
+            ):
                 continue
             try:
-                result = await self._async_agfs.stat(candidate_path)
+                result = await _timed_stage(
+                    "agfs_stat", self._async_agfs.stat(candidate_path)
+                )
                 path = candidate_path
                 break
             except Exception as exc:
@@ -666,7 +821,9 @@ class _OpsMixin:
                 }
             raise NotFoundError(uri, "file") from last_not_found
         if isinstance(result, dict):
-            result["isLocked"] = await self._is_path_locked_async(path)
+            result["isLocked"] = await _timed_stage(
+                "pathlock_check", self._is_path_locked_async(path)
+            )
             # Add count for directories if vector store available
             if not skip_count and result.get("isDir", False):
                 try:
@@ -674,14 +831,18 @@ class _OpsMixin:
                     if vector_store:
                         if not may_include_hidden_actor_peers(uri, real_ctx):
                             filter_expr = PathScope("uri", uri, depth=-1)
-                            result["count"] = await vector_store.count(
-                                filter=filter_expr,
-                                ctx=real_ctx,
+                            result["count"] = await _timed_stage(
+                                "vector_count",
+                                vector_store.count(
+                                    filter=filter_expr,
+                                    ctx=real_ctx,
+                                ),
                             )
                 except Exception as e:
                     logger.warning(f"[VikingFS] Failed to count nodes for directory stat: {e}")
         return result
 
+    @_timed_operation
     async def exists(self, uri: str, ctx: Optional[RequestContext] = None) -> bool:
         """Check whether a URI is physically present in the caller's namespace.
 
@@ -697,12 +858,18 @@ class _OpsMixin:
 
         primary_path = self._uri_to_path(uri, ctx=ctx)
         for candidate_path in self._read_paths(uri, ctx=ctx):
-            if not await self._read_path_visible(uri, candidate_path, primary_path, real_ctx):
+            if not await _timed_stage(
+                "visibility_check",
+                self._read_path_visible(uri, candidate_path, primary_path, real_ctx),
+            ):
                 continue
-            if await self._agfs_path_exists(candidate_path):
+            if await _timed_stage(
+                "agfs_exists", self._agfs_path_exists(candidate_path)
+            ):
                 return True
         return self._is_session_root_uri(uri)
 
+    @_timed_operation
     async def glob(
         self,
         pattern: str,
@@ -712,14 +879,19 @@ class _OpsMixin:
     ) -> Dict:
         """File pattern matching, supports **/*.md recursive."""
         _ensure_non_empty_search_query(pattern)
-        await self._ensure_access(uri, ctx)
+        await _timed_stage("ensure_access", self._ensure_access(uri, ctx))
         real_ctx = self._ctx_or_default(ctx)
         primary_path = self._uri_to_path(uri, ctx=ctx)
         path: Optional[str] = None
         for candidate_path in self._read_paths(uri, ctx=ctx):
-            if not await self._read_path_visible(uri, candidate_path, primary_path, real_ctx):
+            if not await _timed_stage(
+                "visibility_check",
+                self._read_path_visible(uri, candidate_path, primary_path, real_ctx),
+            ):
                 continue
-            if await self._agfs_path_exists(candidate_path):
+            if await _timed_stage(
+                "agfs_exists", self._agfs_path_exists(candidate_path)
+            ):
                 path = candidate_path
                 break
         if path is None:
@@ -731,13 +903,16 @@ class _OpsMixin:
         continuation_token: Optional[str] = None
         matches = []
         while True:
-            page = await self._async_agfs.glob_directory(
-                path,
-                pattern,
-                show_hidden=False,
-                page_size=page_size,
-                level_limit=None,
-                continuation_token=continuation_token,
+            page = await _timed_stage(
+                "agfs_glob",
+                self._async_agfs.glob_directory(
+                    path,
+                    pattern,
+                    show_hidden=False,
+                    page_size=page_size,
+                    level_limit=None,
+                    continuation_token=continuation_token,
+                ),
             )
 
             page_matches: List[str] = []
@@ -749,7 +924,10 @@ class _OpsMixin:
                     real_ctx,
                 ):
                     continue
-                if not await self._read_path_visible(uri, entry["path"], primary_path, real_ctx):
+                if not await _timed_stage(
+                    "visibility_check",
+                    self._read_path_visible(uri, entry["path"], primary_path, real_ctx),
+                ):
                     continue
                 entry_uri = self._alias_uri_for_path(
                     request_uri=uri,
@@ -766,7 +944,9 @@ class _OpsMixin:
                 page_matches.append(entry_uri)
 
             if self.acl_manager is not None:
-                access = await self._can_access_many(page_matches, real_ctx)
+                access = await _timed_stage(
+                    "ensure_access_many", self._can_access_many(page_matches, real_ctx)
+                )
                 for entry_uri in page_matches:
                     if not access.get(entry_uri, False):
                         continue
@@ -836,6 +1016,7 @@ class _OpsMixin:
                 abstract = abstract[: abs_limit - 3] + "..."
             entries[index]["abstract"] = abstract
 
+    @_timed_operation
     async def tree(
         self,
         uri: str = "viking://",
@@ -863,12 +1044,18 @@ class _OpsMixin:
         output="agent"
         [{'uri': 'viking://resources...', 'size': 100, 'isDir': False, 'modTime': '2026-02-11T08:52:16.256Z', 'rel_path': '.abstract.md', 'abstract': "..."}]
         """
-        await self._ensure_access(uri, ctx)
+        await _timed_stage("ensure_access", self._ensure_access(uri, ctx))
         if output == "original":
-            return await self._tree_original(uri, show_all_hidden, node_limit, level_limit, ctx=ctx)
+            return await _timed_stage(
+                "tree_walk",
+                self._tree_original(uri, show_all_hidden, node_limit, level_limit, ctx=ctx),
+            )
         elif output == "agent":
-            return await self._tree_agent(
-                uri, abs_limit, show_all_hidden, node_limit, level_limit, ctx=ctx
+            return await _timed_stage(
+                "tree_walk",
+                self._tree_agent(
+                    uri, abs_limit, show_all_hidden, node_limit, level_limit, ctx=ctx
+                ),
             )
         else:
             raise ValueError(f"Invalid output format: {output}")
@@ -1041,6 +1228,7 @@ class _OpsMixin:
 
     # ========== Batch Read (backward compatible) ==========
 
+    @_timed_operation
     async def read_batch(
         self, uris: List[str], level: str = "l0", ctx: Optional[RequestContext] = None
     ) -> Dict[str, str]:
@@ -1050,9 +1238,9 @@ class _OpsMixin:
             try:
                 content = ""
                 if level == "l0":
-                    content = await self.abstract(uri, ctx=ctx)
+                    content = await _timed_stage("abstract", self.abstract(uri, ctx=ctx))
                 elif level == "l1":
-                    content = await self.overview(uri, ctx=ctx)
+                    content = await _timed_stage("overview", self.overview(uri, ctx=ctx))
                 results[uri] = content
             except Exception:
                 pass
@@ -1060,6 +1248,7 @@ class _OpsMixin:
 
     # ========== Other Preserved Methods ==========
 
+    @_timed_operation
     async def write_file(
         self,
         uri: str,
@@ -1074,20 +1263,29 @@ class _OpsMixin:
         automatic pathlock disabled. Only safe for URIs that are never written
         concurrently (e.g. unique-per-request shared upload directories).
         """
-        await self._ensure_access(uri, ctx, action=AclAction.WRITE)
+        await _timed_stage(
+            "ensure_access", self._ensure_access(uri, ctx, action=AclAction.WRITE)
+        )
         path = self._uri_to_path(uri, ctx=ctx)
-        await self._ensure_parent_dirs(path, ctx=ctx, lease_ref=lease_ref)
+        await _timed_stage(
+            "ensure_parent_dirs",
+            self._ensure_parent_dirs(path, ctx=ctx, lease_ref=lease_ref),
+        )
 
         if isinstance(content, str):
             content = content.encode("utf-8")
 
-        await self._async_agfs.write(
-            path,
-            content,
-            fs_ctx=self._pathlock_fs_ctx(ctx, lease_ref),
-            auto_pathlock=auto_pathlock,
+        await _timed_stage(
+            "agfs_write",
+            self._async_agfs.write(
+                path,
+                content,
+                fs_ctx=self._pathlock_fs_ctx(ctx, lease_ref),
+                auto_pathlock=auto_pathlock,
+            ),
         )
 
+    @_timed_operation
     async def read_file(
         self,
         uri: str,
@@ -1105,17 +1303,19 @@ class _OpsMixin:
         Raises:
             FileNotFoundError: If the file does not exist.
         """
-        await self._ensure_access(uri, ctx)
+        await _timed_stage("ensure_access", self._ensure_access(uri, ctx))
         real_ctx = self._ctx_or_default(ctx)
         primary_path = self._uri_to_path(uri, ctx=ctx)
         # Verify the file exists before reading, because AGFS read returns
         # empty bytes for non-existent files instead of raising an error.
         last_not_found: Optional[Exception] = None
         for path in self._read_paths(uri, ctx=ctx):
-            if not await self._read_path_visible(uri, path, primary_path, real_ctx):
+            if not await _timed_stage(
+                "visibility_check", self._read_path_visible(uri, path, primary_path, real_ctx)
+            ):
                 continue
             try:
-                stat = await self._async_agfs.stat(path)
+                stat = await _timed_stage("agfs_stat", self._async_agfs.stat(path))
                 break
             except Exception as exc:
                 if is_not_found_error(exc):
@@ -1131,7 +1331,7 @@ class _OpsMixin:
                 details={"resource": uri, "expected": "file", "actual": "directory"},
             )
         try:
-            content = await self._async_agfs.read(path)
+            content = await _timed_stage("agfs_read", self._async_agfs.read(path))
             if isinstance(content, bytes):
                 raw = content
             elif content is not None and hasattr(content, "content"):
@@ -1149,21 +1349,24 @@ class _OpsMixin:
         sliced = lines[offset:] if limit == -1 else lines[offset : offset + limit]
         return "".join(sliced)
 
+    @_timed_operation
     async def read_file_bytes(
         self,
         uri: str,
         ctx: Optional[RequestContext] = None,
     ) -> bytes:
         """Read single binary file."""
-        await self._ensure_access(uri, ctx)
+        await _timed_stage("ensure_access", self._ensure_access(uri, ctx))
         real_ctx = self._ctx_or_default(ctx)
         primary_path = self._uri_to_path(uri, ctx=ctx)
         last_not_found: Optional[Exception] = None
         for path in self._read_paths(uri, ctx=ctx):
-            if not await self._read_path_visible(uri, path, primary_path, real_ctx):
+            if not await _timed_stage(
+                "visibility_check", self._read_path_visible(uri, path, primary_path, real_ctx)
+            ):
                 continue
             try:
-                stat = await self._async_agfs.stat(path)
+                stat = await _timed_stage("agfs_stat", self._async_agfs.stat(path))
                 break
             except Exception as exc:
                 if is_not_found_error(exc):
@@ -1178,11 +1381,14 @@ class _OpsMixin:
                 details={"resource": uri, "expected": "file", "actual": "directory"},
             )
         try:
-            raw = self._handle_agfs_read(await self._async_agfs.read(path))
+            raw = self._handle_agfs_read(
+                await _timed_stage("agfs_read", self._async_agfs.read(path))
+            )
             return raw
         except Exception:
             raise NotFoundError(uri, "file")
 
+    @_timed_operation
     async def write_file_bytes(
         self,
         uri: str,
@@ -1197,17 +1403,26 @@ class _OpsMixin:
         automatic pathlock disabled. Only safe for URIs that are never written
         concurrently (e.g. unique-per-request shared upload directories).
         """
-        await self._ensure_access(uri, ctx, action=AclAction.WRITE)
+        await _timed_stage(
+            "ensure_access", self._ensure_access(uri, ctx, action=AclAction.WRITE)
+        )
         path = self._uri_to_path(uri, ctx=ctx)
-        await self._ensure_parent_dirs(path, ctx=ctx, lease_ref=lease_ref)
-
-        await self._async_agfs.write(
-            path,
-            content,
-            fs_ctx=self._pathlock_fs_ctx(ctx, lease_ref),
-            auto_pathlock=auto_pathlock,
+        await _timed_stage(
+            "ensure_parent_dirs",
+            self._ensure_parent_dirs(path, ctx=ctx, lease_ref=lease_ref),
         )
 
+        await _timed_stage(
+            "agfs_write",
+            self._async_agfs.write(
+                path,
+                content,
+                fs_ctx=self._pathlock_fs_ctx(ctx, lease_ref),
+                auto_pathlock=auto_pathlock,
+            ),
+        )
+
+    @_timed_operation
     async def append_file(
         self,
         uri: str,
@@ -1216,15 +1431,22 @@ class _OpsMixin:
         lease_ref: Dict[str, Any] | None = None,
     ) -> None:
         """Append content to file while holding one exact pathlock lease."""
-        await self._ensure_access(uri, ctx, action=AclAction.WRITE)
+        await _timed_stage(
+            "ensure_access", self._ensure_access(uri, ctx, action=AclAction.WRITE)
+        )
         path = self._uri_to_path(uri, ctx=ctx)
 
         owned_lease = None
         try:
-            await self._ensure_parent_dirs(path, ctx=ctx, lease_ref=lease_ref)
+            await _timed_stage(
+                "ensure_parent_dirs",
+                self._ensure_parent_dirs(path, ctx=ctx, lease_ref=lease_ref),
+            )
             lease = lease_ref
             if lease is None:
-                lease = await self._async_agfs.pathlock_acquire_exact(path)
+                lease = await _timed_stage(
+                    "lock_acquire", self._async_agfs.pathlock_acquire_exact(path)
+                )
                 owned_lease = lease
             fs_ctx = self._pathlock_fs_ctx(ctx, lease)
 
@@ -1232,7 +1454,9 @@ class _OpsMixin:
             existing = ""
             try:
                 existing_bytes = self._handle_agfs_read(
-                    await self._async_agfs.read(path, fs_ctx=fs_ctx)
+                    await _timed_stage(
+                        "agfs_read", self._async_agfs.read(path, fs_ctx=fs_ctx)
+                    )
                 )
                 existing = self._decode_bytes(existing_bytes)
             except FileNotFoundError:
@@ -1244,10 +1468,13 @@ class _OpsMixin:
                 raise
 
             final_content = (existing + content).encode("utf-8")
-            await self._async_agfs.write(
-                path,
-                final_content,
-                fs_ctx=fs_ctx,
+            await _timed_stage(
+                "agfs_write",
+                self._async_agfs.write(
+                    path,
+                    final_content,
+                    fs_ctx=fs_ctx,
+                ),
             )
 
         except Exception as e:
@@ -1255,8 +1482,11 @@ class _OpsMixin:
             raise IOError(f"Failed to append to file {uri}: {e}")
         finally:
             if owned_lease is not None:
-                await self._async_agfs.pathlock_release(owned_lease)
+                await _timed_stage(
+                    "lock_release", self._async_agfs.pathlock_release(owned_lease)
+                )
 
+    @_timed_operation
     async def ls(
         self,
         uri: str,
@@ -1286,29 +1516,35 @@ class _OpsMixin:
         output="agent"
         [{'name': '.abstract.md', 'size': 100, 'modTime': '2026-02-11T08:52:16.256Z', 'isDir': False, 'uri': 'viking://resources/.abstract.md', 'abstract': "..."}]
         """
-        await self._ensure_access(uri, ctx)
+        await _timed_stage("ensure_access", self._ensure_access(uri, ctx))
         if sort_by not in {None, "name", "mtime"}:
             raise ValueError("sort_by must be 'name' or 'mtime'")
         if sort_order not in {"asc", "desc"}:
             raise ValueError("sort_order must be 'asc' or 'desc'")
         if output == "original":
-            return await self._ls_original(
-                uri,
-                show_all_hidden,
-                node_limit,
-                sort_by=sort_by,
-                sort_order=sort_order,
-                ctx=ctx,
+            return await _timed_stage(
+                "list_entries",
+                self._ls_original(
+                    uri,
+                    show_all_hidden,
+                    node_limit,
+                    sort_by=sort_by,
+                    sort_order=sort_order,
+                    ctx=ctx,
+                ),
             )
         elif output == "agent":
-            return await self._ls_agent(
-                uri,
-                abs_limit,
-                show_all_hidden,
-                node_limit,
-                sort_by=sort_by,
-                sort_order=sort_order,
-                ctx=ctx,
+            return await _timed_stage(
+                "list_entries",
+                self._ls_agent(
+                    uri,
+                    abs_limit,
+                    show_all_hidden,
+                    node_limit,
+                    sort_by=sort_by,
+                    sort_order=sort_order,
+                    ctx=ctx,
+                ),
             )
         else:
             raise ValueError(f"Invalid output format: {output}")
@@ -1496,6 +1732,7 @@ class _OpsMixin:
                 )
         return browsable
 
+    @_timed_operation
     async def move_file(
         self,
         from_uri: str,
@@ -1503,12 +1740,18 @@ class _OpsMixin:
         ctx: Optional[RequestContext] = None,
     ) -> None:
         """Move file."""
-        await self._ensure_access(from_uri, ctx, action=AclAction.WRITE)
-        await self._ensure_access(to_uri, ctx, action=AclAction.WRITE)
+        await _timed_stage(
+            "ensure_access", self._ensure_access(from_uri, ctx, action=AclAction.WRITE)
+        )
+        await _timed_stage(
+            "ensure_access", self._ensure_access(to_uri, ctx, action=AclAction.WRITE)
+        )
         from_path = self._uri_to_path(from_uri, ctx=ctx)
 
-        await self._copy_file_through_vikingfs(from_uri, to_uri, ctx=ctx)
-        await self._async_agfs.rm(from_path)
+        await _timed_stage(
+            "copy_file", self._copy_file_through_vikingfs(from_uri, to_uri, ctx=ctx)
+        )
+        await _timed_stage("agfs_rm", self._async_agfs.rm(from_path))
 
     # ========== Temp File Operations (backward compatible) ==========
 
@@ -1523,6 +1766,7 @@ class _OpsMixin:
             return VikingURI.create_temp_uri()
         return VikingURI.create_temp_uri(space=real_ctx.user.user_space_name())
 
+    @_timed_operation
     async def persist_temp_tree(
         self,
         temp_uri: str,
@@ -1531,19 +1775,28 @@ class _OpsMixin:
         lease_ref: Dict[str, Any] | None = None,
     ) -> None:
         """Persist an already-encrypted temp tree without rewriting file bytes."""
-        await self._ensure_access(temp_uri, ctx)
-        await self._ensure_access(target_uri, ctx, action=AclAction.WRITE)
+        await _timed_stage("ensure_access", self._ensure_access(temp_uri, ctx))
+        await _timed_stage(
+            "ensure_access", self._ensure_access(target_uri, ctx, action=AclAction.WRITE)
+        )
         src_path = self._uri_to_path(temp_uri, ctx=ctx)
         dst_path = self._uri_to_path(target_uri, ctx=ctx)
         fs_ctx = self._pathlock_fs_ctx(ctx, lease_ref)
-        await self._ensure_parent_dirs(dst_path, ctx=ctx, lease_ref=lease_ref)
-        await self._async_agfs.cp(
-            src_path,
-            dst_path,
-            recursive=True,
-            fs_ctx=fs_ctx or {"account_id": self._ctx_or_default(ctx).account_id},
+        await _timed_stage(
+            "ensure_parent_dirs",
+            self._ensure_parent_dirs(dst_path, ctx=ctx, lease_ref=lease_ref),
+        )
+        await _timed_stage(
+            "agfs_cp",
+            self._async_agfs.cp(
+                src_path,
+                dst_path,
+                recursive=True,
+                fs_ctx=fs_ctx or {"account_id": self._ctx_or_default(ctx).account_id},
+            ),
         )
 
+    @_timed_operation
     async def delete_temp(
         self,
         temp_uri: str,
@@ -1551,11 +1804,15 @@ class _OpsMixin:
         lease_ref: Dict[str, Any] | None = None,
     ) -> None:
         """Delete temp directory and its contents."""
-        await self._ensure_access(temp_uri, ctx, action=AclAction.MANAGE)
+        await _timed_stage(
+            "ensure_access", self._ensure_access(temp_uri, ctx, action=AclAction.MANAGE)
+        )
         path = self._uri_to_path(temp_uri, ctx=ctx)
         fs_ctx = self._pathlock_fs_ctx(ctx, lease_ref)
         try:
-            await self._async_agfs.rm(path, recursive=True, fs_ctx=fs_ctx)
+            await _timed_stage(
+                "agfs_rm", self._async_agfs.rm(path, recursive=True, fs_ctx=fs_ctx)
+            )
         except Exception as e:
             logger.warning(f"[VikingFS] Failed to delete temp {temp_uri}: {e}")
 
