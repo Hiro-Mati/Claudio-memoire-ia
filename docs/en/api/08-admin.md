@@ -337,7 +337,7 @@ List all workspaces (ROOT only).
 
 **Processing Flow:**
 1. Verify requester has ROOT privileges
-2. Call API Key Manager to get all accounts (ordered lexicographically by account ID)
+2. Call API Key Manager to get all accounts (in creation order)
 3. Apply optional `name` filter
 4. Apply optional `limit`/`page` pagination
 5. Return list with account ID, creation time, and user count
@@ -355,7 +355,7 @@ List all workspaces (ROOT only).
 | limit | int | No | null | Page size (≥1). Omit to return all matches |
 | page | int | No | 1 | 1-based page number; only applies when `limit` is set |
 
-Results are always returned in lexicographic order of account ID.
+Results are returned in creation order.
 
 #### 3. Usage Examples
 
@@ -672,7 +672,7 @@ List active users in a workspace. Users with deletion in progress are omitted.
 
 **Processing Flow:**
 1. Verify requester has ROOT privileges or is an ADMIN of the account
-2. Call API Key Manager to get active users list (ordered lexicographically by user ID)
+2. Call API Key Manager to get active users list (in creation order)
 3. Apply optional filters (name, role)
 4. Apply optional `limit`/`page` pagination
 5. Return users list (trusted mode omits user_key)
@@ -695,7 +695,7 @@ List active users in a workspace. Users with deletion in progress are omitted.
 | page | int | No | 1 | 1-based page number; only applies when `limit` is set |
 
 **Notes:**
-- Results are always returned in lexicographic order of user ID
+- Results are returned in creation order
 - ADMIN can only list users in their own account
 - In `trusted` mode, `user_key` is omitted from the response
 - Users whose deletion has started are no longer returned
