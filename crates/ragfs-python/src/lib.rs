@@ -1106,24 +1106,6 @@ fn owned_lease_to_py_dict(py: Python<'_>, lease: &OwnedPathLockLease) -> PyResul
     Ok(dict.into())
 }
 
-/// Release a lease that completed after its Python waiter was cancelled.
-fn spawn_pathlock_release(
-    runtime: &tokio::runtime::Handle,
-    manager: Arc<PathLockManager>,
-    fs_ctx: FsContext,
-    lease: OwnedPathLockLease,
-) {
-    runtime.spawn(FS_CTX.scope(fs_ctx, async move {
-        if let Err(error) = manager.release(&lease).await {
-            tracing::error!(
-                error = %error,
-                lease_ref = %lease.lease.lease_ref,
-                "failed to release pathlock acquired for a cancelled Python waiter"
-            );
-        }
-    }));
-}
-
 /// Releases the lease unless ownership is explicitly transferred to Python.
 struct PendingPathLockLease {
     lease: Option<OwnedPathLockLease>,
@@ -1148,12 +1130,17 @@ impl PendingPathLockLease {
 impl Drop for PendingPathLockLease {
     fn drop(&mut self) {
         if let Some(lease) = self.lease.take() {
-            spawn_pathlock_release(
-                &self.runtime,
-                self.manager.clone(),
-                self.fs_ctx.clone(),
-                lease,
-            );
+            let manager = self.manager.clone();
+            self.runtime
+                .spawn(FS_CTX.scope(self.fs_ctx.clone(), async move {
+                    if let Err(error) = manager.release(&lease).await {
+                        tracing::error!(
+                            error = %error,
+                            lease_ref = %lease.lease.lease_ref,
+                            "failed to release pathlock acquired for a cancelled Python waiter"
+                        );
+                    }
+                }));
         }
     }
 }
@@ -2488,13 +2475,12 @@ impl RAGFSBindingClient {
         let task_manager = self.clone_pathlock_manager();
         let task_runtime = runtime.clone();
         let task_fs_ctx = fs_ctx.clone();
-        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
 
-        runtime.spawn(FS_CTX.scope(fs_ctx, async move {
+        let task = runtime.spawn(FS_CTX.scope(fs_ctx, async move {
             let capability = owner_capability
                 .as_ref()
                 .map(|(lease_ref, ownership_ref)| (lease_ref.as_str(), ownership_ref.as_str()));
-            let result = task_manager
+            task_manager
                 .acquire_batch(&lock_requests, timeout, capability)
                 .await
                 .map(|lease| PendingPathLockLease {
@@ -2502,12 +2488,11 @@ impl RAGFSBindingClient {
                     manager: task_manager,
                     runtime: task_runtime,
                     fs_ctx: task_fs_ctx,
-                });
-            let _ = result_sender.send(result);
+                })
         }));
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            match result_receiver.await {
+            match task.await {
                 Ok(Ok(pending)) => Python::attach(|py| pending.into_py(py)),
                 Ok(Err(error)) => Err(pathlock_err_to_py(error)),
                 Err(error) => Err(PyRuntimeError::new_err(format!(

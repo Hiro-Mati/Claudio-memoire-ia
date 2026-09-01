@@ -328,21 +328,11 @@ class AsyncAGFSClient:
         timeout_secs: float,
         owner_lease_ref: Dict[str, Any] | None,
         fs_ctx: Dict[str, str],
-        legacy_method: str,
-        *legacy_args: Any,
     ) -> Dict[str, Any]:
-        native_async = getattr(self._client, "pathlock_acquire_batch_async", None)
-        if not callable(native_async):
-            return await self.run(
-                legacy_method,
-                fs_ctx,
-                *legacy_args,
-                timeout_secs,
-                owner_lease_ref,
-            )
-
         future = asyncio.ensure_future(
-            native_async(fs_ctx, requests, timeout_secs, owner_lease_ref)
+            self._client.pathlock_acquire_batch_async(
+                fs_ctx, requests, timeout_secs, owner_lease_ref
+            )
         )
         try:
             return await future
@@ -367,8 +357,6 @@ class AsyncAGFSClient:
             timeout_secs,
             owner_lease_ref,
             _fs_ctx_or_default(path, fs_ctx),
-            "pathlock_acquire_exact",
-            path,
         )
 
     async def pathlock_acquire_exact_batch(
@@ -385,8 +373,6 @@ class AsyncAGFSClient:
             timeout_secs,
             owner_lease_ref,
             _fs_ctx_or_default(paths[0] if paths else "/", fs_ctx),
-            "pathlock_acquire_exact_batch",
-            paths,
         )
 
     async def pathlock_acquire_tree(
@@ -403,8 +389,6 @@ class AsyncAGFSClient:
             timeout_secs,
             owner_lease_ref,
             _fs_ctx_or_default(path, fs_ctx),
-            "pathlock_acquire_tree",
-            path,
         )
 
     async def pathlock_acquire_tree_batch(
@@ -421,8 +405,6 @@ class AsyncAGFSClient:
             timeout_secs,
             owner_lease_ref,
             _fs_ctx_or_default(paths[0] if paths else "/", fs_ctx),
-            "pathlock_acquire_tree_batch",
-            paths,
         )
 
     async def pathlock_acquire_exact_tree_batch(
@@ -443,9 +425,6 @@ class AsyncAGFSClient:
             timeout_secs,
             owner_lease_ref,
             _fs_ctx_or_default(first, fs_ctx),
-            "pathlock_acquire_exact_tree_batch",
-            exact_paths,
-            tree_paths,
         )
 
     async def pathlock_acquire_batch(
@@ -471,8 +450,6 @@ class AsyncAGFSClient:
             timeout_secs,
             owner_lease_ref,
             _fs_ctx_or_default(first, fs_ctx),
-            "pathlock_acquire_batch",
-            requests,
         )
 
     async def pathlock_as_borrowed(
