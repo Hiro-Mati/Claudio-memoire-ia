@@ -50,7 +50,12 @@ from openviking.retrieve.context_assembler import (
     AssembleParams,
     assemble_context,
 )
-from openviking.server.auth import _extract_api_key, normalize_actor_peer_header, resolve_identity
+from openviking.server.auth import (
+    _build_request_context,
+    _extract_api_key,
+    normalize_actor_peer_header,
+    resolve_identity,
+)
 from openviking.server.dependencies import get_server_config, get_service
 from openviking.server.identity import RequestContext
 from openviking.server.local_input_guard import (
@@ -60,7 +65,6 @@ from openviking.server.local_input_guard import (
 from openviking.server.resource_ingest import ingest_temp_upload
 from openviking.server.temp_upload_store import TempUploadStore
 from openviking.server.upload_token_store import upload_token_store
-from openviking.telemetry.span_models import update_root_span_identity
 from openviking.utils.search_filters import SearchContextTypeInput, merge_search_filter
 from openviking_cli.exceptions import (
     InvalidArgumentError,
@@ -69,7 +73,6 @@ from openviking_cli.exceptions import (
     PermissionDeniedError,
     UnauthenticatedError,
 )
-from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
@@ -174,6 +177,12 @@ class _IdentityASGIMiddleware:
             actor_peer_id = normalize_actor_peer_header(
                 request.headers.get("x-openviking-actor-peer")
             )
+            ctx = _build_request_context(
+                request,
+                identity,
+                actor_peer_id=actor_peer_id,
+                api_key=_extract_api_key(x_api_key, authorization),
+            )
         except (UnauthenticatedError, PermissionDeniedError, InvalidArgumentError) as exc:
             status = (
                 401
@@ -198,30 +207,6 @@ class _IdentityASGIMiddleware:
             )
             return await resp(scope, receive, send)
 
-        # Mirror the identity fallback RequestContext applies below, so the
-        # observability stamp and the request context never disagree.
-        effective_account_id = identity.account_id or "default"
-        effective_user_id = identity.user_id or "default"
-        # Stamp the resolved identity onto the outer request's root
-        # observability context, mirroring what get_request_context does for
-        # REST routes. MCP authentication bypasses FastAPI's REST context
-        # dependency; request.state shares scope["state"] with the outer app,
-        # where the observability middleware attached root_span_attrs.
-        update_root_span_identity(
-            request_state=request.state,
-            account_id=effective_account_id,
-            user_id=effective_user_id,
-        )
-        ctx = RequestContext(
-            user=UserIdentifier(
-                effective_account_id,
-                effective_user_id,
-            ),
-            role=identity.role,
-            actor_peer_id=actor_peer_id,
-            from_oauth=identity.from_oauth,
-            api_key=_extract_api_key(x_api_key, authorization),
-        )
         url_info = {
             "x_forwarded_proto": request.headers.get("x-forwarded-proto"),
             "x_forwarded_host": request.headers.get("x-forwarded-host"),
@@ -984,11 +969,16 @@ async def add_resource(
             Only applies to remote-URL invocations.
         processing_mode: "semantic_and_vectors" for normal semantic processing, or
             "vectors_only" to skip semantic understanding and only build vector indexes.
-        to: Target URI under viking://resources/ (e.g. "viking://resources/volcengine/OpenViking").
-            Required when ``add_type`` is set; otherwise leave empty to derive a URI
-            from the source.
-        parent: Parent URI under viking://resources/ for remote imports. Mutually exclusive
-            with ``to`` and not supported when ``add_type`` is set.
+        to: Exact final URI including the leaf name (e.g.
+            "viking://resources/volcengine/OpenViking"). Written verbatim; an existing
+            target is synced to match the new source, so visible entries it does not
+            contain are deleted. Required when ``add_type`` is set.
+        parent: Existing directory to store the resource under, for remote or
+            local-file imports; the leaf name comes from the source. Never overwrites
+            — a collision reserves the next free name ("name_1", "name_2", ...) and
+            returns a warning. Mutually exclusive with ``to``; not supported when
+            ``add_type`` is set. Leaving both empty derives the directory and the name
+            from the source and handles collisions like ``parent``.
         tags: Optional explicit k=v retrieval tags to apply after ingestion.
         tag_mode: Tag update mode, "replace" or "append". Defaults to "replace".
         args: Parser-specific options, e.g. {"auth_config": {"token": "..."}}
@@ -1036,6 +1026,8 @@ async def add_resource(
         return "Error: add_type cannot be combined with parent."
     if add_type and not to:
         return "Error: add_type requires an exact 'to' target."
+    if to and parent:
+        return "Error: Cannot specify both 'to' and 'parent' at the same time."
 
     # Branch 1: ingest by temp_file_id. Kept for backward compat / REST-style use — the
     # signed upload now auto-ingests server-side, so agents no longer need this second leg.
@@ -1050,6 +1042,7 @@ async def add_resource(
                 temp_file_id,
                 ctx,
                 to=to,
+                parent=parent,
                 reason=description,
                 args=args,
                 processing_mode=processing_mode,
@@ -1148,6 +1141,7 @@ async def add_resource(
         ctx.user.user_id,
         ttl_seconds=ttl_seconds,
         to=to,
+        parent=parent,
         reason=description,
         actor_peer_id=ctx.actor_peer_id or "",
         processing_mode=processing_mode,

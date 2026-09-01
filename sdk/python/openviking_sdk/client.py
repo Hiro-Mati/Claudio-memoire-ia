@@ -151,6 +151,14 @@ class VikingURI:
             cleaned = cleaned[1:]
         return f"viking://{cleaned}"
 
+    @staticmethod
+    def normalize_file_reference(uri_or_id: str) -> str:
+        """Normalize a URI while preserving record IDs for read-only file lookup APIs."""
+        cleaned = uri_or_id.strip()
+        if len(cleaned) == 32 and all(char in "0123456789abcdef" for char in cleaned):
+            return cleaned
+        return VikingURI.normalize(uri_or_id)
+
 
 class Session:
     def __init__(self, client: "AsyncHTTPClient", session_id: str):
@@ -648,11 +656,16 @@ class AsyncHTTPClient:
         if exc_class == NotFoundError:
             resource = details.get("resource", "") if details else ""
             resource_type = details.get("type", "resource") if details else "resource"
-            raise exc_class(resource, resource_type)
+            reason = details.get("reason") if details else None
+            raise exc_class(resource, resource_type, reason=reason)
         if exc_class == AlreadyExistsError:
             resource = details.get("resource", "") if details else ""
             resource_type = details.get("type", "resource") if details else "resource"
             raise exc_class(resource, resource_type)
+        if exc_class == UnavailableError:
+            service = details.get("service", "service") if details else "service"
+            reason = details.get("reason", "") if details else message
+            raise exc_class(service, reason)
         raise exc_class(message)
 
     def _zip_directory(self, dir_path: str) -> str:
@@ -1049,6 +1062,7 @@ class AsyncHTTPClient:
         node_limit: int = 1000,
         sort_by: Optional[str] = None,
         sort_order: str = "asc",
+        extra_fields: Optional[List[str]] = None,
     ) -> List[Any]:
         params: Dict[str, Any] = {
             "uri": VikingURI.normalize(uri),
@@ -1062,6 +1076,8 @@ class AsyncHTTPClient:
         if sort_by is not None:
             params["sort_by"] = sort_by
             params["sort_order"] = sort_order
+        if extra_fields:
+            params["extra_fields"] = list(extra_fields)
         response = await self._request(
             "GET",
             "/api/v1/fs/ls",
@@ -1077,24 +1093,30 @@ class AsyncHTTPClient:
         show_all_hidden: bool = False,
         node_limit: int = 1000,
         level_limit: int = 3,
+        extra_fields: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {
+            "uri": VikingURI.normalize(uri),
+            "output": output,
+            "abs_limit": abs_limit,
+            "show_all_hidden": show_all_hidden,
+            "node_limit": node_limit,
+            "level_limit": level_limit,
+        }
+        if extra_fields:
+            params["extra_fields"] = list(extra_fields)
         response = await self._request(
             "GET",
             "/api/v1/fs/tree",
-            params={
-                "uri": VikingURI.normalize(uri),
-                "output": output,
-                "abs_limit": abs_limit,
-                "show_all_hidden": show_all_hidden,
-                "node_limit": node_limit,
-                "level_limit": level_limit,
-            },
+            params=params,
         )
         return self._handle_response(response)
 
     async def stat(self, uri: str) -> Dict[str, Any]:
         response = await self._request(
-            "GET", "/api/v1/fs/stat", params={"uri": VikingURI.normalize(uri)}
+            "GET",
+            "/api/v1/fs/stat",
+            params={"uri": VikingURI.normalize_file_reference(uri)},
         )
         return self._handle_response(response)
 
@@ -1136,7 +1158,11 @@ class AsyncHTTPClient:
         response = await self._request(
             "GET",
             "/api/v1/content/read",
-            params={"uri": VikingURI.normalize(uri), "offset": offset, "limit": limit},
+            params={
+                "uri": VikingURI.normalize_file_reference(uri),
+                "offset": offset,
+                "limit": limit,
+            },
         )
         return self._handle_response(response)
 
@@ -1146,7 +1172,7 @@ class AsyncHTTPClient:
             "GET",
             "/api/v1/content/read",
             params={
-                "uri": VikingURI.normalize(uri),
+                "uri": VikingURI.normalize_file_reference(uri),
                 "offset": offset,
                 "limit": limit,
                 "raw": True,
@@ -1261,6 +1287,45 @@ class AsyncHTTPClient:
         )
         return self._handle_response_data(response).get("result", {})
 
+    async def acl_get(self, uri: str) -> Dict[str, Any]:
+        response = await self._http.get(
+            "/api/v1/acl", params={"uri": VikingURI.normalize(uri)}
+        )
+        return self._handle_response_data(response).get("result", {})
+
+    async def acl_set(
+        self, uri: str, entries: List[Dict[str, str]]
+    ) -> Dict[str, Any]:
+        response = await self._http.put(
+            "/api/v1/acl",
+            json={"uri": VikingURI.normalize(uri), "entries": entries},
+        )
+        return self._handle_response_data(response).get("result", {})
+
+    async def acl_grant(self, uri: str, principal: str, level: str) -> Dict[str, Any]:
+        response = await self._http.post(
+            "/api/v1/acl/grant",
+            json={
+                "uri": VikingURI.normalize(uri),
+                "principal": principal,
+                "level": level,
+            },
+        )
+        return self._handle_response_data(response).get("result", {})
+
+    async def acl_revoke(self, uri: str, principal: str) -> Dict[str, Any]:
+        response = await self._http.post(
+            "/api/v1/acl/revoke",
+            json={"uri": VikingURI.normalize(uri), "principal": principal},
+        )
+        return self._handle_response_data(response).get("result", {})
+
+    async def acl_delete(self, uri: str) -> Dict[str, Any]:
+        response = await self._http.request(
+            "DELETE", "/api/v1/acl", params={"uri": VikingURI.normalize(uri)}
+        )
+        return self._handle_response_data(response).get("result", {})
+
     async def find(
         self,
         query: str = "",
@@ -1359,15 +1424,19 @@ class AsyncHTTPClient:
         pattern: str,
         uri: str = "viking://",
         node_limit: int = 256,
+        extra_fields: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
+        json_body: Dict[str, Any] = {
+            "pattern": pattern,
+            "uri": VikingURI.normalize(uri),
+            "node_limit": node_limit,
+        }
+        if extra_fields is not None:
+            json_body["extra_fields"] = list(extra_fields)
         response = await self._request(
             "POST",
             "/api/v1/search/glob",
-            json={
-                "pattern": pattern,
-                "uri": VikingURI.normalize(uri),
-                "node_limit": node_limit,
-            },
+            json=json_body,
         )
         return self._handle_response(response)
 
@@ -1692,8 +1761,19 @@ class AsyncHTTPClient:
         )
         return self._handle_response(response)
 
-    async def admin_list_accounts(self) -> List[Any]:
-        response = await self._request("GET", "/api/v1/admin/accounts")
+    async def admin_list_accounts(
+        self,
+        name: Optional[str] = None,
+        limit: Optional[int] = None,
+        page: int = 1,
+    ) -> List[Any]:
+        params: Dict[str, Any] = {}
+        if name is not None:
+            params["name"] = name
+        if limit is not None:
+            params["limit"] = limit
+            params["page"] = page
+        response = await self._request("GET", "/api/v1/admin/accounts", params=params)
         return self._handle_response(response)
 
     async def admin_delete_account(self, account_id: str) -> Dict[str, Any]:
@@ -1720,8 +1800,25 @@ class AsyncHTTPClient:
         )
         return self._handle_response(response)
 
-    async def admin_list_users(self, account_id: str) -> List[Any]:
-        response = await self._request("GET", f"/api/v1/admin/accounts/{account_id}/users")
+    async def admin_list_users(
+        self,
+        account_id: str,
+        limit: Optional[int] = None,
+        name: Optional[str] = None,
+        role: Optional[str] = None,
+        page: int = 1,
+    ) -> List[Any]:
+        params: Dict[str, Any] = {}
+        if limit is not None:
+            params["limit"] = limit
+            params["page"] = page
+        if name is not None:
+            params["name"] = name
+        if role is not None:
+            params["role"] = role
+        response = await self._request(
+            "GET", f"/api/v1/admin/accounts/{account_id}/users", params=params
+        )
         return self._handle_response(response)
 
     async def admin_remove_user(self, account_id: str, user_id: str) -> Dict[str, Any]:
@@ -1748,6 +1845,47 @@ class AsyncHTTPClient:
             "POST",
             f"/api/v1/admin/accounts/{account_id}/users/{user_id}/key",
             json=payload,
+        )
+        return self._handle_response(response)
+
+    async def admin_create_group(self, account_id: str, group_id: str) -> Dict[str, Any]:
+        response = await self._http.post(
+            f"/api/v1/admin/accounts/{account_id}/groups",
+            json={"group_id": group_id},
+        )
+        return self._handle_response(response)
+
+    async def admin_list_groups(self, account_id: str) -> List[Any]:
+        response = await self._http.get(f"/api/v1/admin/accounts/{account_id}/groups")
+        return self._handle_response(response)
+
+    async def admin_delete_group(self, account_id: str, group_id: str) -> Dict[str, Any]:
+        response = await self._http.delete(
+            f"/api/v1/admin/accounts/{account_id}/groups/{group_id}"
+        )
+        return self._handle_response(response)
+
+    async def admin_list_group_members(
+        self, account_id: str, group_id: str
+    ) -> Dict[str, Any]:
+        response = await self._http.get(
+            f"/api/v1/admin/accounts/{account_id}/groups/{group_id}/members"
+        )
+        return self._handle_response(response)
+
+    async def admin_add_group_member(
+        self, account_id: str, group_id: str, user_id: str
+    ) -> Dict[str, Any]:
+        response = await self._http.put(
+            f"/api/v1/admin/accounts/{account_id}/groups/{group_id}/members/{user_id}"
+        )
+        return self._handle_response(response)
+
+    async def admin_remove_group_member(
+        self, account_id: str, group_id: str, user_id: str
+    ) -> Dict[str, Any]:
+        response = await self._http.delete(
+            f"/api/v1/admin/accounts/{account_id}/groups/{group_id}/members/{user_id}"
         )
         return self._handle_response(response)
 
@@ -2221,6 +2359,7 @@ class SyncHTTPClient:
         node_limit: int = 1000,
         sort_by: Optional[str] = None,
         sort_order: str = "asc",
+        extra_fields: Optional[List[str]] = None,
     ) -> List[Any]:
         return run_async(
             self._async_client.ls(
@@ -2233,6 +2372,7 @@ class SyncHTTPClient:
                 node_limit=node_limit,
                 sort_by=sort_by,
                 sort_order=sort_order,
+                extra_fields=extra_fields,
             )
         )
 
@@ -2244,6 +2384,7 @@ class SyncHTTPClient:
         show_all_hidden: bool = False,
         node_limit: int = 1000,
         level_limit: int = 3,
+        extra_fields: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         return run_async(
             self._async_client.tree(
@@ -2253,6 +2394,7 @@ class SyncHTTPClient:
                 show_all_hidden=show_all_hidden,
                 node_limit=node_limit,
                 level_limit=level_limit,
+                extra_fields=extra_fields,
             )
         )
 
@@ -2335,6 +2477,21 @@ class SyncHTTPClient:
             )
         )
 
+    def acl_get(self, uri: str) -> Dict[str, Any]:
+        return run_async(self._async_client.acl_get(uri))
+
+    def acl_set(self, uri: str, entries: List[Dict[str, str]]) -> Dict[str, Any]:
+        return run_async(self._async_client.acl_set(uri, entries))
+
+    def acl_grant(self, uri: str, principal: str, level: str) -> Dict[str, Any]:
+        return run_async(self._async_client.acl_grant(uri, principal, level))
+
+    def acl_revoke(self, uri: str, principal: str) -> Dict[str, Any]:
+        return run_async(self._async_client.acl_revoke(uri, principal))
+
+    def acl_delete(self, uri: str) -> Dict[str, Any]:
+        return run_async(self._async_client.acl_delete(uri))
+
     def find(
         self,
         query: str = "",
@@ -2416,8 +2573,13 @@ class SyncHTTPClient:
         pattern: str,
         uri: str = "viking://",
         node_limit: int = 256,
+        extra_fields: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        return run_async(self._async_client.glob(pattern, uri=uri, node_limit=node_limit))
+        return run_async(
+            self._async_client.glob(
+                pattern, uri=uri, node_limit=node_limit, extra_fields=extra_fields
+            )
+        )
 
     def create_session(
         self,
@@ -2584,8 +2746,15 @@ class SyncHTTPClient:
             )
         )
 
-    def admin_list_accounts(self) -> List[Any]:
-        return run_async(self._async_client.admin_list_accounts())
+    def admin_list_accounts(
+        self,
+        name: Optional[str] = None,
+        limit: Optional[int] = None,
+        page: int = 1,
+    ) -> List[Any]:
+        return run_async(
+            self._async_client.admin_list_accounts(name=name, limit=limit, page=page)
+        )
 
     def admin_delete_account(self, account_id: str) -> Dict[str, Any]:
         return run_async(self._async_client.admin_delete_account(account_id))
@@ -2608,8 +2777,19 @@ class SyncHTTPClient:
             )
         )
 
-    def admin_list_users(self, account_id: str) -> List[Any]:
-        return run_async(self._async_client.admin_list_users(account_id))
+    def admin_list_users(
+        self,
+        account_id: str,
+        limit: Optional[int] = None,
+        name: Optional[str] = None,
+        role: Optional[str] = None,
+        page: int = 1,
+    ) -> List[Any]:
+        return run_async(
+            self._async_client.admin_list_users(
+                account_id, limit=limit, name=name, role=role, page=page
+            )
+        )
 
     def admin_remove_user(self, account_id: str, user_id: str) -> Dict[str, Any]:
         return run_async(self._async_client.admin_remove_user(account_id, user_id))
@@ -2621,6 +2801,32 @@ class SyncHTTPClient:
         self, account_id: str, user_id: str, seed: Optional[str] = None
     ) -> Dict[str, Any]:
         return run_async(self._async_client.admin_regenerate_key(account_id, user_id, seed=seed))
+
+    def admin_create_group(self, account_id: str, group_id: str) -> Dict[str, Any]:
+        return run_async(self._async_client.admin_create_group(account_id, group_id))
+
+    def admin_list_groups(self, account_id: str) -> List[Any]:
+        return run_async(self._async_client.admin_list_groups(account_id))
+
+    def admin_delete_group(self, account_id: str, group_id: str) -> Dict[str, Any]:
+        return run_async(self._async_client.admin_delete_group(account_id, group_id))
+
+    def admin_list_group_members(self, account_id: str, group_id: str) -> Dict[str, Any]:
+        return run_async(self._async_client.admin_list_group_members(account_id, group_id))
+
+    def admin_add_group_member(
+        self, account_id: str, group_id: str, user_id: str
+    ) -> Dict[str, Any]:
+        return run_async(
+            self._async_client.admin_add_group_member(account_id, group_id, user_id)
+        )
+
+    def admin_remove_group_member(
+        self, account_id: str, group_id: str, user_id: str
+    ) -> Dict[str, Any]:
+        return run_async(
+            self._async_client.admin_remove_group_member(account_id, group_id, user_id)
+        )
 
     def admin_migrate(self, cleanup: bool = False) -> Dict[str, Any]:
         return run_async(self._async_client.admin_migrate(cleanup=cleanup))

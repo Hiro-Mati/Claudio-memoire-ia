@@ -414,9 +414,7 @@ class MarkdownParser(BaseParser):
         doc_name = self._sanitize_for_path(doc_title)
         # Preserve code source filenames as the temp document directory.
         source_name = kwargs.get("source_name")
-        root_name = (
-            source_name if source_name and supports_code_skeleton(source_name) else doc_name
-        )
+        root_name = source_name if source_name and supports_code_skeleton(source_name) else doc_name
         root_dir = (
             temp_uri
             if kwargs.get("flatten_single_output", False)
@@ -426,8 +424,12 @@ class MarkdownParser(BaseParser):
         # Find all headings
         headings = self._find_headings(content)
 
-        # The temp dir is the first thing materialized on apply.
-        ops: List[_LayoutOp] = [_LayoutOp("mkdir", temp_uri)]
+        # The temp dir is the first thing materialized on apply. A flattened
+        # document uses the temp dir itself as its root, which _build_structure
+        # creates below, so do not enqueue the same mkdir twice.
+        ops: List[_LayoutOp] = []
+        if root_dir != temp_uri:
+            ops.append(_LayoutOp("mkdir", temp_uri))
         await self._build_structure(
             ops,
             content,
@@ -782,9 +784,11 @@ class MarkdownParser(BaseParser):
         for row in rows:
             candidate_lines = [*current_lines, row]
             candidate = "\n".join(candidate_lines)
-            if current_lines and (
-                len(candidate) > max_chars or self._estimate_token_count(candidate) > max_size
-            ) and current_data_rows > 0:
+            if (
+                current_lines
+                and (len(candidate) > max_chars or self._estimate_token_count(candidate) > max_size)
+                and current_data_rows > 0
+            ):
                 flush()
                 current_lines = [*header, row] if repeat_header else [row]
                 current_data_rows = 1
@@ -945,7 +949,7 @@ class MarkdownParser(BaseParser):
             allowed root, otherwise None
         """
         try:
-            path = Path(path_str)
+            path = Path(self._unwrap_link_destination(path_str))
 
             # Reject absolute paths: they can point anywhere on the host
             if path.is_absolute():
@@ -1020,7 +1024,15 @@ class MarkdownParser(BaseParser):
         return is_valid_image(image_bytes, source_path)
 
     @staticmethod
-    def _is_remote_uri(path: str) -> bool:
+    def _unwrap_link_destination(path: str) -> str:
+        """Return the path represented by a Markdown ``<destination>``."""
+        path = path.strip()
+        if len(path) >= 2 and path.startswith("<") and path.endswith(">"):
+            return path[1:-1]
+        return path
+
+    @classmethod
+    def _is_remote_uri(cls, path: str) -> bool:
         """
         Check if a path is a remote URI.
 
@@ -1031,7 +1043,7 @@ class MarkdownParser(BaseParser):
             True if path starts with http://, https://, viking://, data:, or ftp://
         """
         remote_prefixes = ("http://", "https://", "viking://", "data:", "ftp://")
-        return path.startswith(remote_prefixes)
+        return cls._unwrap_link_destination(path).startswith(remote_prefixes)
 
     @staticmethod
     def _deduplicate_filename(filename: str, used_names: set[str]) -> str:

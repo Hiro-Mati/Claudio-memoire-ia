@@ -433,6 +433,40 @@ impl HttpClient {
         self.post("/api/v1/fs/attrs/set_tags", &body).await
     }
 
+    pub async fn acl_get(&self, uri: &str) -> Result<Value> {
+        self.get("/api/v1/acl", &[("uri".to_string(), uri.to_string())])
+            .await
+    }
+
+    pub async fn acl_set(&self, uri: &str, entries: Vec<Value>) -> Result<Value> {
+        self.put(
+            "/api/v1/acl",
+            &serde_json::json!({"uri": uri, "entries": entries}),
+        )
+        .await
+    }
+
+    pub async fn acl_grant(&self, uri: &str, principal: &str, level: &str) -> Result<Value> {
+        self.post(
+            "/api/v1/acl/grant",
+            &serde_json::json!({"uri": uri, "principal": principal, "level": level}),
+        )
+        .await
+    }
+
+    pub async fn acl_revoke(&self, uri: &str, principal: &str) -> Result<Value> {
+        self.post(
+            "/api/v1/acl/revoke",
+            &serde_json::json!({"uri": uri, "principal": principal}),
+        )
+        .await
+    }
+
+    pub async fn acl_delete(&self, uri: &str) -> Result<Value> {
+        self.delete("/api/v1/acl", &[("uri".to_string(), uri.to_string())])
+            .await
+    }
+
     fn build_write_body(
         uri: &str,
         content: &str,
@@ -550,8 +584,9 @@ impl HttpClient {
         abs_limit: i32,
         show_all_hidden: bool,
         node_limit: i32,
+        extra_fields: &[String],
     ) -> Result<serde_json::Value> {
-        let params = vec![
+        let mut params = vec![
             ("uri".to_string(), uri.to_string()),
             ("simple".to_string(), simple.to_string()),
             ("recursive".to_string(), recursive.to_string()),
@@ -560,6 +595,9 @@ impl HttpClient {
             ("show_all_hidden".to_string(), show_all_hidden.to_string()),
             ("node_limit".to_string(), node_limit.to_string()),
         ];
+        for field in extra_fields {
+            params.push(("extra_fields".to_string(), field.clone()));
+        }
         self.get("/api/v1/fs/ls", &params).await
     }
 
@@ -571,8 +609,9 @@ impl HttpClient {
         show_all_hidden: bool,
         node_limit: i32,
         level_limit: i32,
+        extra_fields: &[String],
     ) -> Result<serde_json::Value> {
-        let params = vec![
+        let mut params = vec![
             ("uri".to_string(), uri.to_string()),
             ("output".to_string(), output.to_string()),
             ("abs_limit".to_string(), abs_limit.to_string()),
@@ -580,6 +619,9 @@ impl HttpClient {
             ("node_limit".to_string(), node_limit.to_string()),
             ("level_limit".to_string(), level_limit.to_string()),
         ];
+        for field in extra_fields {
+            params.push(("extra_fields".to_string(), field.clone()));
+        }
         self.get("/api/v1/fs/tree", &params).await
     }
 
@@ -724,12 +766,16 @@ impl HttpClient {
         pattern: &str,
         uri: &str,
         node_limit: i32,
+        extra_fields: Option<&[String]>,
     ) -> Result<serde_json::Value> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "pattern": pattern,
             "uri": uri,
             "node_limit": node_limit,
         });
+        if let Some(fields) = extra_fields {
+            body["extra_fields"] = serde_json::json!(fields);
+        }
         self.post("/api/v1/search/glob", &body).await
     }
 
@@ -1420,13 +1466,44 @@ impl HttpClient {
             .await
     }
 
-    pub async fn admin_list_accounts(&self) -> Result<Value> {
-        self.get("/api/v1/admin/accounts", &[]).await
+    pub async fn admin_list_accounts(
+        &self,
+        name: Option<String>,
+        limit: Option<u32>,
+        page: u32,
+    ) -> Result<Value> {
+        let mut params = vec![];
+        if let Some(n) = name {
+            params.push(("name".to_string(), n));
+        }
+        if let Some(l) = limit {
+            params.push(("limit".to_string(), l.to_string()));
+            params.push(("page".to_string(), page.to_string()));
+        }
+        self.get("/api/v1/admin/accounts", &params).await
     }
 
     pub async fn admin_delete_account(&self, account_id: &str) -> Result<Value> {
         let path = format!("/api/v1/admin/accounts/{}", account_id);
         self.delete(&path, &[]).await
+    }
+
+    pub async fn admin_set_account_acl_enabled(
+        &self,
+        account_id: &str,
+        enabled: bool,
+    ) -> Result<Value> {
+        let path = format!("/api/v1/admin/accounts/{}/settings", account_id);
+        self.patch(
+            &path,
+            &serde_json::json!({
+                "acl": {
+                    "enabled": enabled,
+                }
+            }),
+            &[],
+        )
+        .await
     }
 
     pub async fn admin_register_user(
@@ -1453,12 +1530,17 @@ impl HttpClient {
     pub async fn admin_list_users(
         &self,
         account_id: &str,
-        limit: u32,
+        limit: Option<u32>,
         name: Option<String>,
         role: Option<String>,
+        page: u32,
     ) -> Result<Value> {
         let path = format!("/api/v1/admin/accounts/{}/users", account_id);
-        let mut params = vec![("limit".to_string(), limit.to_string())];
+        let mut params = vec![];
+        if let Some(l) = limit {
+            params.push(("limit".to_string(), l.to_string()));
+            params.push(("page".to_string(), page.to_string()));
+        }
         if let Some(n) = name {
             params.push(("name".to_string(), n));
         }
@@ -1502,6 +1584,60 @@ impl HttpClient {
             None => serde_json::json!({}),
         };
         self.post(&path, &body).await
+    }
+
+    pub async fn admin_create_group(&self, account_id: &str, group_id: &str) -> Result<Value> {
+        let path = format!("/api/v1/admin/accounts/{}/groups", account_id);
+        self.post(&path, &serde_json::json!({"group_id": group_id}))
+            .await
+    }
+
+    pub async fn admin_list_groups(&self, account_id: &str) -> Result<Value> {
+        let path = format!("/api/v1/admin/accounts/{}/groups", account_id);
+        self.get(&path, &[]).await
+    }
+
+    pub async fn admin_delete_group(&self, account_id: &str, group_id: &str) -> Result<Value> {
+        let path = format!("/api/v1/admin/accounts/{}/groups/{}", account_id, group_id);
+        self.delete(&path, &[]).await
+    }
+
+    pub async fn admin_list_group_members(
+        &self,
+        account_id: &str,
+        group_id: &str,
+    ) -> Result<Value> {
+        let path = format!(
+            "/api/v1/admin/accounts/{}/groups/{}/members",
+            account_id, group_id
+        );
+        self.get(&path, &[]).await
+    }
+
+    pub async fn admin_add_group_member(
+        &self,
+        account_id: &str,
+        group_id: &str,
+        user_id: &str,
+    ) -> Result<Value> {
+        let path = format!(
+            "/api/v1/admin/accounts/{}/groups/{}/members/{}",
+            account_id, group_id, user_id
+        );
+        self.put(&path, &serde_json::json!({})).await
+    }
+
+    pub async fn admin_remove_group_member(
+        &self,
+        account_id: &str,
+        group_id: &str,
+        user_id: &str,
+    ) -> Result<Value> {
+        let path = format!(
+            "/api/v1/admin/accounts/{}/groups/{}/members/{}",
+            account_id, group_id, user_id
+        );
+        self.delete(&path, &[]).await
     }
 
     pub async fn admin_migrate(&self, cleanup: bool) -> Result<Value> {
@@ -2122,7 +2258,7 @@ mod tests {
         let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
 
         client
-            .ls("viking://resources", false, false, "agent", 256, false, 1)
+            .ls("viking://resources", false, false, "agent", 256, false, 1, &[])
             .await
             .expect("ls request should succeed");
 
@@ -2248,7 +2384,7 @@ mod tests {
         let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
 
         client
-            .tree("viking://resources", "agent", 256, false, 1, 3)
+            .tree("viking://resources", "agent", 256, false, 1, 3, &[])
             .await
             .expect("tree request should succeed");
 
@@ -2330,7 +2466,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_seed_payloads_are_sent() {
+    async fn admin_request_payloads_are_sent() {
         let (base_url, request_rx) = spawn_request_capture_server().await;
         let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
         client
@@ -2360,6 +2496,16 @@ mod tests {
         let request = request_rx.await.expect("request should be captured");
         assert!(request.starts_with("POST /api/v1/admin/accounts/acct/users/alice/key "));
         assert!(request.contains(r#""seed":"new-seed""#));
+
+        let (base_url, request_rx) = spawn_request_capture_server().await;
+        let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
+        client
+            .admin_set_account_acl_enabled("acct", true)
+            .await
+            .expect("set account settings should succeed");
+        let request = request_rx.await.expect("request should be captured");
+        assert!(request.starts_with("PATCH /api/v1/admin/accounts/acct/settings "));
+        assert!(request.contains(r#""acl":{"enabled":true}"#));
     }
 
     #[test]

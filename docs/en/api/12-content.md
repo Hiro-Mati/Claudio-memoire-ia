@@ -143,7 +143,7 @@ Read the complete text of an L0, L1, or L2 file.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| uri | str | Yes | - | Viking URI |
+| uri | str | Yes | - | Viking URI (e.g. `viking://resources/docs/api.md`) or a 32-character hex vector record `id` (returned by `stat()`) |
 | offset | int | No | 0 | Starting line number (0-indexed) |
 | limit | int | No | -1 | Number of lines to read, `-1` means read to end |
 | raw | bool | No | false | Return raw stored content without memory-field cleanup. HTTP API only (Python SDK does not expose it yet). |
@@ -151,6 +151,7 @@ Read the complete text of an L0, L1, or L2 file.
 **Notes**
 
 - `read()` accepts file URIs only. Passing an existing directory URI returns `INVALID_ARGUMENT` (`400`), not `NOT_FOUND`. This error carries a structured `details` payload — `details.expected` is `"file"`, `details.actual` is `"directory"`, and `details.resource` is the offending URI (present on the HTTP path) — so clients can detect a file-vs-directory mismatch programmatically (for example, fall back to `list`) instead of string-matching the message.
+- Instead of a Viking URI, you may pass the 32-character hex `id` returned by `stat()` for a file. The server looks up the URI via the vector index and applies the same permission checks. Because indexing is asynchronous, a newly returned ID might not be resolvable immediately; lookup also fails if the corresponding vector record has been deleted. In both cases, the server returns `NOT_FOUND` and indicates that the data may not have been indexed yet or may have been deleted.
 - Public URI parameters accept `resources` and `user` scopes. For session files, use `viking://user/{user_id}/sessions/{session_id}` or the backward-compatible `viking://session/{session_id}` alias. Internal scopes such as `temp` and `queue` return `INVALID_URI`.
 
 
@@ -210,22 +211,22 @@ openviking read viking://resources/docs/api.md
 
 ### write()
 
-Update an existing file, or create a new one when `mode="create"`, and automatically refresh related semantics and vectors.
+Write a file and automatically refresh related semantics and vectors.
 
 **Parameters**
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| uri | str | Yes | - | File URI to write. For `mode="create"`, the file must not already exist |
+| uri | str | Yes | - | File URI to write |
 | content | str | Yes | - | New content to write |
-| mode | str | No | `replace` | `replace`, `append`, or `create` |
+| mode | str | No | `replace` | `replace` overwrites an existing file or creates a missing file; `append` appends to an existing file or creates a missing file; `create` creates only a missing file and returns `409 Conflict` if it already exists |
 | wait | bool | No | `false` | Wait for background semantic/vector refresh |
 | timeout | float | No | `null` | Timeout in seconds when `wait=true` |
 
 **Notes**
 
-- `replace` and `append` require the file to exist; `create` targets a new file and returns `409 Conflict` when the path already exists. Directories are always rejected.
-- `create` only accepts text-writable extensions: `.md`, `.txt`, `.json`, `.yaml`, `.yml`, `.toml`, `.py`, `.js`, `.ts`. Parent directories are created automatically.
+- `replace` and `append` create a missing target file. `append` uses the supplied content as the initial file content in that case. `create` targets only a missing file and returns `409 Conflict` when the path already exists. Directories are always rejected.
+- Explicit `create` only accepts text-writable extensions: `.md`, `.txt`, `.json`, `.yaml`, `.yml`, `.toml`, `.py`, `.js`, `.ts`. Parent directories are created automatically for every write mode.
 - Existing `.abstract.md` and `.overview.md` bodies may be updated, but public APIs cannot create them. A body-only request preserves stored OKF metadata; a full-OKF request must match the stored metadata. Unknown metadata fields are silently dropped. A sidecar body write rebuilds only the directory's existing L0/L1 vectors and does not regenerate semantics.
 - File content is updated before the API returns. `wait` only controls whether the call waits for semantic/vector refresh to finish.
 - The public API no longer accepts `regenerate_semantics` or `revectorize`; write always refreshes related semantics and vectors.
@@ -452,6 +453,12 @@ curl --get http://localhost:1933/api/v1/content/download \
   --output logo.png
 ```
 
+**CLI**
+
+```bash
+ov get viking://resources/images/logo.png ./logo.png
+```
+
 **Response**
 
 On success, the endpoint returns HTTP `200` with the raw file bytes instead of the standard JSON envelope:
@@ -464,7 +471,7 @@ Content-Disposition: attachment; filename*=UTF-8''logo.png
 <binary body>
 ```
 
-The public SDKs and CLI do not currently expose a dedicated raw-byte download method, so this section shows only the HTTP tab.
+`ov get <uri> <local-path>` downloads through the HTTP API above and writes the file to a local path. The Python, TypeScript, and Go SDKs do not currently expose a dedicated raw-byte download method.
 
 ---
 
@@ -571,7 +578,7 @@ This API operates on existing `viking://...` content. It does not import new fil
 
 **Authentication**
 
-- HTTP endpoint: requires admin/root role when authentication is enabled. In `api_key` mode, use an admin key for tenant content; a raw root key cannot access tenant-scoped data.
+- In `api_key` mode, shared `viking://resources/...` targets require an admin key. A regular user key may reindex only its own `viking://user/<user_id>/...` namespace, including the equivalent `viking://~/...` home alias. A root key cannot access tenant-scoped data APIs.
 - Python HTTP client / CLI: sends the current authenticated identity
 
 **Parameters**

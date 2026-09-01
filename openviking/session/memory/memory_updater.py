@@ -906,6 +906,7 @@ class MemoryUpdater:
                 if resolution_skip.reason_code in {
                     MemoryOperationSkipCode.INVALID_PEER_ID,
                     MemoryOperationSkipCode.INVALID_RANGES,
+                    MemoryOperationSkipCode.PAGE_ID_TYPE_MISMATCH,
                 }:
                     logger.warning(message)
                 else:
@@ -1665,6 +1666,16 @@ class MemoryUpdater:
                 ),
                 ctx=ctx,
                 lease_ref=lease_ref,
+            )
+            from openviking.utils.embedding_utils import vectorize_directory_meta
+
+            await vectorize_directory_meta(
+                uri=directory,
+                abstract="",
+                overview=rendered,
+                context_type="memory",
+                ctx=ctx,
+                include_abstract=False,
             )
             return True
         except Exception as e:

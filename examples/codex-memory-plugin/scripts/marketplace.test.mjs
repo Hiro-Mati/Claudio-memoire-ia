@@ -120,6 +120,11 @@ test("required plugin files are present", () => {
     ".mcp.json",
     "hooks/hooks.json",
     "skills/ov-experience-memory/SKILL.md",
+    "skills/openviking-memory/SKILL.md",
+    "skills/ov-memory-doctor/SKILL.md",
+    "skills/ov-memory-doctor/reference.md",
+    "scripts/ov-memory-doctor.mjs",
+    "scripts/shared/doctor-core.mjs",
   ]) {
     assert.ok(existsSync(join(pluginDir, rel)), `missing required plugin file: ${rel}`);
   }
@@ -151,10 +156,19 @@ test("hooks.json uses Codex's native ${PLUGIN_ROOT}, not the legacy placeholder"
     .flat()
     .flatMap((group) => group.hooks || [])
     .map((h) => h.command || "");
-  assert.ok(commands.length >= 4, "expected at least 4 hook commands (SessionStart/UserPromptSubmit/Stop/PreCompact)");
+  assert.ok(commands.length >= 5, "expected at least 5 hook commands (SessionStart/UserPromptSubmit/Stop/SessionEnd/PreCompact)");
   for (const cmd of commands) {
     assert.ok(cmd.includes("${PLUGIN_ROOT}/scripts/"), `hook command must be rooted at \${PLUGIN_ROOT}: ${cmd}`);
   }
+});
+
+test("hooks.json registers SessionEnd within Codex's clamped budget", () => {
+  const parsed = JSON.parse(readFileSync(join(pluginDir, "hooks", "hooks.json"), "utf-8"));
+  const entries = (parsed.hooks?.SessionEnd || []).flatMap((group) => group.hooks || []);
+  assert.equal(entries.length, 1, "expected exactly one SessionEnd hook");
+  assert.match(entries[0].command, /scripts\/session-end\.mjs/);
+  // Codex clamps SessionEnd to 3s; anything larger is silently ignored.
+  assert.ok(entries[0].timeout <= 3, `SessionEnd timeout must be <= 3, got ${entries[0].timeout}`);
 });
 
 test(".mcp.json starts the stdio MCP proxy from the plugin root", () => {
@@ -175,6 +189,8 @@ test("Codex MCP entrypoint forwards only native OpenViking tools", () => {
   const entrypoint = readFileSync(join(pluginDir, "servers", "mcp-proxy.mjs"), "utf-8");
   assert.doesNotMatch(entrypoint, /createExperienceToolProvider/);
   assert.doesNotMatch(entrypoint, /localToolProvider/);
+  assert.match(entrypoint, /resolveMcpActorPeerId\(cfg\)/);
+  assert.doesNotMatch(entrypoint, /resolveEffectivePeerId|process\.cwd\(\)/);
 });
 
 test("canonical MCP tool list matches server registrations", () => {
@@ -183,4 +199,13 @@ test("canonical MCP tool list matches server registrations", () => {
     ...source.matchAll(/@mcp\.tool\(([^)]*)\)\s*\nasync def ([a-z_]+)\(/g),
   ].map((match) => match[1].match(/(?:^|,\s*)name="([a-z_]+)"/)?.[1] || match[2]);
   assert.deepEqual(registered, REAL_MCP_TOOLS);
+});
+
+test("plugin.json declares the skills directory so Codex loads bundled skills", () => {
+  const manifest = readJson(manifestPath);
+  assert.equal(manifest.skills, "./skills/");
+});
+
+test("memory doctor script parses", () => {
+  execFileSync("node", ["--check", join(pluginDir, "scripts", "ov-memory-doctor.mjs")], { stdio: "pipe" });
 });

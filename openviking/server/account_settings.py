@@ -31,6 +31,14 @@ class AccountAgentEvolutionSettings(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class AccountAclSettings(BaseModel):
+    """Account-scoped ACL switch."""
+
+    enabled: bool = False
+
+    model_config = {"extra": "forbid"}
+
+
 class AccountSettings(BaseModel):
     """Persisted account overrides.
 
@@ -38,6 +46,7 @@ class AccountSettings(BaseModel):
     """
 
     agent_evolution: Optional[AccountAgentEvolutionSettings] = None
+    acl: Optional[AccountAclSettings] = None
 
     model_config = {"extra": "forbid"}
 
@@ -46,6 +55,7 @@ class AccountSettingsPatch(BaseModel):
     """Allowlisted account settings accepted by the update API."""
 
     agent_evolution: Optional[AccountAgentEvolutionSettings] = None
+    acl: Optional[AccountAclSettings] = None
 
     model_config = {"extra": "forbid"}
 
@@ -95,7 +105,7 @@ def _parse_account_settings(raw: bytes) -> AccountSettings:
 async def _read_raw(client: AsyncAGFSClient, path: str) -> Optional[bytes]:
     try:
         return _decode_read_result(await client.read(path))
-    except AGFSNotFoundError:
+    except (AGFSNotFoundError, FileNotFoundError):
         return None
 
 
@@ -114,6 +124,12 @@ def effective_agent_evolution_enabled(
     if settings.agent_evolution is None:
         return bool(default_enabled)
     return settings.agent_evolution.enabled
+
+
+def effective_acl_enabled(settings: AccountSettings) -> bool:
+    if settings.acl is None:
+        return False
+    return settings.acl.enabled
 
 
 async def update_account_settings(
@@ -147,7 +163,13 @@ async def update_account_settings(
         updated = current.model_copy(deep=True)
         if patch.agent_evolution is not None:
             updated.agent_evolution = patch.agent_evolution.model_copy(deep=True)
+        if patch.acl is not None:
+            updated.acl = patch.acl.model_copy(deep=True)
         if updated == current:
+            if patch.acl is not None:
+                if viking_fs.acl_manager is None:
+                    raise RuntimeError("ACL is not initialized")
+                viking_fs.acl_manager.set_enabled(account_id, updated.acl.enabled)
             return current
 
         encoded = json.dumps(
@@ -180,6 +202,10 @@ async def update_account_settings(
                     account_id,
                 )
             raise
+        if patch.acl is not None:
+            if viking_fs.acl_manager is None:
+                raise RuntimeError("ACL is not initialized")
+            viking_fs.acl_manager.set_enabled(account_id, updated.acl.enabled)
         return updated
     finally:
         await client.pathlock_release(lease)

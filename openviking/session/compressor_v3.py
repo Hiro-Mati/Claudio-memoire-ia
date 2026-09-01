@@ -54,6 +54,10 @@ from openviking.session.memory.streaming_memory_updater import (
 from openviking.session.memory.utils.json_parser import JsonUtils
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.memory.utils.uri import generate_uri
+from openviking.session.skill.session_skill_context_provider import (
+    SESSION_SKILL_MEMORY_TYPE,
+    load_skill_extract_registry,
+)
 from openviking.session.train import (
     Case,
     ExperienceGradientContext,
@@ -126,11 +130,28 @@ def _initialize_extraction_telemetry() -> None:
         "memory.extract.merged",
         "memory.extract.deleted",
         "memory.extract.skipped",
+        "memory.extract.failed",
     ):
         telemetry.set(name, 0)
 
 
-def _report_extraction_telemetry(result: Any) -> None:
+def _memory_type_by_uri(operations: ResolvedOperations) -> dict[str, str]:
+    """Map applied memory URIs to their stable extraction schema names."""
+    types_by_uri: dict[str, str] = {}
+    for operation in getattr(operations, "upsert_operations", []) or []:
+        memory_type = str(getattr(operation, "memory_type", "") or "unknown")
+        for uri in getattr(operation, "uris", []) or []:
+            types_by_uri[str(uri)] = memory_type
+    for file_content in getattr(operations, "delete_file_contents", []) or []:
+        uri = str(getattr(file_content, "uri", "") or "")
+        if uri:
+            types_by_uri[uri] = str(
+                getattr(file_content, "memory_type", "") or "unknown"
+            )
+    return types_by_uri
+
+
+def _report_extraction_telemetry(result: Any, operations: ResolvedOperations) -> None:
     telemetry = get_current_telemetry()
     telemetry.set(
         "memory.extract.candidates.total",
@@ -139,7 +160,31 @@ def _report_extraction_telemetry(result: Any) -> None:
     telemetry.set("memory.extract.created", len(result.written_uris))
     telemetry.set("memory.extract.merged", len(result.edited_uris))
     telemetry.set("memory.extract.deleted", len(result.deleted_uris))
-    telemetry.set("memory.extract.skipped", len(result.errors))
+    telemetry.set("memory.extract.skipped", len(result.skipped_operations))
+    telemetry.set("memory.extract.failed", len(result.errors))
+
+    types_by_uri = _memory_type_by_uri(operations)
+    actions_by_type: dict[str, dict[str, int]] = {}
+
+    def add(memory_type: Any, action: str) -> None:
+        normalized_type = str(memory_type or "unknown")
+        type_actions = actions_by_type.setdefault(normalized_type, {})
+        type_actions[action] = type_actions.get(action, 0) + 1
+
+    for uri in result.written_uris:
+        add(types_by_uri.get(str(uri), MemoryUpdater.memory_type_from_uri(uri)), "created")
+    for uri in result.edited_uris:
+        add(types_by_uri.get(str(uri), MemoryUpdater.memory_type_from_uri(uri)), "merged")
+    for uri in result.deleted_uris:
+        add(types_by_uri.get(str(uri), MemoryUpdater.memory_type_from_uri(uri)), "deleted")
+    for operation in result.skipped_operations:
+        add(getattr(operation, "memory_type", None), "skipped")
+    for uri, _error in result.errors:
+        add(types_by_uri.get(str(uri), MemoryUpdater.memory_type_from_uri(uri)), "failed")
+
+    for memory_type, actions in actions_by_type.items():
+        for action, value in actions.items():
+            telemetry.set(f"memory.extract.by_type.{memory_type}.{action}", value)
 
 
 async def _commit_experience_snapshot(
@@ -714,7 +759,7 @@ class SessionCompressorV3:
 
         result = update_result.apply_result
         patch_operations = update_result.operations
-        _report_extraction_telemetry(result)
+        _report_extraction_telemetry(result, patch_operations)
 
         memory_diff = None
         if archive_uri and viking_fs and result is not None:
@@ -845,7 +890,8 @@ class SessionCompressorV3:
             gradient_estimator=_NoopGradientEstimator(),
             policy_optimizer=PatchMergePolicyOptimizer(
                 viking_fs=viking_fs,
-                memory_type="skills",
+                memory_type=SESSION_SKILL_MEMORY_TYPE,
+                memory_registry=load_skill_extract_registry(),
             ),
             policy_updater=SkillPolicyUpdater(
                 skill_processor=self.skill_processor,
