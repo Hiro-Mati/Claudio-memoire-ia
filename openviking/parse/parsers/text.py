@@ -38,7 +38,9 @@ class TextParser(BaseParser):
         self, content: str, source_path: Optional[str] = None, instruction: str = "", **kwargs
     ) -> ParseResult:
         """Parse text content - delegates to MarkdownParser."""
-        result = await self._md_parser.parse_content(content, source_path, **kwargs)
+        result = await self._md_parser.parse_content(
+            content, source_path, instruction=instruction, **kwargs
+        )
         result.source_format = "text"
         result.parser_name = "TextParser"
         return result
