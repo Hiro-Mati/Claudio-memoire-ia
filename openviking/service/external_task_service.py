@@ -37,6 +37,7 @@ class ExternalTaskSnapshot:
     status: str
     stage: str | None = None
     result: dict[str, Any] | None = None
+    meta: dict[str, Any] | None = None
     error_code: str | None = None
     error_message: str | None = None
 
@@ -54,6 +55,7 @@ class ExternalTaskProvider(Protocol):
         self,
         ov_task_id: str,
         payload: Mapping[str, Any],
+        private_payload: Mapping[str, Any],
         connection: Mapping[str, Any],
     ) -> str: ...
 
@@ -97,6 +99,7 @@ class ExternalTaskService:
         *,
         resource_id: str | None,
         payload: Mapping[str, Any],
+        private_payload: Mapping[str, Any] | None = None,
         connection: Mapping[str, Any],
         ctx: RequestContext,
     ) -> TaskRecord:
@@ -109,7 +112,10 @@ class ExternalTaskService:
             user_id=ctx.user.user_id,
             task_id=f"{provider.task_id_prefix}{uuid4().hex}",
             meta={"request": dict(payload)},
-            auth={"openviking_connection": dict(connection)},
+            auth={
+                "openviking_connection": dict(connection),
+                "external_request_private": dict(private_payload or {}),
+            },
         )
         enqueued = False
         try:
@@ -128,6 +134,13 @@ class ExternalTaskService:
                 account_id=ctx.account_id,
                 user_id=ctx.user.user_id,
             )
+            current = await tracker.get(
+                task.task_id,
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
+            )
+            if current is not None:
+                task = current
         except BaseException:
             if not enqueued:
                 await tracker.fail(
@@ -164,21 +177,30 @@ class ExternalTaskService:
                 user_id=user_id,
             )
             return
-        connection = await self._connection(task_id, account_id, user_id)
-        external_task_id: str | None = None
+        auth = await self._task_auth(task_id, account_id, user_id)
+        connection = self._mapping(auth.get("openviking_connection"))
+        private_payload = self._mapping(auth.get("external_request_private"))
+        external_task_id = str(auth.get("external_task_id") or "").strip() or None
         try:
             await tracker.start(
                 task_id,
                 account_id=account_id,
                 user_id=user_id,
-                stage="submitting",
+                stage="polling" if external_task_id else "submitting",
             )
-            external_task_id = await self._retry(
-                lambda: provider.submit(task_id, payload, connection),
-                task_id=task_id,
-                operation_name="submit",
-                poll_interval=provider.poll_interval_seconds,
-            )
+            if external_task_id is None:
+                external_task_id = await self._retry(
+                    lambda: provider.submit(task_id, payload, private_payload, connection),
+                    task_id=task_id,
+                    operation_name="submit",
+                    poll_interval=provider.poll_interval_seconds,
+                )
+                await tracker.update_task_auth(
+                    task_id,
+                    {"external_task_id": external_task_id},
+                    account_id=account_id,
+                    user_id=user_id,
+                )
             while True:
                 snapshot = await self._retry(
                     lambda: provider.get(external_task_id, connection),
@@ -209,8 +231,11 @@ class ExternalTaskService:
                     provider,
                     ov_task_id=task_id,
                     payload=payload,
+                    private_payload=private_payload,
                     connection=connection,
                     external_task_id=external_task_id,
+                    account_id=account_id,
+                    user_id=user_id,
                 )
             )
             raise
@@ -227,22 +252,29 @@ class ExternalTaskService:
                 "External task request is missing",
                 transient=False,
             )
+        auth = await self._task_auth(task_id, account_id, user_id)
         await self._cancel_external(
             self._provider(task.task_type),
             ov_task_id=task_id,
             payload=payload,
-            connection=await self._connection(task_id, account_id, user_id),
-            external_task_id=None,
+            private_payload=self._mapping(auth.get("external_request_private")),
+            connection=self._mapping(auth.get("openviking_connection")),
+            external_task_id=str(auth.get("external_task_id") or "").strip() or None,
+            account_id=account_id,
+            user_id=user_id,
         )
 
-    async def _connection(self, task_id: str, account_id: str, user_id: str) -> dict[str, Any]:
-        auth = await get_task_tracker().get_task_auth(
+    @staticmethod
+    async def _task_auth(task_id: str, account_id: str, user_id: str) -> dict[str, Any]:
+        return await get_task_tracker().get_task_auth(
             task_id,
             account_id=account_id,
             user_id=user_id,
         )
-        connection = auth.get("openviking_connection")
-        return dict(connection) if isinstance(connection, dict) else {}
+
+    @staticmethod
+    def _mapping(value: Any) -> dict[str, Any]:
+        return dict(value) if isinstance(value, dict) else {}
 
     async def _apply_snapshot(
         self,
@@ -253,24 +285,20 @@ class ExternalTaskService:
         user_id: str,
     ) -> bool:
         tracker = get_task_tracker()
-        if snapshot.status in _ACTIVE_STATUSES:
+        if snapshot.stage is not None or snapshot.meta:
             await tracker.update_stage(
                 task_id,
                 snapshot.stage or snapshot.status,
                 account_id=account_id,
                 user_id=user_id,
+                meta=snapshot.meta,
             )
+        if snapshot.status in _ACTIVE_STATUSES:
             return False
         if snapshot.status == "completed":
-            if snapshot.result is None:
-                raise ExternalTaskError(
-                    "INVALID_RESPONSE",
-                    "Completed external task did not include a result",
-                    transient=False,
-                )
             await tracker.complete(
                 task_id,
-                snapshot.result,
+                snapshot.result or snapshot.meta or {},
                 account_id=account_id,
                 user_id=user_id,
             )
@@ -305,15 +333,24 @@ class ExternalTaskService:
         *,
         ov_task_id: str,
         payload: Mapping[str, Any],
+        private_payload: Mapping[str, Any],
         connection: Mapping[str, Any],
         external_task_id: str | None,
+        account_id: str,
+        user_id: str,
     ) -> None:
         if external_task_id is None:
             external_task_id = await self._retry(
-                lambda: provider.submit(ov_task_id, payload, connection),
+                lambda: provider.submit(ov_task_id, payload, private_payload, connection),
                 task_id=ov_task_id,
                 operation_name="recover before cancel",
                 poll_interval=provider.poll_interval_seconds,
+            )
+            await get_task_tracker().update_task_auth(
+                ov_task_id,
+                {"external_task_id": external_task_id},
+                account_id=account_id,
+                user_id=user_id,
             )
         snapshot = await self._retry(
             lambda: provider.cancel(external_task_id, connection),
@@ -321,6 +358,13 @@ class ExternalTaskService:
             operation_name="cancel",
             poll_interval=provider.poll_interval_seconds,
         )
+        if await self._apply_snapshot(
+            snapshot,
+            task_id=ov_task_id,
+            account_id=account_id,
+            user_id=user_id,
+        ):
+            return
         while snapshot.status not in _TERMINAL_STATUSES:
             await asyncio.sleep(provider.poll_interval_seconds)
             snapshot = await self._retry(
@@ -329,6 +373,13 @@ class ExternalTaskService:
                 operation_name="poll cancellation",
                 poll_interval=provider.poll_interval_seconds,
             )
+            if await self._apply_snapshot(
+                snapshot,
+                task_id=ov_task_id,
+                account_id=account_id,
+                user_id=user_id,
+            ):
+                return
 
     @staticmethod
     async def _retry(

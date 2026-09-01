@@ -64,6 +64,7 @@ class CompileRequest(BaseModel):
     to: str = Field(min_length=1)
     reason: str | None = None
     skill: str = Field(min_length=1)
+    args: dict[str, Any] | None = None
     runtime_timeout_seconds: float | None = Field(
         default=None,
         gt=0,
@@ -233,6 +234,7 @@ class CompileTask(BaseModel):
     stage: str
     created_at: str
     updated_at: str
+    meta: dict[str, Any] = Field(default_factory=dict)
     result: CompileResult | None = None
     error: CompileErrorInfo | None = None
 
@@ -246,9 +248,16 @@ class CompileTask(BaseModel):
 class CompileAccepted(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    session_id: str
     task_id: str
     status: Literal["accepted"] = "accepted"
     to: str
+
+
+class CompileSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(min_length=1)
 
 
 class CompileFailure(RuntimeError):
@@ -270,6 +279,7 @@ __all__ = [
     "CompileLimits",
     "CompileRequest",
     "CompileResult",
+    "CompileSessionRequest",
     "CompileTask",
     "DEFAULT_COMPILE_REASON",
     "OKF_VERSION",

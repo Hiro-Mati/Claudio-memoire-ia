@@ -26,8 +26,8 @@ async def create_compile(
         ctx,
         include_legacy_user_id=False,
     ).get("openviking_connection", {})
-    accepted = await get_service().compile.create(body, connection=connection, ctx=ctx)
-    return Response(status="ok", result=accepted.model_dump(mode="json"))
+    task = await get_service().compile.create(body, connection=connection, ctx=ctx)
+    return Response(status="ok", result=task.to_dict())
 
 
 __all__ = ["router"]

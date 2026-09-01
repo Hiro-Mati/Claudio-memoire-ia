@@ -496,10 +496,12 @@ class TaskTracker:
         stage: str,
         account_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        *,
+        meta: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Update task stage without changing its lifecycle status."""
+        """Update task progress without changing its lifecycle status."""
         await self._dispatcher.run(
-            lambda: self._update_stage_on_owner(task_id, stage, account_id, user_id)
+            lambda: self._update_stage_on_owner(task_id, stage, account_id, user_id, meta)
         )
 
     async def _update_stage_on_owner(
@@ -508,12 +510,49 @@ class TaskTracker:
         stage: str,
         account_id: Optional[str],
         user_id: Optional[str],
+        meta: Optional[Dict[str, Any]],
     ) -> None:
         async with self._task_locks.acquire(task_id):
             task = await self._load_for_update(task_id, account_id, user_id)
-            if task and task.status in (TaskStatus.PENDING, TaskStatus.RUNNING):
+            if task and task.status in _ACTIVE_STATUSES:
                 updated = deepcopy(task)
                 updated.stage = stage
+                if meta:
+                    updated.meta.update(deepcopy(meta))
+                updated.updated_at = self._next_updated_at(task)
+                await self._persist_and_publish("update", updated)
+
+    async def update_task_auth(
+        self,
+        task_id: str,
+        values: Dict[str, Any],
+        *,
+        account_id: str,
+        user_id: str,
+    ) -> None:
+        """Persist private state required to resume an active task."""
+        self._validate_owner(account_id, user_id)
+        await self._dispatcher.run(
+            lambda: self._update_task_auth_on_owner(
+                task_id,
+                values,
+                account_id,
+                user_id,
+            )
+        )
+
+    async def _update_task_auth_on_owner(
+        self,
+        task_id: str,
+        values: Dict[str, Any],
+        account_id: str,
+        user_id: str,
+    ) -> None:
+        async with self._task_locks.acquire(task_id):
+            task = await self._load_for_update(task_id, account_id, user_id)
+            if task and task.status in _ACTIVE_STATUSES:
+                updated = deepcopy(task)
+                updated.auth.update(deepcopy(values))
                 updated.updated_at = self._next_updated_at(task)
                 await self._persist_and_publish("update", updated)
 

@@ -237,12 +237,12 @@ Search 和 Find 请求的默认 `limit` 为 `10`，可以在每次 API 或 SDK �
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---:|---|
 | `enable` | boolean | `false` | 是否启用外部 Compile Server |
-| `host` | string | `""` | 外部服务地址，必须包含 `http://` 或 `https://` |
-| `api_key` | string | `""` | OV 调用外部服务使用的服务级凭证 |
+| `base_url` | string | `""` | 外部服务地址，必须包含 `http://` 或 `https://` |
+| `gateway_token` | string | `""` | OV 调用 Compile Gateway 使用的服务凭证 |
 | `http_timeout_seconds` | number | `10` | 单次 HTTP 请求超时 |
 | `poll_interval_ms` | integer | `3000` | 外部任务状态轮询间隔 |
 
-启用后，OV 会把当前调用用户的 OV API Key 放入 `openviking_connection`，供外部服务写回正确的 OV 实例。完整协议见[外部 Compile Server 对接说明](../../design/external-compile-server-api.md)。
+启用后，OV 通过 `X-API-Key` 传递当前用户的 OV API Key，并通过 `X-Gateway-Token` 传递服务身份。完整协议见[Compile Server 对接说明](../../design/external-compile-server-api.md)。
 
 ## Reindex 配置
 

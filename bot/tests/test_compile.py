@@ -4268,10 +4268,18 @@ async def test_compile_create_task_connection_and_exec(
     accepted = await service.create_task(
         _compile_request(connection=with_connection),
         principal_scope=principal_scope,
+        task_id="cmp_ov_task",
     )
     await started.wait()
+    repeated = await service.create_task(
+        _compile_request(connection=with_connection),
+        principal_scope=principal_scope,
+        task_id="cmp_ov_task",
+    )
 
     assert accepted.status == "accepted"
+    assert accepted.session_id == "cmp_ov_task"
+    assert repeated.session_id == accepted.session_id
     assert service._compile_capabilities().exec_enabled is expected_exec
     expected_connection = {"api_key": "secret"} if with_connection else {}
     assert observed == {

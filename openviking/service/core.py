@@ -119,7 +119,11 @@ class OpenVikingService:
         self._debug_service = DebugService()
         self._agent_evolution_service = AgentEvolutionService()
         self._external_task_service = ExternalTaskService()
-        self._compile_service = CompileService(config.compile_api, self._external_task_service)
+        self._compile_service = CompileService(
+            config.compile_api,
+            self._external_task_service,
+            self._fs_service,
+        )
         self._external_task_service.register(self._compile_service)
 
         # State

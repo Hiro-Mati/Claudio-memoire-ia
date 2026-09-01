@@ -115,7 +115,14 @@ pub enum SnapshotShowResult {
 pub struct CompileAccepted {
     pub task_id: String,
     pub status: String,
-    pub to: String,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub task_type: Option<String>,
+    #[serde(default)]
+    pub stage: Option<String>,
+    #[serde(default)]
+    pub resource_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

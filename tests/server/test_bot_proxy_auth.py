@@ -15,7 +15,7 @@ import openviking.service.compile_service as compile_service_module
 from openviking.server.auth.plugins import DevAuthPlugin, TrustedAuthPlugin
 from openviking.server.config import ServerConfig
 from openviking.server.identity import AuthMode
-from openviking.service.compile_service import CompileAccepted, CompileService
+from openviking.service.compile_service import CompileService
 from openviking.service.external_task_service import ExternalTaskService
 from openviking.service.task_tracker import TaskRecord, TaskStatus
 from openviking_cli.utils.config.open_viking_config import CompileApiConfig
@@ -252,9 +252,15 @@ async def test_compile_routes_use_ov_owned_task_and_forward_identity(monkeypatch
             calls["request"] = body.model_dump(mode="json", by_alias=True)
             calls["connection"] = connection
             calls["owner"] = (ctx.account_id, ctx.user.user_id)
-            return CompileAccepted(
+            return TaskRecord(
                 task_id="cmp_1",
-                to="viking://resources/wiki",
+                task_type="compile",
+                status=TaskStatus.PENDING,
+                stage="queued",
+                resource_id="viking://resources/source",
+                account_id="acct",
+                user_id="alice",
+                meta={"request": {"to": "viking://resources/wiki"}},
             )
 
         async def get_owned_task(self, task_id, ctx):
@@ -308,24 +314,22 @@ async def test_compile_routes_use_ov_owned_task_and_forward_identity(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_compile_api_client_sends_user_connection_and_idempotency_key(monkeypatch):
-    forwarded = {}
+async def test_compile_api_client_uses_session_protocol_and_documented_auth(monkeypatch):
+    forwarded = []
 
     class FakeResponse:
         status_code = 202
         is_success = True
 
-        @staticmethod
-        def json():
-            return {
-                "task_id": "external_cmp_1",
-                "status": "accepted",
-                "to": "viking://resources/wiki",
-            }
+        def __init__(self, body):
+            self._body = body
+
+        def json(self):
+            return self._body
 
     class FakeClient:
         def __init__(self, **kwargs):
-            forwarded["client"] = kwargs
+            self.kwargs = kwargs
 
         async def __aenter__(self):
             return self
@@ -334,18 +338,49 @@ async def test_compile_api_client_sends_user_connection_and_idempotency_key(monk
             return None
 
         async def request(self, method, url, headers, json):
-            forwarded.update(method=method, url=url, body=json, headers=headers)
-            return FakeResponse()
+            forwarded.append({"method": method, "url": url, "body": json, "headers": headers})
+            if url.endswith("/bot/v1/compile"):
+                return FakeResponse({"session_id": "ma-session-1"})
+            if url.endswith("/compile/cancel"):
+                return FakeResponse(
+                    {
+                        "status": "cancelled",
+                        "stage": "compile: cancelled",
+                        "error": None,
+                        "meta": {},
+                    }
+                )
+            return FakeResponse(
+                {
+                    "status": "running",
+                    "stage": "compile: running",
+                    "error": None,
+                    "meta": {"token_usage": {"total_tokens": 12}},
+                }
+            )
 
     monkeypatch.setattr(compile_service_module.httpx, "AsyncClient", FakeClient)
     service = CompileService(
         CompileApiConfig(
             enable=True,
-            host="https://compile.example.com",
-            api_key="compile-service-key",
+            base_url="https://compile.example.com",
+            gateway_token="compile-gateway-token",
         ),
         ExternalTaskService(),
+        SimpleNamespace(),
     )
+    public_payload, private_payload = service._split_payload(
+        compile_service_module.CompileRequest.model_validate(
+            {
+                "from": ["viking://resources/source"],
+                "to": "viking://resources/wiki",
+                "skill": "viking://agent/skills/wiki",
+                "args": {"model_name": "model-1", "user_key": "model-user-key"},
+            }
+        )
+    )
+    assert public_payload["args"] == {"model_name": "model-1"}
+    assert private_payload == {"args": {"user_key": "model-user-key"}}
     external_task_id = await service.submit(
         "cmp_ov_1",
         {
@@ -354,20 +389,39 @@ async def test_compile_api_client_sends_user_connection_and_idempotency_key(monk
             "skill": "viking://agent/skills/wiki",
         },
         {
+            "args": {"user_key": "model-user-key"},
+        },
+        {
             "server_url": "https://ov.example.com",
             "api_key": "active-user-key",
             "account_id": "acct",
             "user_id": "alice",
         },
     )
+    status_snapshot = await service.get(
+        external_task_id,
+        {"api_key": "active-user-key"},
+    )
+    cancel_snapshot = await service.cancel(
+        external_task_id,
+        {"api_key": "active-user-key"},
+    )
 
-    assert external_task_id == "external_cmp_1"
-    assert forwarded["method"] == "POST"
-    assert forwarded["url"] == "https://compile.example.com/bot/v1/compile"
-    assert forwarded["headers"]["Authorization"] == "Bearer compile-service-key"
-    assert forwarded["headers"]["Idempotency-Key"] == "cmp_ov_1"
-    assert forwarded["headers"]["X-API-Key"] == "active-user-key"
-    assert forwarded["body"]["openviking_connection"]["api_key"] == "active-user-key"
+    assert external_task_id == "ma-session-1"
+    assert [request["url"] for request in forwarded] == [
+        "https://compile.example.com/bot/v1/compile",
+        "https://compile.example.com/compile/status",
+        "https://compile.example.com/compile/cancel",
+    ]
+    assert all(request["method"] == "POST" for request in forwarded)
+    assert forwarded[0]["headers"]["X-Gateway-Token"] == "compile-gateway-token"
+    assert forwarded[0]["headers"]["Idempotency-Key"] == "cmp_ov_1"
+    assert forwarded[0]["headers"]["X-API-Key"] == "active-user-key"
+    assert forwarded[0]["body"]["args"]["user_key"] == "model-user-key"
+    assert "openviking_connection" not in forwarded[0]["body"]
+    assert forwarded[1]["body"] == {"session_id": "ma-session-1"}
+    assert status_snapshot.meta == {"token_usage": {"total_tokens": 12}}
+    assert cancel_snapshot.status == "cancelled"
 
 
 @pytest.mark.asyncio

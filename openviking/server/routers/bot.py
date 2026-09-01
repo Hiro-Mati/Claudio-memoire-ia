@@ -74,11 +74,12 @@ async def create_compile(
         _ctx,
         include_legacy_user_id=False,
     )
-    accepted = await get_service().compile.create(
+    task = await get_service().compile.create(
         body,
         connection=enriched.get("openviking_connection", {}),
         ctx=_ctx,
     )
+    accepted = CompileService.compatibility_accepted(task)
     return Response(status="ok", result=accepted.model_dump(mode="json"))
 
 

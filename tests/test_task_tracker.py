@@ -390,6 +390,16 @@ async def test_to_dict(tracker: TaskTracker):
         "provider": "git_http_basic",
         "password": "secret",
     }
+    await tracker.update_task_auth(
+        task.task_id,
+        {"external_task_id": "session-1"},
+        **_owner_kwargs(),
+    )
+    assert await tracker.get_task_auth(task.task_id, **_owner_kwargs()) == {
+        "provider": "git_http_basic",
+        "password": "secret",
+        "external_task_id": "session-1",
+    }
     assert (await tracker.get(task.task_id, **_owner_kwargs())).auth == {}
     assert (await tracker.list_tasks(**_owner_kwargs()))[0].auth == {}
 

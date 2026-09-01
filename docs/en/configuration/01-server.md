@@ -237,12 +237,12 @@ This setting controls queue-job concurrency. It is separate from `vlm.media.max_
 | Field | Type | Default | Description |
 |---|---|---:|---|
 | `enable` | boolean | `false` | Enable the external Compile server |
-| `host` | string | `""` | External service base URL, including `http://` or `https://` |
-| `api_key` | string | `""` | Service credential used by OV to call the external server |
+| `base_url` | string | `""` | External service base URL, including `http://` or `https://` |
+| `gateway_token` | string | `""` | Service credential used by OV to call the Compile Gateway |
 | `http_timeout_seconds` | number | `10` | Timeout for one HTTP request |
 | `poll_interval_ms` | integer | `3000` | External task polling interval |
 
-When enabled, OV includes the current user's OV API key in `openviking_connection` so the external service can write back to the correct OV instance.
+When enabled, OV sends the current user's OV API key in `X-API-Key` and its service identity in `X-Gateway-Token`.
 
 ## Reindex Settings
 

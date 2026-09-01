@@ -34,7 +34,7 @@ pub async fn run(
         .create_compile(&sources, to.trim(), skill.trim(), reason, runtime_timeout)
         .await?;
     if !wait {
-        render_accepted(&accepted, output_format, compact);
+        render_accepted(&accepted, to.trim(), output_format, compact);
         return Ok(());
     }
 
@@ -105,13 +105,18 @@ fn normalize_sources(values: Vec<String>) -> Result<Vec<String>> {
     Ok(result)
 }
 
-fn render_accepted(value: &CompileAccepted, format: OutputFormat, compact: bool) {
+fn render_accepted(
+    value: &CompileAccepted,
+    requested_to: &str,
+    format: OutputFormat,
+    compact: bool,
+) {
     if matches!(format, OutputFormat::Json) {
         output_success(value, format, compact);
     } else {
         println!("task_id: {}", value.task_id);
         println!("status: {}", value.status);
-        println!("to: {}", value.to);
+        println!("to: {}", value.to.as_deref().unwrap_or(requested_to));
     }
 }
 
@@ -120,12 +125,14 @@ fn render_completed(value: &Value, format: OutputFormat, compact: bool) -> Resul
         output_success(value, format, compact);
         return Ok(());
     }
-    let result: CompileResult = serde_json::from_value(
-        value
-            .get("result")
-            .cloned()
-            .ok_or_else(|| Error::Parse("completed Compile task has no result".into()))?,
-    )?;
+    let Some(result_value) = value.get("result").cloned() else {
+        println!("status: completed");
+        return Ok(());
+    };
+    let Ok(result) = serde_json::from_value::<CompileResult>(result_value) else {
+        println!("status: completed");
+        return Ok(());
+    };
     println!("to: {}", result.to);
     println!("created: {}", result.created.len());
     println!("updated: {}", result.updated.len());

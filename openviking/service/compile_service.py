@@ -10,17 +10,27 @@ from typing import Any, Mapping
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from openviking.core.namespace import classify_uri, uri_parts
+from openviking.core.path_variables import resolve_path_variables
+from openviking.core.uri_validation import validate_request_viking_uri
 from openviking.server.identity import RequestContext
 from openviking.service.external_task_service import (
     ExternalTaskError,
     ExternalTaskService,
     ExternalTaskSnapshot,
 )
+from openviking.service.fs_service import FSService
 from openviking.service.task_tracker import TaskRecord, TaskStatus, get_task_tracker
-from openviking_cli.exceptions import UnauthenticatedError, UnavailableError
+from openviking_cli.exceptions import (
+    InvalidArgumentError,
+    NotFoundError,
+    UnauthenticatedError,
+    UnavailableError,
+)
 from openviking_cli.utils.config.open_viking_config import CompileApiConfig
 
-_EXTERNAL_ACTIVE_STATUSES = frozenset({"accepted", "pending", "running", "committing"})
+_ACTIVE_STATUSES = frozenset({"accepted", "pending", "running", "committing"})
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 
 class CompileRequest(BaseModel):
@@ -30,21 +40,25 @@ class CompileRequest(BaseModel):
     to: str = Field(min_length=1)
     skill: str = Field(min_length=1)
     reason: str | None = None
+    args: dict[str, Any] | None = None
+    # Kept for the existing CLI/local VikingBot path. The documented external
+    # service protocol uses `args` for provider-specific extensions.
     runtime_timeout_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _normalize(self) -> "CompileRequest":
         sources: list[str] = []
         for source in self.from_:
-            normalized = source.strip()
+            normalized = source.strip().rstrip("/")
             if not normalized:
                 raise ValueError("from must not contain empty values")
             if normalized not in sources:
                 sources.append(normalized)
         self.from_ = sources
-        self.to = self.to.strip()
-        self.skill = self.skill.strip()
+        self.to = self.to.strip().rstrip("/")
+        self.skill = self.skill.strip().rstrip("/")
         self.reason = self.reason.strip() if self.reason and self.reason.strip() else None
+        self.args = dict(self.args) if self.args else None
         if not self.to:
             raise ValueError("to must not be empty")
         if not self.skill:
@@ -53,6 +67,8 @@ class CompileRequest(BaseModel):
 
 
 class CompileAccepted(BaseModel):
+    """Legacy `/bot/v1/compile` response retained for existing clients."""
+
     model_config = ConfigDict(extra="forbid")
 
     task_id: str
@@ -61,48 +77,39 @@ class CompileAccepted(BaseModel):
 
 
 class CompileErrorInfo(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     code: str
     message: str
 
 
-class CompileResult(BaseModel):
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
-
-    from_: list[str] = Field(alias="from")
-    to: str
-    skill: str
-    okf_version: str = "0.1"
-    created: list[str] = Field(default_factory=list)
-    updated: list[str] = Field(default_factory=list)
-    unchanged: list[str] = Field(default_factory=list)
-    page_count: int = 0
-    link_count: int = 0
-    warnings: list[str] = Field(default_factory=list)
-
-
-class ExternalCompileTask(BaseModel):
+class CompileSessionAccepted(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    task_id: str
-    status: str
-    stage: str | None = None
-    result: CompileResult | None = None
-    error: CompileErrorInfo | None = None
+    session_id: str
+
+
+class CompileSessionStatus(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    status: str | None = None
+    stage: str
+    error: CompileErrorInfo | str | None = None
+    meta: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
 class _CompileEndpoint:
-    host: str
-    api_key: str
+    base_url: str
+    gateway_token: str
     http_timeout_seconds: float
     poll_interval_ms: int
-    gateway_auth: bool = False
+    local: bool = False
 
 
 class CompileAPIClient:
-    """HTTP client for the external `/bot/v1/compile` API family."""
+    """Client for the Compile Server session protocol."""
 
     def __init__(self, endpoint: _CompileEndpoint) -> None:
         self._endpoint = endpoint
@@ -113,71 +120,62 @@ class CompileAPIClient:
         *,
         idempotency_key: str | None = None,
     ) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
-        if self._endpoint.api_key:
-            header = "X-Gateway-Token" if self._endpoint.gateway_auth else "Authorization"
-            value = (
-                self._endpoint.api_key
-                if self._endpoint.gateway_auth
-                else f"Bearer {self._endpoint.api_key}"
-            )
-            headers[header] = value
-        for field, header in {
-            "api_key": "X-API-Key",
-            "account_id": "X-OpenViking-Account",
-            "user_id": "X-OpenViking-User",
-            "actor_peer_id": "X-OpenViking-Actor-Peer",
-        }.items():
-            value = str(connection.get(field) or "").strip()
-            if value:
-                headers[header] = value
+        headers = {
+            "Content-Type": "application/json",
+            "X-Gateway-Token": self._endpoint.gateway_token,
+        }
+        api_key = str(connection.get("api_key") or "").strip()
+        if api_key:
+            headers["X-API-Key"] = api_key
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
         return headers
 
     async def create(
         self,
-        request: CompileRequest,
+        payload: Mapping[str, Any],
         *,
         connection: Mapping[str, Any],
         idempotency_key: str,
-    ) -> CompileAccepted:
-        payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
-        payload["openviking_connection"] = dict(connection)
-        body = await self._request(
+    ) -> CompileSessionAccepted:
+        body = dict(payload)
+        if not self._endpoint.local:
+            body.pop("runtime_timeout_seconds", None)
+        response = await self._request(
             "POST",
             "/bot/v1/compile",
-            json=payload,
+            json=body,
             headers=self._headers(connection, idempotency_key=idempotency_key),
         )
-        return self._validate(CompileAccepted, body)
+        return self._validate(CompileSessionAccepted, response)
 
     async def get(
         self,
-        task_id: str,
+        session_id: str,
         *,
         connection: Mapping[str, Any],
-    ) -> ExternalCompileTask:
+    ) -> CompileSessionStatus:
         body = await self._request(
-            "GET",
-            f"/bot/v1/compile/{task_id}",
+            "POST",
+            "/compile/status",
+            json={"session_id": session_id},
             headers=self._headers(connection),
         )
-        return self._validate(ExternalCompileTask, body)
+        return self._validate(CompileSessionStatus, body)
 
     async def cancel(
         self,
-        task_id: str,
+        session_id: str,
         *,
         connection: Mapping[str, Any],
-    ) -> ExternalCompileTask:
+    ) -> CompileSessionStatus:
         body = await self._request(
             "POST",
-            f"/bot/v1/compile/{task_id}/cancel",
-            json={},
+            "/compile/cancel",
+            json={"session_id": session_id},
             headers=self._headers(connection),
         )
-        return self._validate(ExternalCompileTask, body)
+        return self._validate(CompileSessionStatus, body)
 
     async def _request(
         self,
@@ -185,18 +183,19 @@ class CompileAPIClient:
         path: str,
         *,
         headers: Mapping[str, str],
-        json: Mapping[str, Any] | None = None,
+        json: Mapping[str, Any],
     ) -> Any:
         try:
             async with httpx.AsyncClient(
                 timeout=self._endpoint.http_timeout_seconds,
-                trust_env=not self._endpoint.gateway_auth,
+                trust_env=not self._endpoint.local,
+                follow_redirects=False,
             ) as client:
                 response = await client.request(
                     method,
-                    f"{self._endpoint.host}{path}",
+                    f"{self._endpoint.base_url}{path}",
                     headers=dict(headers),
-                    json=dict(json) if json is not None else None,
+                    json=dict(json),
                 )
         except httpx.RequestError as exc:
             raise ExternalTaskError("UNAVAILABLE", str(exc), transient=True) from exc
@@ -217,12 +216,11 @@ class CompileAPIClient:
         source = detail if isinstance(detail, dict) else error if isinstance(error, dict) else {}
         default_code = "UNAVAILABLE" if response.status_code >= 500 else "INVALID_ARGUMENT"
         code = str(source.get("code") or default_code)
-        message = str(source.get("message") or detail or "Compile API request failed")
-        status_code = response.status_code
+        message = str(source.get("message") or detail or error or "Compile API request failed")
         raise ExternalTaskError(
             code,
             message,
-            transient=status_code in {408, 425, 429} or status_code >= 500,
+            transient=response.status_code in {408, 425, 429} or response.status_code >= 500,
         )
 
     @staticmethod
@@ -238,36 +236,42 @@ class CompileAPIClient:
 
 
 class CompileService:
-    """Compile API facade and provider for the generic external task owner."""
+    """Validate Compile requests and own their external task lifecycle."""
 
     task_type = "compile"
     task_id_prefix = "cmp_"
 
-    def __init__(self, config: CompileApiConfig, tasks: ExternalTaskService) -> None:
+    def __init__(
+        self,
+        config: CompileApiConfig,
+        tasks: ExternalTaskService,
+        fs: FSService,
+    ) -> None:
         self._config = config
         self._tasks = tasks
+        self._fs = fs
         self._local_endpoint: _CompileEndpoint | None = None
 
     @property
     def poll_interval_seconds(self) -> float:
         return self._endpoint().poll_interval_ms / 1000.0
 
-    def configure_local_backend(self, host: str, gateway_token: str) -> None:
+    def configure_local_backend(self, base_url: str, gateway_token: str) -> None:
         if self._config.enable:
             return
         self._local_endpoint = _CompileEndpoint(
-            host=host.rstrip("/"),
-            api_key=gateway_token,
+            base_url=base_url.rstrip("/"),
+            gateway_token=gateway_token,
             http_timeout_seconds=10.0,
             poll_interval_ms=3000,
-            gateway_auth=True,
+            local=True,
         )
 
     def _endpoint(self) -> _CompileEndpoint:
         if self._config.enable:
             return _CompileEndpoint(
-                host=self._config.host,
-                api_key=self._config.api_key,
+                base_url=self._config.base_url,
+                gateway_token=self._config.gateway_token,
                 http_timeout_seconds=self._config.http_timeout_seconds,
                 poll_interval_ms=self._config.poll_interval_ms,
             )
@@ -284,47 +288,56 @@ class CompileService:
         *,
         connection: Mapping[str, Any],
         ctx: RequestContext,
-    ) -> CompileAccepted:
+    ) -> TaskRecord:
         endpoint = self._endpoint()
-        if not endpoint.gateway_auth and not str(connection.get("api_key") or "").strip():
+        if not endpoint.local and not str(connection.get("api_key") or "").strip():
             raise UnauthenticatedError("Compile requires a forwardable OpenViking API key")
-        task = await self._tasks.create(
+        normalized = await self._normalize_request(request, ctx)
+        payload, private_payload = self._split_payload(normalized)
+        return await self._tasks.create(
             self.task_type,
-            resource_id=request.to,
-            payload=request.model_dump(mode="json", by_alias=True, exclude_none=True),
+            resource_id=", ".join(normalized.from_),
+            payload=payload,
+            private_payload=private_payload,
             connection=connection,
             ctx=ctx,
         )
-        return CompileAccepted(task_id=task.task_id, to=request.to)
 
     async def submit(
         self,
         ov_task_id: str,
         payload: Mapping[str, Any],
+        private_payload: Mapping[str, Any],
         connection: Mapping[str, Any],
     ) -> str:
+        request_payload = dict(payload)
+        public_args = request_payload.get("args")
+        private_args = private_payload.get("args")
+        if isinstance(public_args, dict) or isinstance(private_args, dict):
+            request_payload["args"] = {
+                **(public_args if isinstance(public_args, dict) else {}),
+                **(private_args if isinstance(private_args, dict) else {}),
+            }
         accepted = await self._client().create(
-            self._validate_request(payload),
+            request_payload,
             connection=connection,
             idempotency_key=ov_task_id,
         )
-        return accepted.task_id
+        return accepted.session_id
 
     async def get(
         self,
         external_task_id: str,
         connection: Mapping[str, Any],
     ) -> ExternalTaskSnapshot:
-        task = await self._client().get(external_task_id, connection=connection)
-        return self._snapshot(task)
+        return self._snapshot(await self._client().get(external_task_id, connection=connection))
 
     async def cancel(
         self,
         external_task_id: str,
         connection: Mapping[str, Any],
     ) -> ExternalTaskSnapshot:
-        task = await self._client().cancel(external_task_id, connection=connection)
-        return self._snapshot(task)
+        return self._snapshot(await self._client().cancel(external_task_id, connection=connection))
 
     async def get_owned_task(self, task_id: str, ctx: RequestContext) -> TaskRecord | None:
         task = await get_task_tracker().get(
@@ -344,42 +357,154 @@ class CompileService:
             user_id=ctx.user.user_id,
         )
 
-    @staticmethod
-    def _validate_request(payload: Mapping[str, Any]) -> CompileRequest:
+    async def _normalize_request(
+        self,
+        request: CompileRequest,
+        ctx: RequestContext,
+    ) -> CompileRequest:
+        sources: list[str] = []
+        for index, source in enumerate(request.from_):
+            uri = validate_request_viking_uri(
+                resolve_path_variables(source),
+                ctx,
+                field_name=f"from[{index}]",
+            ).rstrip("/")
+            stat = await self._fs.stat(uri, ctx)
+            if not stat.get("isDir"):
+                raise InvalidArgumentError(f"Compile source must be a directory: {uri}")
+            canonical = str(stat.get("uri") or uri).rstrip("/")
+            if canonical not in sources:
+                sources.append(canonical)
+
+        skill = request.skill
+        if skill.endswith("/SKILL.md"):
+            skill = skill[: -len("/SKILL.md")]
+        skill = validate_request_viking_uri(
+            resolve_path_variables(skill),
+            ctx,
+            field_name="skill",
+        ).rstrip("/")
+        if not classify_uri(skill).is_skill_root:
+            raise InvalidArgumentError("skill must resolve to a Skill directory or SKILL.md")
+        skill_stat = await self._fs.stat(skill, ctx)
+        if not skill_stat.get("isDir"):
+            raise InvalidArgumentError("skill must resolve to a Skill directory or SKILL.md")
+        skill = str(skill_stat.get("uri") or skill).rstrip("/")
+        skill_file = await self._fs.stat(f"{skill}/SKILL.md", ctx)
+        if skill_file.get("isDir"):
+            raise InvalidArgumentError("Skill directory must contain a SKILL.md file")
+
+        target = validate_request_viking_uri(
+            resolve_path_variables(request.to),
+            ctx,
+            field_name="to",
+        ).rstrip("/")
+        self._validate_target(target)
+        await self._fs.ensure_write_access(target, ctx)
         try:
-            return CompileRequest.model_validate(payload)
-        except ValidationError as exc:
-            raise ExternalTaskError(
-                "INVALID_ARGUMENT",
-                f"Persisted Compile request is invalid: {exc}",
-                transient=False,
-            ) from exc
+            target_stat = await self._fs.stat(target, ctx)
+        except NotFoundError:
+            pass
+        else:
+            if not target_stat.get("isDir"):
+                raise InvalidArgumentError("Compile target must be a directory")
+            target = str(target_stat.get("uri") or target).rstrip("/")
+
+        return request.model_copy(
+            update={"from_": sources, "to": target, "skill": skill},
+        )
 
     @staticmethod
-    def _snapshot(task: ExternalCompileTask) -> ExternalTaskSnapshot:
-        if task.status in _EXTERNAL_ACTIVE_STATUSES:
+    def _validate_target(target: str) -> None:
+        classification = classify_uri(target)
+        parts = uri_parts(target)
+        if classification.context_type == "skill":
+            if not classification.is_skill_namespace or (
+                classification.scope == "agent" and parts != ["agent", "skills"]
+            ):
+                raise InvalidArgumentError(
+                    "Compile Skill target must be a supported skills namespace"
+                )
+            return
+        if classification.context_type not in {"resource", "memory"}:
+            raise InvalidArgumentError(
+                "Compile target must be a resource, memory, or skills directory"
+            )
+        if classification.context_type == "memory":
+            if (
+                classification.content_index is None
+                or len(parts) <= classification.content_index + 1
+            ):
+                raise InvalidArgumentError("Compile target must be inside a memory type directory")
+        elif parts == ["resources"] or (
+            classification.content_index is not None
+            and len(parts) <= classification.content_index + 1
+        ):
+            raise InvalidArgumentError("Compile target must be inside a resource directory")
+
+    @staticmethod
+    def _split_payload(request: CompileRequest) -> tuple[dict[str, Any], dict[str, Any]]:
+        payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
+        args = payload.get("args")
+        if not isinstance(args, dict) or "user_key" not in args:
+            return payload, {}
+        private_payload = {"args": {"user_key": args.pop("user_key")}}
+        if not args:
+            payload.pop("args", None)
+        return payload, private_payload
+
+    @staticmethod
+    def _snapshot(task: CompileSessionStatus) -> ExternalTaskSnapshot:
+        status = (task.status or "").strip().lower()
+        if not status:
+            normalized_stage = task.stage.strip().lower().replace(" ", "")
+            if "cancelled" in normalized_stage or "canceled" in normalized_stage:
+                status = "cancelled"
+            elif task.error is not None or any(
+                marker in normalized_stage for marker in ("failed", "error")
+            ):
+                status = "failed"
+            elif any(
+                marker in normalized_stage
+                for marker in ("completed", "succeeded", "success", "finished")
+            ):
+                status = "completed"
+            else:
+                status = "running"
+        if status in _ACTIVE_STATUSES:
             status = "running"
-        elif task.status == "cancelling":
-            status = "cancelling"
-        elif task.status in {"completed", "failed", "cancelled"}:
-            status = task.status
-        else:
+        elif status == "cancelling":
+            pass
+        elif status not in _TERMINAL_STATUSES:
             raise ExternalTaskError(
                 "INVALID_RESPONSE",
-                f"Unknown Compile task status: {task.status}",
+                f"Unknown Compile task status: {status}",
                 transient=False,
             )
+
+        if isinstance(task.error, CompileErrorInfo):
+            error_code = task.error.code
+            error_message = task.error.message
+        elif task.error:
+            error_code = "UNKNOWN"
+            error_message = str(task.error)
+        else:
+            error_code = None
+            error_message = None
         return ExternalTaskSnapshot(
             status=status,
-            stage=task.stage or task.status,
-            result=(
-                task.result.model_dump(mode="json", by_alias=True)
-                if task.result is not None
-                else None
-            ),
-            error_code=task.error.code if task.error else None,
-            error_message=task.error.message if task.error else None,
+            stage=task.stage,
+            result=task.result,
+            meta=task.meta,
+            error_code=error_code,
+            error_message=error_message,
         )
+
+    @staticmethod
+    def compatibility_accepted(task: TaskRecord) -> CompileAccepted:
+        request = task.meta.get("request")
+        to = str(request.get("to") or "") if isinstance(request, dict) else ""
+        return CompileAccepted(task_id=task.task_id, to=to)
 
     @staticmethod
     def compatibility_status(task: TaskRecord) -> dict[str, Any]:
@@ -407,7 +532,7 @@ __all__ = [
     "CompileAPIClient",
     "CompileAccepted",
     "CompileRequest",
-    "CompileResult",
     "CompileService",
-    "ExternalCompileTask",
+    "CompileSessionAccepted",
+    "CompileSessionStatus",
 ]

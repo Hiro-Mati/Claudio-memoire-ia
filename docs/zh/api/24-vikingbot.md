@@ -134,7 +134,7 @@ data: {"event":"response","data":{"content":"当前知识库包含……","respo
 
 ### compile()
 
-启动一个异步、由 Skill 驱动的 Compile 任务。VikingBot 会加载指定 Skill，使用当前认证用户身份读取来源目录，在任务独立的 AgentLoop 中执行，并将通过校验的产物提交到目标 URI 下。
+启动一个由 OV 托管的异步 Compile 任务。OV 负责校验请求、持久化任务，并把执行交给配置的 Compile Server；内置 VikingBot 实现了同一协议，可用于本地运行。
 
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
@@ -142,6 +142,7 @@ data: {"event":"response","data":{"content":"当前知识库包含……","respo
 | `to` | string | 是 | - | 目标 Resource 或 Memory 目录，或受支持的 Skill namespace |
 | `skill` | string | 是 | - | Skill 目录或其 `SKILL.md` URI |
 | `reason` | string | 否 | Skill 驱动的默认值 | 本次 Compile 的补充指令 |
+| `args` | object | 否 | - | Provider 扩展参数，例如 `model_name` 和 `user_key` |
 | `runtime_timeout_seconds` | number | 否 | 3600 | 正数且有限，且不得超过服务端最大运行时限（默认 3600 秒） |
 
 **HTTP API**
@@ -186,13 +187,15 @@ HTTP 接口返回 `202 Accepted`：
   "status": "ok",
   "result": {
     "task_id": "cmp_01abc",
-    "status": "accepted",
-    "to": "viking://resources/research-wiki"
+    "task_type": "compile",
+    "status": "pending",
+    "stage": "queued",
+    "resource_id": "viking://resources/research"
   }
 }
 ```
 
-`POST /bot/v1/compile` 保留为兼容入口，返回同一个 OV Task ID。
+公开接口返回 OV TaskRecord。`POST /bot/v1/compile` 保留为兼容入口，返回同一个 OV Task ID。
 
 ### compile_status()
 

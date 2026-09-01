@@ -140,8 +140,8 @@ class CompileApiConfig(BaseModel):
     """Configuration for the external Compile task API."""
 
     enable: bool = False
-    host: str = ""
-    api_key: str = ""
+    base_url: str = ""
+    gateway_token: str = ""
     http_timeout_seconds: float = 10.0
     poll_interval_ms: int = 3000
     model_config = {"extra": "forbid"}
@@ -149,17 +149,19 @@ class CompileApiConfig(BaseModel):
     @model_validator(mode="after")
     def _validate(self) -> "CompileApiConfig":
         if self.enable:
-            if not self.host.strip():
-                raise ValueError("compile_api.host is required when compile_api.enable=true")
-            if not self.api_key.strip():
-                raise ValueError("compile_api.api_key is required when compile_api.enable=true")
-        if self.host and "://" not in self.host:
-            raise ValueError("compile_api.host must include scheme (e.g., https://...)")
+            if not self.base_url.strip():
+                raise ValueError("compile_api.base_url is required when compile_api.enable=true")
+            if not self.gateway_token.strip():
+                raise ValueError(
+                    "compile_api.gateway_token is required when compile_api.enable=true"
+                )
+        if self.base_url and "://" not in self.base_url:
+            raise ValueError("compile_api.base_url must include scheme (e.g., https://...)")
         if self.http_timeout_seconds <= 0:
             raise ValueError("compile_api.http_timeout_seconds must be > 0")
         if self.poll_interval_ms <= 0:
             raise ValueError("compile_api.poll_interval_ms must be > 0")
-        self.host = self.host.rstrip("/")
+        self.base_url = self.base_url.rstrip("/")
         return self
 
 

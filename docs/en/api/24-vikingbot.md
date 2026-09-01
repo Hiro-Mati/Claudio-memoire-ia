@@ -137,7 +137,7 @@ data: {"event":"response","data":{"content":"The knowledge base contains…","re
 
 ### compile()
 
-Start an asynchronous, Skill-driven Compile task. VikingBot loads the selected Skill, reads the supplied OpenViking directories with the authenticated user identity, runs a task-scoped AgentLoop, and commits validated outputs below the target URI.
+Start an asynchronous, Skill-driven Compile task owned by OV. OV validates the request, persists the task, and delegates execution to the configured Compile server. The bundled VikingBot implements the same server protocol for local use.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -145,6 +145,7 @@ Start an asynchronous, Skill-driven Compile task. VikingBot loads the selected S
 | `to` | string | Yes | - | Target Resource or Memory directory, or a supported Skill namespace |
 | `skill` | string | Yes | - | Skill directory or its `SKILL.md` URI |
 | `reason` | string | No | Skill-driven default | Additional instructions for this Compile run |
+| `args` | object | No | - | Provider-specific extensions such as `model_name` and `user_key` |
 | `runtime_timeout_seconds` | number | No | 3600 | Positive finite runtime limit no greater than the server maximum (3600 seconds by default) |
 
 **HTTP API**
@@ -189,13 +190,15 @@ The HTTP endpoint returns `202 Accepted`:
   "status": "ok",
   "result": {
     "task_id": "cmp_01abc",
-    "status": "accepted",
-    "to": "viking://resources/research-wiki"
+    "task_type": "compile",
+    "status": "pending",
+    "stage": "queued",
+    "resource_id": "viking://resources/research"
   }
 }
 ```
 
-`POST /bot/v1/compile` remains available as a compatibility endpoint and returns the same OV task ID.
+The public response is the OV task record. `POST /bot/v1/compile` remains available as a compatibility endpoint and returns the same OV task ID.
 
 ### compile_status()
 
