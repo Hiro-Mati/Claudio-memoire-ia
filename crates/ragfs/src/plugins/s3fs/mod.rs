@@ -86,6 +86,14 @@ async fn cached_full_object_read(
     None
 }
 
+fn resolve_read_not_found(path: &str, error: Error, directory_exists: bool) -> Result<Vec<u8>> {
+    if directory_exists {
+        Err(Error::IsADirectory(path.to_string()))
+    } else {
+        Err(error)
+    }
+}
+
 async fn finalize_directory_rename_source_removal(
     object_cache: &S3ObjectCache,
     source_path: &str,
@@ -649,26 +657,35 @@ impl FileSystem for S3FileSystem {
             return Ok(content);
         }
 
-        // Check if it's a directory
-        if key.ends_with('/') || self.client.directory_exists(&normalized).await? {
-            // Try to read as file first
-            if self.client.head_object(&key).await?.is_none() {
-                return Err(Error::IsADirectory(normalized));
-            }
+        if normalized == "/" {
+            return Err(Error::IsADirectory(normalized));
         }
 
-        if offset == 0 && size == 0 {
+        let result = if offset == 0 && size == 0 {
             let cache_generation = self.object_cache.generation();
-            let content = self.client.get_object(&key).await?;
-            if !bypass_cache {
-                self.object_cache
-                    .put_if_current(cache_generation, normalized, content.clone())
-                    .await;
+            match self.client.get_object(&key).await {
+                Ok(content) => {
+                    if !bypass_cache {
+                        self.object_cache
+                            .put_if_current(cache_generation, normalized.clone(), content.clone())
+                            .await;
+                    }
+                    Ok(content)
+                }
+                Err(error) => Err(error),
             }
-            Ok(content)
         } else {
             // Range read
             self.client.get_object_range(&key, offset, size).await
+        };
+
+        match result {
+            Err(error @ Error::NotFound(_)) => resolve_read_not_found(
+                &normalized,
+                error,
+                self.client.directory_exists(&normalized).await?,
+            ),
+            result => result,
         }
     }
 
@@ -1569,6 +1586,15 @@ mod tests {
         assert_eq!(S3FileSystem::file_name("/"), "/");
         assert_eq!(S3FileSystem::file_name("/foo.txt"), "foo.txt");
         assert_eq!(S3FileSystem::file_name("/dir/file.txt"), "file.txt");
+    }
+
+    #[test]
+    fn test_read_not_found_is_translated_to_directory_only_when_directory_exists() {
+        let directory = resolve_read_not_found("/dir", Error::not_found("dir"), true);
+        assert!(matches!(directory, Err(Error::IsADirectory(path)) if path == "/dir"));
+
+        let missing = resolve_read_not_found("/missing", Error::not_found("missing"), false);
+        assert!(matches!(missing, Err(Error::NotFound(path)) if path == "missing"));
     }
 
     #[tokio::test]
