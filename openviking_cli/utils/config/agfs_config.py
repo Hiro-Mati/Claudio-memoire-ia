@@ -91,6 +91,29 @@ class S3Config(BaseModel):
         "during uploads. Disabled by default for backward compatibility.",
     )
 
+    cache_enabled: bool = Field(
+        default=True,
+        description="Enable local S3 directory, metadata, and full-object read caches.",
+    )
+
+    cache_max_size: int = Field(
+        default=10_000,
+        gt=0,
+        description="Maximum entries in the local S3 directory and object caches.",
+    )
+
+    cache_ttl: int = Field(
+        default=600,
+        gt=0,
+        description="Sliding TTL in seconds for local S3 directory and object caches.",
+    )
+
+    stat_cache_ttl: int = Field(
+        default=600,
+        gt=0,
+        description="Sliding TTL in seconds for the local S3 metadata cache.",
+    )
+
     model_config = {"extra": "forbid"}
 
     def validate_config(self):

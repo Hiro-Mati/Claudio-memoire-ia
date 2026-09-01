@@ -8,7 +8,7 @@
 //!
 //! - Full POSIX-like file system operations over S3
 //! - Directory simulation via prefix/delimiter listing + marker objects
-//! - Dual-layer caching (directory listings + stat metadata)
+//! - Local caching for directory listings, stat metadata, and small full-object reads
 //! - Range-based reads for partial file access
 //! - Configurable directory marker modes
 //! - Support for custom S3 endpoints
@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use cache::{S3ListDirCache, S3StatCache};
+use cache::{S3ListDirCache, S3ObjectCache, S3StatCache};
 use client::{ListTreePage, S3Client, S3Vendor};
 use futures::stream::{self, StreamExt};
 use regex::Regex;
@@ -52,18 +52,43 @@ fn s3_is_excluded_path(path: &str, exclude_path: &str) -> bool {
 async fn finalize_remove_all(
     dir_cache: &S3ListDirCache,
     stat_cache: &S3StatCache,
+    object_cache: &S3ObjectCache,
     path: &str,
     result: Result<()>,
 ) -> Result<()> {
     if path == "/" {
         dir_cache.invalidate_prefix("/").await;
         stat_cache.invalidate_prefix("/").await;
+        object_cache.invalidate_prefix("/").await;
     } else {
         dir_cache.invalidate_parent(path).await;
         dir_cache.invalidate_prefix(path).await;
         stat_cache.invalidate_prefix(path).await;
+        object_cache.invalidate_prefix(path).await;
     }
 
+    result
+}
+
+async fn cached_full_object_read(
+    object_cache: &S3ObjectCache,
+    path: &str,
+    offset: u64,
+    size: u64,
+    bypass_cache: bool,
+) -> Option<Vec<u8>> {
+    if offset == 0 && size == 0 && !bypass_cache {
+        return object_cache.get(path).await;
+    }
+    None
+}
+
+async fn finalize_directory_rename_source_removal(
+    object_cache: &S3ObjectCache,
+    source_path: &str,
+    result: Result<()>,
+) -> Result<()> {
+    object_cache.invalidate_prefix(source_path).await;
     result
 }
 
@@ -197,6 +222,7 @@ pub struct S3FileSystem {
     client: Arc<S3Client>,
     dir_cache: S3ListDirCache,
     stat_cache: S3StatCache,
+    object_cache: S3ObjectCache,
 }
 
 impl S3FileSystem {
@@ -214,22 +240,23 @@ impl S3FileSystem {
             .params
             .get("cache_max_size")
             .and_then(|v| v.as_int())
-            .unwrap_or(1000) as usize;
+            .unwrap_or(10_000) as usize;
 
         let cache_ttl = config
             .params
             .get("cache_ttl")
             .and_then(|v| v.as_int())
-            .unwrap_or(30) as u64;
+            .unwrap_or(600) as u64;
 
         let stat_cache_ttl = config
             .params
             .get("stat_cache_ttl")
             .and_then(|v| v.as_int())
-            .unwrap_or(60) as u64;
+            .unwrap_or(600) as u64;
 
         let dir_cache = S3ListDirCache::new(cache_max_size, cache_ttl, cache_enabled);
         let stat_cache = S3StatCache::new(cache_max_size, stat_cache_ttl, cache_enabled);
+        let object_cache = S3ObjectCache::new(cache_max_size, cache_ttl, cache_enabled);
 
         tracing::info!(
             "S3FS initialized: bucket={}, cache={}",
@@ -241,6 +268,7 @@ impl S3FileSystem {
             client: Arc::new(client),
             dir_cache,
             stat_cache,
+            object_cache,
         })
     }
 
@@ -481,6 +509,7 @@ impl FileSystem for S3FileSystem {
         // Invalidate caches
         self.dir_cache.invalidate_parent(&normalized).await;
         self.stat_cache.invalidate(&normalized).await;
+        self.object_cache.invalidate(&normalized).await;
 
         Ok(())
     }
@@ -519,6 +548,7 @@ impl FileSystem for S3FileSystem {
                 self.client.delete_object(&key).await?;
                 self.dir_cache.invalidate_parent(&normalized).await;
                 self.stat_cache.invalidate(&normalized).await;
+                self.object_cache.invalidate(&normalized).await;
                 return Ok(());
             }
         }
@@ -540,6 +570,7 @@ impl FileSystem for S3FileSystem {
             self.dir_cache.invalidate_parent(&normalized).await;
             self.dir_cache.invalidate(&normalized).await;
             self.stat_cache.invalidate(&normalized).await;
+            self.object_cache.invalidate(&normalized).await;
             return Ok(());
         }
 
@@ -552,8 +583,14 @@ impl FileSystem for S3FileSystem {
         if normalized == "/" {
             // Delete everything under prefix
             let result = self.client.delete_directory("").await;
-            return finalize_remove_all(&self.dir_cache, &self.stat_cache, &normalized, result)
-                .await;
+            return finalize_remove_all(
+                &self.dir_cache,
+                &self.stat_cache,
+                &self.object_cache,
+                &normalized,
+                result,
+            )
+            .await;
         }
 
         let result = async {
@@ -569,12 +606,27 @@ impl FileSystem for S3FileSystem {
         // DeleteObjects may succeed for only part of a batch. Always evict the
         // affected cache scope before returning its error so deleted objects do
         // not remain visible until cache expiry.
-        finalize_remove_all(&self.dir_cache, &self.stat_cache, &normalized, result).await
+        finalize_remove_all(
+            &self.dir_cache,
+            &self.stat_cache,
+            &self.object_cache,
+            &normalized,
+            result,
+        )
+        .await
     }
 
     async fn read(&self, path: &str, offset: u64, size: u64) -> Result<Vec<u8>> {
         let normalized = Self::normalize_path(path);
         let key = self.client.build_key(&normalized);
+        let bypass_cache = FsContextView::current().bypass_cache();
+
+        if let Some(content) =
+            cached_full_object_read(&self.object_cache, &normalized, offset, size, bypass_cache)
+                .await
+        {
+            return Ok(content);
+        }
 
         // Check if it's a directory
         if key.ends_with('/') || self.client.directory_exists(&normalized).await? {
@@ -585,8 +637,14 @@ impl FileSystem for S3FileSystem {
         }
 
         if offset == 0 && size == 0 {
-            // Full read
-            self.client.get_object(&key).await
+            let cache_generation = self.object_cache.generation();
+            let content = self.client.get_object(&key).await?;
+            if !bypass_cache {
+                self.object_cache
+                    .put_if_current(cache_generation, normalized, content.clone())
+                    .await;
+            }
+            Ok(content)
         } else {
             // Range read
             self.client.get_object_range(&key, offset, size).await
@@ -610,6 +668,7 @@ impl FileSystem for S3FileSystem {
         // Invalidate caches
         self.dir_cache.invalidate_parent(&normalized).await;
         self.stat_cache.invalidate(&normalized).await;
+        self.object_cache.invalidate(&normalized).await;
 
         Ok(data.len() as u64)
     }
@@ -635,6 +694,7 @@ impl FileSystem for S3FileSystem {
         if changed {
             self.dir_cache.invalidate_parent(&normalized).await;
             self.stat_cache.invalidate(&normalized).await;
+            self.object_cache.invalidate(&normalized).await;
         }
         Ok(changed)
     }
@@ -652,6 +712,7 @@ impl FileSystem for S3FileSystem {
         if changed {
             self.dir_cache.invalidate_parent(&normalized).await;
             self.stat_cache.invalidate(&normalized).await;
+            self.object_cache.invalidate(&normalized).await;
         }
         Ok(changed)
     }
@@ -804,12 +865,17 @@ impl FileSystem for S3FileSystem {
                 // File rename: copy + delete
                 let new_key = self.client.build_key(&new_normalized);
                 self.client.copy_object(&old_key, &new_key).await?;
+                self.dir_cache.invalidate_parent(&new_normalized).await;
+                self.stat_cache.invalidate(&new_normalized).await;
+                self.object_cache.invalidate(&new_normalized).await;
                 self.client.delete_object(&old_key).await?;
 
                 self.dir_cache.invalidate_parent(&old_normalized).await;
                 self.dir_cache.invalidate_parent(&new_normalized).await;
                 self.stat_cache.invalidate(&old_normalized).await;
                 self.stat_cache.invalidate(&new_normalized).await;
+                self.object_cache.invalidate(&old_normalized).await;
+                self.object_cache.invalidate(&new_normalized).await;
 
                 return Ok(());
             }
@@ -827,6 +893,12 @@ impl FileSystem for S3FileSystem {
             let old_dir_key = format!("{}/", self.client.build_key(&old_normalized));
             let new_dir_key = format!("{}/", new_prefix_base);
 
+            // The destination may change even if a later copy or source deletion fails.
+            self.dir_cache.invalidate_prefix(&new_normalized).await;
+            self.dir_cache.invalidate_parent(&new_normalized).await;
+            self.stat_cache.invalidate_prefix(&new_normalized).await;
+            self.object_cache.invalidate_prefix(&new_normalized).await;
+
             if self.client.head_object(&old_dir_key).await?.is_some() {
                 self.client.copy_object(&old_dir_key, &new_dir_key).await?;
             }
@@ -836,10 +908,16 @@ impl FileSystem for S3FileSystem {
                 let relative = obj.key.strip_prefix(&old_prefix).unwrap_or(&obj.key);
                 let new_key = format!("{}/{}", new_prefix_base, relative);
                 self.client.copy_object(&obj.key, &new_key).await?;
+                self.object_cache.invalidate_prefix(&new_normalized).await;
             }
 
             // Delete old directory
-            self.client.delete_directory(&old_normalized).await?;
+            finalize_directory_rename_source_removal(
+                &self.object_cache,
+                &old_normalized,
+                self.client.delete_directory(&old_normalized).await,
+            )
+            .await?;
 
             // Also delete the old directory marker
             let _ = self.client.delete_object(&old_dir_key).await;
@@ -850,6 +928,8 @@ impl FileSystem for S3FileSystem {
             self.dir_cache.invalidate_parent(&new_normalized).await;
             self.stat_cache.invalidate_prefix(&old_normalized).await;
             self.stat_cache.invalidate_prefix(&new_normalized).await;
+            self.object_cache.invalidate_prefix(&old_normalized).await;
+            self.object_cache.invalidate_prefix(&new_normalized).await;
 
             return Ok(());
         }
@@ -880,12 +960,17 @@ impl FileSystem for S3FileSystem {
 
         let dst_key = self.client.build_key(&dst_normalized);
         self.client.copy_object(&src_key, &dst_key).await?;
+        self.dir_cache.invalidate_parent(&dst_normalized).await;
+        self.stat_cache.invalidate(&dst_normalized).await;
+        self.object_cache.invalidate(&dst_normalized).await;
         self.client.delete_object(&src_key).await?;
 
         self.dir_cache.invalidate_parent(&src_normalized).await;
         self.dir_cache.invalidate_parent(&dst_normalized).await;
         self.stat_cache.invalidate(&src_normalized).await;
         self.stat_cache.invalidate(&dst_normalized).await;
+        self.object_cache.invalidate(&src_normalized).await;
+        self.object_cache.invalidate(&dst_normalized).await;
 
         Ok(())
     }
@@ -913,6 +998,7 @@ impl FileSystem for S3FileSystem {
         self.client.put_object(&key, data).await?;
 
         self.stat_cache.invalidate(&normalized).await;
+        self.object_cache.invalidate(&normalized).await;
 
         Ok(())
     }
@@ -1215,25 +1301,25 @@ impl S3FSPlugin {
                     "cache_enabled",
                     "bool",
                     "true",
-                    "Enable caching",
+                    "Enable local directory, metadata, and full-object read caches",
                 ),
                 ConfigParameter::optional(
                     "cache_max_size",
                     "int",
-                    "1000",
-                    "Maximum cache entries",
+                    "10000",
+                    "Maximum entries in the directory and full-object read caches",
                 ),
                 ConfigParameter::optional(
                     "cache_ttl",
                     "int",
-                    "30",
-                    "Directory listing cache TTL in seconds",
+                    "600",
+                    "Sliding TTL in seconds for directory and full-object read caches",
                 ),
                 ConfigParameter::optional(
                     "stat_cache_ttl",
                     "int",
-                    "60",
-                    "Stat cache TTL in seconds",
+                    "600",
+                    "Sliding TTL in seconds for metadata cache",
                 ),
             ],
         }
@@ -1392,6 +1478,25 @@ plugins:
                 return Err(Error::config(
                     "invalid auto_detect_content_type: expected bool",
                 ));
+            }
+        }
+
+        if let Some(value) = config.params.get("cache_enabled") {
+            if value.as_bool().is_none() {
+                return Err(Error::config("invalid cache_enabled: expected bool"));
+            }
+        }
+
+        for name in ["cache_max_size", "cache_ttl", "stat_cache_ttl"] {
+            if let Some(value) = config.params.get(name) {
+                let value = value
+                    .as_int()
+                    .ok_or_else(|| Error::config(format!("invalid {name}: expected integer")))?;
+                if value <= 0 {
+                    return Err(Error::config(format!(
+                        "invalid {name}: must be greater than zero"
+                    )));
+                }
             }
         }
 
@@ -1577,9 +1682,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_plugin_validate_rejects_invalid_cache_settings() {
+        let plugin = S3FSPlugin::new();
+        for (name, value) in [
+            ("cache_max_size", crate::core::ConfigValue::Int(0)),
+            ("cache_ttl", crate::core::ConfigValue::Int(-1)),
+            ("stat_cache_ttl", crate::core::ConfigValue::Int(0)),
+        ] {
+            let mut params = std::collections::HashMap::new();
+            params.insert(
+                "bucket".to_string(),
+                crate::core::ConfigValue::String("test".to_string()),
+            );
+            params.insert(name.to_string(), value);
+            let config = PluginConfig {
+                name: "s3fs".to_string(),
+                mount_path: "/s3".to_string(),
+                params,
+                ..PluginConfig::default()
+            };
+            assert!(
+                plugin.validate(&config).await.is_err(),
+                "{name} should be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_directory_rename_invalidates_source_objects_when_delete_fails() {
+        let object_cache = S3ObjectCache::new(10, 60, true);
+        object_cache
+            .put("/old/file.txt".to_string(), b"stale".to_vec())
+            .await;
+
+        let result = finalize_directory_rename_source_removal(
+            &object_cache,
+            "/old",
+            Err(Error::internal("S3 DeleteObjects partial failure")),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(object_cache.get("/old/file.txt").await, None);
+    }
+
+    #[tokio::test]
+    async fn test_full_read_cache_lookup_returns_before_backend_validation() {
+        let object_cache = S3ObjectCache::new(10, 60, true);
+        object_cache
+            .put("/cached.txt".to_string(), b"cached".to_vec())
+            .await;
+
+        assert_eq!(
+            cached_full_object_read(&object_cache, "/cached.txt", 0, 0, false).await,
+            Some(b"cached".to_vec())
+        );
+        assert_eq!(
+            cached_full_object_read(&object_cache, "/cached.txt", 1, 0, false).await,
+            None
+        );
+        assert_eq!(
+            cached_full_object_read(&object_cache, "/cached.txt", 0, 0, true).await,
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn test_partial_remove_all_error_invalidates_deleted_prefix_caches() {
         let dir_cache = S3ListDirCache::new(10, 60, true);
         let stat_cache = S3StatCache::new(10, 60, true);
+        let object_cache = S3ObjectCache::new(10, 60, true);
 
         let info = FileInfo {
             name: "file.txt".to_string(),
@@ -1603,10 +1775,17 @@ mod tests {
         stat_cache
             .put("/unrelated/file.txt".to_string(), Some(info))
             .await;
+        object_cache
+            .put("/parent/child/file.txt".to_string(), b"deleted".to_vec())
+            .await;
+        object_cache
+            .put("/unrelated/file.txt".to_string(), b"kept".to_vec())
+            .await;
 
         let result = finalize_remove_all(
             &dir_cache,
             &stat_cache,
+            &object_cache,
             "/parent/child",
             Err(Error::internal("S3 DeleteObjects partial failure")),
         )
@@ -1616,8 +1795,13 @@ mod tests {
         assert!(dir_cache.get("/parent").await.is_none());
         assert!(dir_cache.get("/parent/child").await.is_none());
         assert!(stat_cache.get("/parent/child/file.txt").await.is_none());
+        assert!(object_cache.get("/parent/child/file.txt").await.is_none());
         assert!(dir_cache.get("/unrelated").await.is_some());
         assert!(stat_cache.get("/unrelated/file.txt").await.is_some());
+        assert_eq!(
+            object_cache.get("/unrelated/file.txt").await,
+            Some(b"kept".to_vec())
+        );
     }
 
     #[test]

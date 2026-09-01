@@ -105,6 +105,48 @@ def test_agfs_s3_auto_detect_content_type_is_forwarded_to_ragfs_plugin_config():
 
     assert plugins["s3fs"]["config"]["auto_detect_content_type"] is True
 
+
+def test_agfs_s3_cache_settings_default_and_forward_to_ragfs_plugin_config():
+    config = AGFSConfig(
+        path="/tmp/ov-test",
+        backend="s3",
+        s3=S3Config(
+            bucket="my-bucket",
+            region="us-west-1",
+            access_key="fake-access-key-for-testing",
+            secret_key="fake-secret-key-for-testing-12345",
+            endpoint="https://s3.amazonaws.com",
+        ),
+    )
+
+    assert config.s3.cache_enabled is True
+    assert config.s3.cache_max_size == 10_000
+    assert config.s3.cache_ttl == 600
+    assert config.s3.stat_cache_ttl == 600
+
+    plugins = _generate_plugin_config(config, Path("/tmp/ov-test"))
+    assert plugins["s3fs"]["config"] == {
+        **plugins["s3fs"]["config"],
+        "cache_enabled": True,
+        "cache_max_size": 10_000,
+        "cache_ttl": 600,
+        "stat_cache_ttl": 600,
+    }
+
+    config.s3.cache_enabled = False
+    config.s3.cache_max_size = 123
+    config.s3.cache_ttl = 456
+    config.s3.stat_cache_ttl = 789
+
+    plugins = _generate_plugin_config(config, Path("/tmp/ov-test"))
+    assert plugins["s3fs"]["config"] == {
+        **plugins["s3fs"]["config"],
+        "cache_enabled": False,
+        "cache_max_size": 123,
+        "cache_ttl": 456,
+        "stat_cache_ttl": 789,
+    }
+
     # Test 2: invalid backend
     print("\n2. Test invalid backend...")
     try:
@@ -606,6 +648,10 @@ def test_generate_plugin_config_materializes_multiwrite_backups(tmp_path):
         "disable_batch_delete": False,
         "normalize_encoding_chars": "#?",
         "auto_detect_content_type": False,
+        "cache_enabled": True,
+        "cache_max_size": 10_000,
+        "cache_ttl": 600,
+        "stat_cache_ttl": 600,
     }
 
 
