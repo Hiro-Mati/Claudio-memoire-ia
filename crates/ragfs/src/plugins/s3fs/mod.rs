@@ -22,7 +22,10 @@ use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use cache::{S3ListDirCache, S3ObjectCache, S3StatCache};
+use cache::{
+    S3ListDirCache, S3ObjectCache, S3StatCache, DEFAULT_OBJECT_CACHE_MAX_FILE_SIZE_BYTES,
+    DEFAULT_OBJECT_CACHE_MAX_SIZE_BYTES,
+};
 use client::{ListTreePage, S3Client, S3Vendor};
 use futures::stream::{self, StreamExt};
 use regex::Regex;
@@ -254,9 +257,29 @@ impl S3FileSystem {
             .and_then(|v| v.as_int())
             .unwrap_or(600) as u64;
 
+        let object_cache_max_file_size_bytes = config
+            .params
+            .get("object_cache_max_file_size_bytes")
+            .and_then(|v| v.as_int())
+            .unwrap_or(DEFAULT_OBJECT_CACHE_MAX_FILE_SIZE_BYTES as i64)
+            as usize;
+
+        let object_cache_max_size_bytes = config
+            .params
+            .get("object_cache_max_size_bytes")
+            .and_then(|v| v.as_int())
+            .unwrap_or(DEFAULT_OBJECT_CACHE_MAX_SIZE_BYTES as i64)
+            as usize;
+
         let dir_cache = S3ListDirCache::new(cache_max_size, cache_ttl, cache_enabled);
         let stat_cache = S3StatCache::new(cache_max_size, stat_cache_ttl, cache_enabled);
-        let object_cache = S3ObjectCache::new(cache_max_size, cache_ttl, cache_enabled);
+        let object_cache = S3ObjectCache::new(
+            cache_max_size,
+            cache_ttl,
+            cache_enabled,
+            object_cache_max_file_size_bytes,
+            object_cache_max_size_bytes,
+        );
 
         tracing::info!(
             "S3FS initialized: bucket={}, cache={}",
@@ -382,8 +405,6 @@ impl S3FileSystem {
 
         Ok((matched, next_last_rel_parts))
     }
-
-
     /// Get file name from path
     fn file_name(path: &str) -> String {
         if path == "/" {
@@ -936,8 +957,6 @@ impl FileSystem for S3FileSystem {
 
         Err(Error::not_found(&old_normalized))
     }
-
-
     async fn replace(&self, src_path: &str, dst_path: &str) -> Result<()> {
         let src_normalized = Self::normalize_path(src_path);
         let dst_normalized = Self::normalize_path(dst_path);
@@ -1321,6 +1340,18 @@ impl S3FSPlugin {
                     "600",
                     "Sliding TTL in seconds for metadata cache",
                 ),
+                ConfigParameter::optional(
+                    "object_cache_max_file_size_bytes",
+                    "int",
+                    "8388608",
+                    "Maximum size in bytes of one full S3 object cached locally",
+                ),
+                ConfigParameter::optional(
+                    "object_cache_max_size_bytes",
+                    "int",
+                    "536870912",
+                    "Maximum total bytes used by the local full-object S3 cache",
+                ),
             ],
         }
     }
@@ -1487,7 +1518,13 @@ plugins:
             }
         }
 
-        for name in ["cache_max_size", "cache_ttl", "stat_cache_ttl"] {
+        for name in [
+            "cache_max_size",
+            "cache_ttl",
+            "stat_cache_ttl",
+            "object_cache_max_file_size_bytes",
+            "object_cache_max_size_bytes",
+        ] {
             if let Some(value) = config.params.get(name) {
                 let value = value
                     .as_int()
@@ -1688,6 +1725,14 @@ mod tests {
             ("cache_max_size", crate::core::ConfigValue::Int(0)),
             ("cache_ttl", crate::core::ConfigValue::Int(-1)),
             ("stat_cache_ttl", crate::core::ConfigValue::Int(0)),
+            (
+                "object_cache_max_file_size_bytes",
+                crate::core::ConfigValue::Int(0),
+            ),
+            (
+                "object_cache_max_size_bytes",
+                crate::core::ConfigValue::Int(-1),
+            ),
         ] {
             let mut params = std::collections::HashMap::new();
             params.insert(
@@ -1710,7 +1755,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_directory_rename_invalidates_source_objects_when_delete_fails() {
-        let object_cache = S3ObjectCache::new(10, 60, true);
+        let object_cache = S3ObjectCache::new(
+            10,
+            60,
+            true,
+            DEFAULT_OBJECT_CACHE_MAX_FILE_SIZE_BYTES,
+            DEFAULT_OBJECT_CACHE_MAX_SIZE_BYTES,
+        );
         object_cache
             .put("/old/file.txt".to_string(), b"stale".to_vec())
             .await;
@@ -1728,7 +1779,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_read_cache_lookup_returns_before_backend_validation() {
-        let object_cache = S3ObjectCache::new(10, 60, true);
+        let object_cache = S3ObjectCache::new(
+            10,
+            60,
+            true,
+            DEFAULT_OBJECT_CACHE_MAX_FILE_SIZE_BYTES,
+            DEFAULT_OBJECT_CACHE_MAX_SIZE_BYTES,
+        );
         object_cache
             .put("/cached.txt".to_string(), b"cached".to_vec())
             .await;
@@ -1751,7 +1808,13 @@ mod tests {
     async fn test_partial_remove_all_error_invalidates_deleted_prefix_caches() {
         let dir_cache = S3ListDirCache::new(10, 60, true);
         let stat_cache = S3StatCache::new(10, 60, true);
-        let object_cache = S3ObjectCache::new(10, 60, true);
+        let object_cache = S3ObjectCache::new(
+            10,
+            60,
+            true,
+            DEFAULT_OBJECT_CACHE_MAX_FILE_SIZE_BYTES,
+            DEFAULT_OBJECT_CACHE_MAX_SIZE_BYTES,
+        );
 
         let info = FileInfo {
             name: "file.txt".to_string(),

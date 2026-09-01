@@ -114,6 +114,18 @@ class S3Config(BaseModel):
         description="Sliding TTL in seconds for the local S3 metadata cache.",
     )
 
+    object_cache_max_file_size_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        gt=0,
+        description="Maximum size in bytes of one full S3 object cached locally.",
+    )
+
+    object_cache_max_size_bytes: int = Field(
+        default=512 * 1024 * 1024,
+        gt=0,
+        description="Maximum total bytes used by the local full-object S3 cache.",
+    )
+
     model_config = {"extra": "forbid"}
 
     def validate_config(self):

@@ -14,8 +14,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-const MAX_OBJECT_CACHE_BYTES: usize = 512 * 1024 * 1024;
-const MAX_OBJECT_CACHE_FILE_BYTES: usize = 8 * 1024 * 1024;
+/// Default total byte budget for cached S3 object bodies.
+pub const DEFAULT_OBJECT_CACHE_MAX_SIZE_BYTES: usize = 512 * 1024 * 1024;
+/// Default per-object byte budget for cached S3 object bodies.
+pub const DEFAULT_OBJECT_CACHE_MAX_FILE_SIZE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Cache entry with timestamp for TTL
 #[derive(Clone)]
@@ -191,14 +193,15 @@ pub struct S3StatCache {
 }
 
 /// Full-object cache for small S3 reads.  The entry count follows the S3FS
-/// cache configuration while the fixed byte limits keep a large object set
-/// from exhausting the service process.
+/// cache configuration while configurable byte limits bound process memory.
 pub struct S3ObjectCache {
     inner: Arc<RwLock<ObjectCacheInner>>,
     generation: AtomicU64,
     ttl: Duration,
     enabled: bool,
     max_entries: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
 }
 
 struct ObjectCacheInner {
@@ -208,7 +211,13 @@ struct ObjectCacheInner {
 
 impl S3ObjectCache {
     /// Create a bounded cache for complete object reads.
-    pub fn new(max_entries: usize, ttl_seconds: u64, enabled: bool) -> Self {
+    pub fn new(
+        max_entries: usize,
+        ttl_seconds: u64,
+        enabled: bool,
+        max_file_bytes: usize,
+        max_total_bytes: usize,
+    ) -> Self {
         let max_entries = if max_entries == 0 {
             10_000
         } else {
@@ -223,6 +232,8 @@ impl S3ObjectCache {
             ttl: Duration::from_secs(if ttl_seconds == 0 { 600 } else { ttl_seconds }),
             enabled,
             max_entries,
+            max_file_bytes,
+            max_total_bytes,
         }
     }
 
@@ -248,13 +259,19 @@ impl S3ObjectCache {
         Some(entry.value.clone())
     }
 
-    /// Store a complete object when it fits within the fixed safety budgets.
+    /// Store a complete object when it fits within configured safety budgets.
     pub async fn put(&self, key: String, value: Vec<u8>) {
-        if !self.enabled || value.len() > MAX_OBJECT_CACHE_FILE_BYTES {
+        if !self.enabled || value.len() > self.max_file_bytes {
             return;
         }
         let mut inner = self.inner.write().await;
-        Self::put_locked(&mut inner, self.max_entries, key, value);
+        Self::put_locked(
+            &mut inner,
+            self.max_entries,
+            self.max_total_bytes,
+            key,
+            value,
+        );
     }
 
     /// Capture the cache generation before a backend read starts.
@@ -264,28 +281,40 @@ impl S3ObjectCache {
 
     /// Store a backend read only when no write-side invalidation occurred.
     pub async fn put_if_current(&self, generation: u64, key: String, value: Vec<u8>) {
-        if !self.enabled || value.len() > MAX_OBJECT_CACHE_FILE_BYTES {
+        if !self.enabled || value.len() > self.max_file_bytes {
             return;
         }
         let mut inner = self.inner.write().await;
         if self.generation() == generation {
-            Self::put_locked(&mut inner, self.max_entries, key, value);
+            Self::put_locked(
+                &mut inner,
+                self.max_entries,
+                self.max_total_bytes,
+                key,
+                value,
+            );
         }
     }
 
-    fn put_locked(inner: &mut ObjectCacheInner, max_entries: usize, key: String, value: Vec<u8>) {
+    fn put_locked(
+        inner: &mut ObjectCacheInner,
+        max_entries: usize,
+        max_total_bytes: usize,
+        key: String,
+        value: Vec<u8>,
+    ) {
         let value_len = value.len();
         if let Some(previous) = inner.cache.pop(&key) {
             inner.bytes = inner.bytes.saturating_sub(previous.value.len());
         }
-        while (inner.bytes + value_len > MAX_OBJECT_CACHE_BYTES || inner.cache.len() >= max_entries)
+        while (inner.bytes + value_len > max_total_bytes || inner.cache.len() >= max_entries)
             && !inner.cache.is_empty()
         {
             if let Some((_key, entry)) = inner.cache.pop_lru() {
                 inner.bytes = inner.bytes.saturating_sub(entry.value.len());
             }
         }
-        if inner.bytes + value_len <= MAX_OBJECT_CACHE_BYTES {
+        if inner.bytes + value_len <= max_total_bytes {
             inner.bytes += value_len;
             inner.cache.put(
                 key,
@@ -472,7 +501,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_object_cache_returns_full_object_and_invalidates_prefix() {
-        let cache = S3ObjectCache::new(10, 60, true);
+        let cache = S3ObjectCache::new(
+            10,
+            60,
+            true,
+            DEFAULT_OBJECT_CACHE_MAX_FILE_SIZE_BYTES,
+            DEFAULT_OBJECT_CACHE_MAX_SIZE_BYTES,
+        );
         cache
             .put("/parent/file.txt".to_string(), b"content".to_vec())
             .await;
@@ -488,7 +523,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_object_cache_respects_capacity_and_lru_recency() {
-        let cache = S3ObjectCache::new(2, 60, true);
+        let cache = S3ObjectCache::new(
+            2,
+            60,
+            true,
+            DEFAULT_OBJECT_CACHE_MAX_FILE_SIZE_BYTES,
+            DEFAULT_OBJECT_CACHE_MAX_SIZE_BYTES,
+        );
         cache.put("/one".to_string(), b"one".to_vec()).await;
         cache.put("/two".to_string(), b"two".to_vec()).await;
 
@@ -503,25 +544,57 @@ mod tests {
 
     #[tokio::test]
     async fn test_object_cache_disabled_or_too_large_never_hits() {
-        let disabled = S3ObjectCache::new(10, 60, false);
+        let disabled = S3ObjectCache::new(
+            10,
+            60,
+            false,
+            DEFAULT_OBJECT_CACHE_MAX_FILE_SIZE_BYTES,
+            DEFAULT_OBJECT_CACHE_MAX_SIZE_BYTES,
+        );
         disabled
             .put("/disabled".to_string(), b"content".to_vec())
             .await;
         assert_eq!(disabled.get("/disabled").await, None);
 
-        let cache = S3ObjectCache::new(10, 60, true);
+        let cache = S3ObjectCache::new(
+            10,
+            60,
+            true,
+            DEFAULT_OBJECT_CACHE_MAX_FILE_SIZE_BYTES,
+            DEFAULT_OBJECT_CACHE_MAX_SIZE_BYTES,
+        );
         cache
             .put(
                 "/too-large".to_string(),
-                vec![0; MAX_OBJECT_CACHE_FILE_BYTES + 1],
+                vec![0; DEFAULT_OBJECT_CACHE_MAX_FILE_SIZE_BYTES + 1],
             )
             .await;
         assert_eq!(cache.get("/too-large").await, None);
     }
 
     #[tokio::test]
+    async fn test_object_cache_respects_configured_byte_budgets() {
+        let cache = S3ObjectCache::new(10, 60, true, 3, 5);
+
+        cache.put("/too-large".to_string(), vec![0; 4]).await;
+        assert_eq!(cache.get("/too-large").await, None);
+
+        cache.put("/first".to_string(), vec![0; 3]).await;
+        cache.put("/second".to_string(), vec![1; 3]).await;
+
+        assert_eq!(cache.get("/first").await, None);
+        assert_eq!(cache.get("/second").await, Some(vec![1; 3]));
+    }
+
+    #[tokio::test]
     async fn test_object_cache_does_not_refill_after_invalidation() {
-        let cache = S3ObjectCache::new(10, 60, true);
+        let cache = S3ObjectCache::new(
+            10,
+            60,
+            true,
+            DEFAULT_OBJECT_CACHE_MAX_FILE_SIZE_BYTES,
+            DEFAULT_OBJECT_CACHE_MAX_SIZE_BYTES,
+        );
         let generation = cache.generation();
 
         cache.invalidate("/file.txt").await;
