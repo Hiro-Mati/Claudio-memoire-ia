@@ -11,7 +11,6 @@ from urllib.parse import urlparse
 
 from openviking.telemetry import tracer
 from openviking.utils.async_client_cache import LoopScopedAsyncClientCache
-from openviking.utils.multimodal import redact_image_data_urls
 from openviking_cli.utils import get_logger
 
 try:
@@ -343,11 +342,6 @@ class OpenAIVLM(VLMBase):
                 self._update_token_usage_from_response(response, duration_seconds=elapsed)
                 return self._build_vlm_response(response, has_tools=True)
             return await self._extract_completion_content_async(response, elapsed)
-
-        # 用 tracer.info 打印请求
-        tracer.info(
-            f"messages={json.dumps(redact_image_data_urls(kwargs), ensure_ascii=False, indent=2)}"
-        )
 
         return await retry_async(
             _call,
