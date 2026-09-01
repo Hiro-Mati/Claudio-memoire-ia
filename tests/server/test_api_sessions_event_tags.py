@@ -70,6 +70,15 @@ async def test_session_config_updates_extraction_context_policy(client: httpx.As
                         "enabled": True,
                         "scopes": ["viking://resources/project-a/"],
                         "max_entries": 2,
+                        "external_providers": [
+                            {
+                                "name": "third-ov",
+                                "type": "third_ov",
+                                "target_uri": "viking://resources/team/",
+                                "max_entries": 1,
+                                "max_tokens": 500,
+                            }
+                        ],
                     },
                 }
             }
@@ -81,6 +90,15 @@ async def test_session_config_updates_extraction_context_policy(client: httpx.As
     assert policy["memory_recall"]["max_entries"] == 3
     assert policy["resource_recall"]["enabled"] is True
     assert policy["resource_recall"]["scopes"] == ["viking://resources/project-a/"]
+    assert policy["resource_recall"]["external_providers"] == [
+        {
+            "name": "third-ov",
+            "type": "third_ov",
+            "target_uri": "viking://resources/team/",
+            "max_entries": 1,
+            "max_tokens": 500,
+        }
+    ]
 
     updated = await client.patch(
         f"/api/v1/sessions/{session_id}/config",
@@ -100,6 +118,7 @@ async def test_session_config_updates_extraction_context_policy(client: httpx.As
     assert updated_policy["resource_recall"]["max_entries"] == 2
     assert updated_policy["resource_recall"]["max_tokens"] == 1234
     assert updated_policy["resource_recall"]["scopes"] == ["viking://resources/project-a/"]
+    assert updated_policy["resource_recall"]["external_providers"][0]["name"] == "third-ov"
 
 
 async def test_session_event_tags_discard_invalid_values(client: httpx.AsyncClient):

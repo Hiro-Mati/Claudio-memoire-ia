@@ -6,6 +6,7 @@ Test that provider instruction correctly instructs LLM.
 
 from openviking.message import ImagePart, Message, TextPart, ToolPart
 from openviking.server.identity import RequestContext, Role
+from openviking.session.memory.resource_recall_providers import ResourceRecallItem
 from openviking.session.memory.session_extract_context_provider import SessionExtractContextProvider
 from openviking.session.memory.vision_message_normalizer import IMAGE_DESCRIPTION_PROMPT
 from openviking_cli.session.user_id import UserIdentifier
@@ -423,6 +424,88 @@ class TestSessionConversationToolFiltering:
             }
         ]
         assert provider._viking_fs.search_calls[-1]["target_uri"] == ["viking://resources/"]
+
+    async def test_prefetch_appends_external_third_ov_resource_context(self, monkeypatch):
+        class FakeExternalProvider:
+            def __init__(self, policy):
+                self.policy = policy
+
+            async def search(self, query, *, limit):
+                assert "boost" in query
+                assert limit == 1
+                return [
+                    ResourceRecallItem(
+                        uri="viking://resources/team/boost-governance.md",
+                        provider=self.policy.name,
+                        provider_type=self.policy.type,
+                        title="Boost governance",
+                        content="",
+                        score=0.87,
+                    )
+                ]
+
+            async def read(self, item):
+                item.content = "Boost changes are tracked in weekly strategy reviews."
+                return item
+
+        def fake_create_external_resource_provider(policy):
+            assert policy.name == "third-ov"
+            assert policy.type == "third_ov"
+            return FakeExternalProvider(policy)
+
+        monkeypatch.setattr(
+            "openviking.session.memory.session_extract_context_provider."
+            "create_external_resource_provider",
+            fake_create_external_resource_provider,
+        )
+        request_ctx = RequestContext(
+            user=UserIdentifier(account_id="default", user_id="default"),
+            role=Role.USER,
+        )
+        provider = SessionExtractContextProvider(
+            messages=[
+                Message(
+                    id="m1",
+                    role="user",
+                    parts=[TextPart("这次把线上 boost 策略整理成文档，后续周粒度 review。")],
+                )
+            ],
+            ctx=request_ctx,
+            viking_fs=None,
+            extraction_context_policy={
+                "memory_recall": {"enabled": False},
+                "event_recall": {"enabled": False},
+                "resource_recall": {
+                    "enabled": True,
+                    "scopes": [],
+                    "max_entries": 0,
+                    "max_tokens": 0,
+                    "external_providers": [
+                        {
+                            "name": "third-ov",
+                            "type": "third_ov",
+                            "target_uri": "viking://resources/team/",
+                            "max_entries": 1,
+                            "max_tokens": 200,
+                        }
+                    ],
+                },
+            },
+        )
+
+        prefetch_messages = await provider.prefetch()
+
+        assert any("Boost governance" in message["content"] for message in prefetch_messages)
+        assert provider.recall_refs()["resource"] == [
+            {
+                "resource_uri": "viking://resources/team/boost-governance.md",
+                "source": "extraction_context_recall",
+                "provider": "third-ov",
+                "provider_type": "third_ov",
+                "title": "Boost governance",
+                "score": 0.87,
+            }
+        ]
 
 
 def test_session_provider_empty_messages_still_uses_environment_fallback(monkeypatch):

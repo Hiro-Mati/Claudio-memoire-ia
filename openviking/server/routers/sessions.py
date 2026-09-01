@@ -127,6 +127,7 @@ class RecallPolicyRequest(BaseModel):
     max_entries: Optional[int] = None
     max_tokens: Optional[int] = None
     scopes: Optional[List[str]] = None
+    external_providers: Optional[List[Dict[str, Any]]] = None
 
     model_config = {"extra": "forbid"}
 

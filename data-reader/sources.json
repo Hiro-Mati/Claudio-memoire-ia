@@ -1,0 +1,10 @@
+{
+  "sources": [
+    {
+      "id": "current",
+      "label": "Local data",
+      "description": "OpenViking local data directory",
+      "path": "../data"
+    }
+  ]
+}

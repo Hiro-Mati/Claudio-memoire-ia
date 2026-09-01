@@ -12,9 +12,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from openviking.message.part import TextPart, ToolPart
 from openviking.server.identity import RequestContext, ToolContext
 from openviking.session.extraction_context_policy import ExtractionContextPolicy, RecallPolicy
+from openviking.session.memory.constants import EVENT_MEMORY_TYPE
 from openviking.session.memory.core import ExtractContextProvider
 from openviking.session.memory.dataclass import MemoryFile
-from openviking.session.memory.constants import EVENT_MEMORY_TYPE
 from openviking.session.memory.memory_isolation_handler import (
     MemoryIsolationHandler,
     RoleScope,
@@ -22,6 +22,10 @@ from openviking.session.memory.memory_isolation_handler import (
 )
 from openviking.session.memory.memory_type_registry import (
     MemoryTypeRegistry,
+)
+from openviking.session.memory.resource_recall_providers import (
+    ResourceRecallItem,
+    create_external_resource_provider,
 )
 from openviking.session.memory.tools import (
     add_tool_call_pair_to_messages,
@@ -499,12 +503,12 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
     def _dedupe_uris(uris: List[str]) -> List[str]:
         return [uri for uri in dict.fromkeys(str(item or "") for item in uris) if uri]
 
-    def _record_recall_ref(self, category: str, uri: str) -> None:
+    def _record_recall_ref(self, category: str, uri: str, ref: Optional[Dict[str, Any]] = None) -> None:
         if not uri:
             return
         refs = self._recall_refs.setdefault(category, [])
         if category == "resource":
-            resource_ref = {
+            resource_ref = ref or {
                 "resource_uri": uri,
                 "source": "extraction_context_recall",
             }
@@ -625,6 +629,64 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
             call_id_seq += 1
         return call_id_seq
 
+    async def _build_external_resource_recall_section(
+        self,
+        *,
+        policy: RecallPolicy,
+        query: str,
+        call_id_seq: int,
+        pre_fetch_messages: List[Dict[str, Any]],
+    ) -> int:
+        if not policy.has_active_external_providers() or not query.strip():
+            return call_id_seq
+        for provider_policy in policy.external_providers:
+            if not provider_policy.active():
+                continue
+            provider = create_external_resource_provider(provider_policy)
+            if provider is None:
+                continue
+            remaining_tokens = provider_policy.max_tokens
+            raw_items = await provider.search(query, limit=provider_policy.max_entries)
+            items: List[ResourceRecallItem] = []
+            seen_uris = set()
+            for item in raw_items:
+                if not item.uri or item.uri in seen_uris:
+                    continue
+                seen_uris.add(item.uri)
+                item = await provider.read(item)
+                rendered = self._fit_token_budget(item.content, remaining_tokens)
+                if not rendered:
+                    continue
+                item.content = rendered
+                remaining_tokens -= max(1, len(rendered) // 4)
+                items.append(item)
+                self._record_recall_ref("resource", item.uri, item.to_ref())
+                if len(items) >= provider_policy.max_entries or remaining_tokens <= 0:
+                    break
+            if not items:
+                continue
+            add_tool_call_pair_to_messages(
+                messages=pre_fetch_messages,
+                call_id=call_id_seq,
+                tool_name="recall_resource",
+                params={
+                    "query": "[Keywords]",
+                    "scope": provider_policy.target_uri,
+                    "provider": provider_policy.name,
+                    "provider_type": provider_policy.type,
+                    "note": (
+                        "External resource recall context only; new facts must be grounded "
+                        "in Conversation History message ranges."
+                    ),
+                },
+                result={
+                    "title": f"Recalled Resources from {provider_policy.name}",
+                    "items": [item.to_snippet() for item in items],
+                },
+            )
+            call_id_seq += 1
+        return call_id_seq
+
     async def _append_selective_recall_context(
         self,
         *,
@@ -658,6 +720,12 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
             title="Recalled Resources",
             policy=policy.resource_recall,
             search_dirs=list(policy.resource_recall.scopes),
+            query=query,
+            call_id_seq=call_id_seq,
+            pre_fetch_messages=pre_fetch_messages,
+        )
+        call_id_seq = await self._build_external_resource_recall_section(
+            policy=policy.resource_recall,
             query=query,
             call_id_seq=call_id_seq,
             pre_fetch_messages=pre_fetch_messages,

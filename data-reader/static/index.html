@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark"><title>OpenViking · Data Reader</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body><div class="app">
+  <header class="topbar">
+    <button class="icon-button mobile-only" id="nav-toggle">☰</button>
+    <a class="brand" href="#/"><span class="brand-mark">V</span><span><strong>Data Reader</strong><small>OpenViking 本地数据阅读器</small></span></a>
+    <label class="search-box"><span>⌕</span><input id="search" type="search" placeholder="搜索路径和文件内容…"><kbd>⌘ K</kbd></label>
+    <button class="icon-button" id="theme-toggle">◐</button>
+  </header>
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-head"><div class="source-block"><label class="eyebrow" for="source-select">DATA SOURCE</label><select id="source-select" aria-label="选择数据源"></select><small id="source-description"></small></div><button class="quiet-button" id="refresh" title="刷新当前数据源">↻</button></div>
+    <div class="stats" id="stats"></div>
+    <div class="filters"><button class="filter active" data-filter="readable">可阅读</button><button class="filter" data-filter="all">全部文件</button><button class="filter" data-filter="hidden">隐藏文件</button></div>
+    <nav class="tree" id="tree"></nav><footer class="sidebar-foot"><span class="status-dot"></span> 本地只读模式</footer>
+  </aside>
+  <main class="main">
+    <section class="welcome" id="welcome"><span class="welcome-icon">⌘</span><p class="eyebrow">OPENVIKING STORAGE</p><h1>把数据读成知识，<br>而不是一堆文件。</h1><p class="lead">从左侧目录开始浏览，或搜索记忆、会话与系统元数据。Markdown 会自动排版，JSON 会格式化，SQLite 可以按表查看。</p><div class="kind-grid" id="kind-grid"></div><div class="shortcuts"><span><kbd>⌘ K</kbd> 搜索</span><span><kbd>↑ ↓</kbd> 浏览结果</span><span><kbd>Esc</kbd> 清空</span></div></section>
+    <section class="search-results hidden" id="search-results"><div class="section-title"><div><p class="eyebrow">FULL-TEXT SEARCH</p><h1 id="result-title">搜索结果</h1></div><span id="result-count"></span></div><div id="result-list"></div></section>
+    <article class="reader hidden" id="reader"><header class="reader-head"><div class="breadcrumbs" id="breadcrumbs"></div><div class="reader-title-row"><div><span class="kind-pill" id="file-kind"></span><h1 id="file-title"></h1></div><button class="quiet-button" id="copy-path">复制路径</button></div><div class="file-meta" id="file-meta"></div></header><div class="reader-body" id="reader-body"></div></article>
+  </main>
+</div><div class="toast" id="toast"></div><script src="/app.js"></script></body>
+</html>

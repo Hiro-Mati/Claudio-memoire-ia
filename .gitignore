@@ -121,6 +121,7 @@ docker-compose.override.yml
 /data/*
 /demo_data/*
 /benchmark_data/*
+/ov_conf/
 .claude
 .openviking
 *.code-workspace

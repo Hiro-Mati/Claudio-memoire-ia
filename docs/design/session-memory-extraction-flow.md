@@ -23,6 +23,91 @@ is set, extraction is limited to those names for both self and peer writes.
 When `working_memory.enabled` is `false`, commit still archives messages and
 runs configured memory extraction, but skips the archive summary.
 
+`memory_extraction_config.extraction_context_policy` controls the context that
+is recalled before V3 extraction. It is session configuration and can be set at
+session creation or patched later:
+
+```json
+{
+  "memory_extraction_config": {
+    "extraction_context_policy": {
+      "memory_recall": {
+        "enabled": true,
+        "mode": "selective",
+        "max_queries": 2,
+        "max_entries": 4,
+        "max_tokens": 3000
+      },
+      "event_recall": {
+        "enabled": true,
+        "mode": "selective",
+        "max_queries": 2,
+        "max_entries": 4,
+        "max_tokens": 3000
+      },
+      "resource_recall": {
+        "enabled": true,
+        "mode": "selective",
+        "max_queries": 2,
+        "max_entries": 4,
+        "max_tokens": 4000,
+        "scopes": ["viking://resources/"],
+        "external_providers": [
+          {
+            "name": "team-knowledge",
+            "type": "openviking_http",
+            "target_uri": "viking://resources/team/",
+            "max_entries": 2,
+            "max_tokens": 2000
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+All recall modes currently accept `off` and `selective`. `memory_recall` and
+`event_recall` use long-term memory/event indexes from the current OpenViking
+service. `resource_recall` can read local OpenViking resources through `scopes`
+and can also read configured external resource providers.
+
+External resource providers are read-only. They enrich extraction context so the
+model can align new writes with existing team knowledge, but they are not a
+source of new memories by themselves; memory operations must still be grounded
+in the committed conversation ranges.
+
+Supported external provider types:
+
+| Type | Transport | Required environment |
+| --- | --- | --- |
+| `openviking_http` | OpenViking HTTP `search/search` plus `content/read` | `OPENVIKING_RESOURCE_RECALL_URL` or `OPENVIKING_RESOURCE_RECALL_BASE_URL` |
+| `third_ov` | Same HTTP shape, with `THIRD_OV_*` environment prefix | `THIRD_OV_OPENVIKING_URL` or `THIRD_OV_BASE_URL` |
+
+Optional environment keys for both prefixes:
+
+| Suffix | Purpose |
+| --- | --- |
+| `_API_PREFIX` | Prefix before `/api/v1`, for example `/openviking` |
+| `_API_KEY` or `_TOKEN` | Auth token sent as `X-API-Key`; `_TOKEN` is also sent as `token` |
+| `_OPENVIKING` | Provider-specific OpenViking identifier header |
+| `_REGION` | Provider-specific region header |
+| `_ACCOUNT` | Sent as `X-OpenViking-Account` |
+| `_USER` | Sent as `X-OpenViking-User` |
+| `_TIMEOUT` or `_TIMEOUT_SECONDS` | HTTP timeout in seconds, default `30` |
+
+Example local setup:
+
+```bash
+export OPENVIKING_RESOURCE_RECALL_URL=http://127.0.0.1:30303
+export OPENVIKING_RESOURCE_RECALL_API_KEY="$USER_OPENVIKING_API_KEY"
+```
+
+Then create or patch a session with the policy above and commit the session.
+During prefetch, the extractor adds synthetic `recall_resource` tool results
+for matched external resources. The final commit response includes resource
+references in recall metadata when the recalled context was used.
+
 ## Memory Type Groups
 
 | Group | Types | Target |
@@ -102,8 +187,48 @@ are initialized only when `allow_self_memory` is true.
 ## Practical Invariants
 
 - V3 user-memory extraction sees the full archived batch once.
+- Selective recall context is appended before extraction and is visible as
+  synthetic recall tool results, not as user conversation content.
+- External resource recall is skipped when the provider has no base URL, the
+  provider errors, or `max_entries`/`max_tokens` is zero.
 - The extractor may emit self and peer operations in the same response.
 - Final write targets are decided per operation by the isolation handler.
 - Peer writes require safe peer IDs observed in the archived batch.
 - `trajectories`, `experiences`, and executable session skills are trained only
   from an extracted case and never write peer memory.
+
+## Deploy And Verify
+
+For local development, install the editable package with test dependencies and
+run the focused tests:
+
+```bash
+UV_CACHE_DIR=/tmp/openviking-uv-cache uv sync --all-extras
+UV_CACHE_DIR=/tmp/openviking-uv-cache uv pip install -e . --force-reinstall
+UV_CACHE_DIR=/tmp/openviking-uv-cache uv run pytest \
+  tests/server/test_api_sessions_event_tags.py \
+  tests/session/memory/test_memory_react_system_prompt.py \
+  data-reader/tests/test_server.py
+```
+
+Run the server with a local config file that is not committed to git:
+
+```bash
+OPENVIKING_CONFIG_FILE=ov_conf/ov.conf \
+OPENVIKING_RESOURCE_RECALL_URL=http://127.0.0.1:30303 \
+OPENVIKING_RESOURCE_RECALL_API_KEY="$USER_OPENVIKING_API_KEY" \
+uv run openviking-server --config ov_conf/ov.conf
+```
+
+To inspect results, use Studio for the integrated product view:
+
+```text
+http://127.0.0.1:30303/studio
+```
+
+Look at the session commit result and the Resources or Memories panels. For
+API-level checks, read the session metadata after patching config and confirm
+that `memory_extraction_config.extraction_context_policy.resource_recall` keeps
+the expected `scopes` and `external_providers`. After a commit, confirm recalled
+resources appear in the recall references and that long-term memory writes are
+still tied to conversation message ranges.
