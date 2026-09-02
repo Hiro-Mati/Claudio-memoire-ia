@@ -444,7 +444,6 @@ class LiteLLMVLMProvider(VLMBase):
             operation_name="LiteLLM VLM completion",
         )
 
-    @tracer("litellm.vlm.call", ignore_result=True, ignore_args=["messages"])
     async def get_completion_async(
         self,
         prompt: str = "",
