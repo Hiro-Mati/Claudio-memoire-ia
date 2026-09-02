@@ -40,6 +40,8 @@ class _FakeLlama:
     init_kwargs = []
     inputs = []
     thread_ids = []
+    inference_started = threading.Event()
+    inference_release = threading.Event()
 
     def __init__(self, **kwargs):
         self.__class__.init_kwargs.append(kwargs)
@@ -47,6 +49,8 @@ class _FakeLlama:
     def create_embedding(self, payload):
         self.__class__.inputs.append(payload)
         self.__class__.thread_ids.append(threading.get_ident())
+        self.__class__.inference_started.set()
+        self.__class__.inference_release.wait()
         return {"data": [{"embedding": [0.1] * 512}]}
 
 
@@ -55,6 +59,8 @@ def _reset_fake_llama():
     _FakeLlama.init_kwargs = []
     _FakeLlama.inputs = []
     _FakeLlama.thread_ids = []
+    _FakeLlama.inference_started.set()
+    _FakeLlama.inference_release.set()
 
 
 def test_embedding_config_defaults_to_local_dense():
@@ -101,27 +107,31 @@ async def test_local_embedder_uses_explicit_model_path(monkeypatch, tmp_path):
 
     assert Path(_FakeLlama.init_kwargs[-1]["model_path"]) == model_path.resolve()
     event_loop_thread_id = threading.get_ident()
-    default_executor_blocker = threading.Event()
     loop = asyncio.get_running_loop()
-    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
-    occupied_default_worker = asyncio.create_task(
-        asyncio.to_thread(default_executor_blocker.wait)
-    )
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=2))
+    _FakeLlama.inference_started.clear()
+    _FakeLlama.inference_release.clear()
+    running = asyncio.create_task(embedder.embed_async("你好", is_query=False))
+    await asyncio.to_thread(_FakeLlama.inference_started.wait)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    queued = asyncio.create_task(embedder.embed_async("世界", is_query=False))
     await asyncio.sleep(0)
 
     try:
-        result = await asyncio.wait_for(
-            embedder.embed_async("你好", is_query=False),
-            timeout=1,
-        )
+        worker_thread_id = await asyncio.wait_for(asyncio.to_thread(threading.get_ident), 1)
+        assert _FakeLlama.inputs == ["你好"]
     finally:
-        default_executor_blocker.set()
-        await occupied_default_worker
-        embedder.close()
+        _FakeLlama.inference_release.set()
+
+    result = await queued
 
     assert len(result.dense_vector) == 512
-    assert _FakeLlama.inputs[-1] == "你好"
-    assert _FakeLlama.thread_ids[-1] != event_loop_thread_id
+    assert _FakeLlama.inputs == ["你好", "世界"]
+    assert worker_thread_id != event_loop_thread_id
+    assert all(thread_id != event_loop_thread_id for thread_id in _FakeLlama.thread_ids)
 
 
 def test_local_embedder_downloads_default_model_and_prefixes_query(monkeypatch, tmp_path):

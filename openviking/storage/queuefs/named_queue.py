@@ -102,9 +102,6 @@ class DequeueHandlerBase(abc.ABC):
         self.report_success()
         return None
 
-    async def close(self) -> None:
-        """Release resources owned by the handler."""
-
     @abc.abstractmethod
     async def on_dequeue(self, data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Called after message dequeue. Returns None to discard message."""
@@ -222,10 +219,6 @@ class NamedQueue:
     def has_dequeue_handler(self) -> bool:
         """Check if dequeue handler exists."""
         return self._dequeue_handler is not None
-
-    async def close(self) -> None:
-        if self._dequeue_handler is not None:
-            await self._dequeue_handler.close()
 
     async def _ensure_initialized(self):
         """Ensure queue directory is created in AGFS."""

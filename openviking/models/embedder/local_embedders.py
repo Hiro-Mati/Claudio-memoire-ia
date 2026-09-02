@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import importlib
 import os
-from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import dataclass
 from functools import partial
@@ -93,6 +92,7 @@ class LocalDenseEmbedder(DenseEmbedderBase):
         runtime_config.setdefault("provider", "local")
         super().__init__(model_name, runtime_config)
 
+        self._inference_lock = asyncio.Lock()
         self.model_spec = get_local_model_spec(model_name)
         self.model_path = model_path
         self.cache_dir = cache_dir or DEFAULT_LOCAL_MODEL_CACHE_DIR
@@ -110,10 +110,6 @@ class LocalDenseEmbedder(DenseEmbedderBase):
 
         self._resolved_model_path = self._resolve_model_path()
         self._llama = self._load_model()
-        self._executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="openviking-local-embedding",
-        )
 
     def _import_llama(self):
         try:
@@ -224,19 +220,19 @@ class LocalDenseEmbedder(DenseEmbedderBase):
         return result
 
     async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
-        context = copy_context()
-        call = partial(self.embed, text, is_query=is_query)
-        return await asyncio.get_running_loop().run_in_executor(
-            self._executor,
-            context.run,
-            call,
+        await self._inference_lock.acquire()
+        inference = asyncio.get_running_loop().run_in_executor(
+            None,
+            copy_context().run,
+            partial(self.embed, text, is_query=is_query),
         )
+        inference.add_done_callback(lambda _: self._inference_lock.release())
+        return await asyncio.shield(inference)
 
     def get_dimension(self) -> int:
         return self._dimension
 
     def close(self):
-        self._executor.shutdown(wait=True, cancel_futures=True)
         close_fn = getattr(self._llama, "close", None)
         if callable(close_fn):
             close_fn()
