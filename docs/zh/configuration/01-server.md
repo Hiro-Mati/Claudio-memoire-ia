@@ -147,6 +147,8 @@ API 型 `embedding`、`vlm`、`query_planner` 和 `rerank` 配置会复用部分
 
 Rerank 没有单独的 `enabled` 字段；配置了对应 provider 所需的凭证后才会启用。
 
+显式指定 `provider` 时必须提供该 provider 所需的凭证：`vikingdb` 需要 `ak` 和 `sk`，`cohere` 需要 `api_key`，`openai` 需要 `api_key` 和 `api_base`，`litellm` 需要 `model`。凭证不全的配置在加载时即被拒绝。
+
 ## 检索配置
 
 ```json
@@ -347,10 +349,17 @@ Provider 和密钥管理配置见[加密指南](../guides/08-encryption.md)。
     "audio": {},
     "video": {},
     "markdown": {},
-    "excel": {},
+    "anydoc": {
+      "enabled": true
+    },
     "html": {},
     "text": {},
-    "directory": {},
+    "directory": {
+      "preserve_structure": true,
+      "max_files": 1000,
+      "max_depth": 10,
+      "max_concurrent": 4
+    },
     "feishu": {
       "domain": "https://open.feishu.cn",
       "max_rows_per_sheet": 1000,
@@ -362,6 +371,19 @@ Provider 和密钥管理配置见[加密指南](../guides/08-encryption.md)。
 }
 ```
 
+`parsers.directory.max_concurrent` 由服务事件循环中的所有目录导入共享。默认值为
+`4` 时，单个目录可以并发执行 4 个 Understanding 任务；多个目录同时导入时，合计仍最多
+执行 4 个。
+
+启用 Understanding 目录路由时，`max_files` 和 `max_depth` 才约束目录导入。每次
+`DirectoryParser` 扫描会在提交该层 Understanding 请求前独立应用限制；嵌套 ZIP 会启动
+新的目录扫描，不与外层共享文件数量和深度预算。关闭 Understanding 时，OpenViking
+原生目录解析不应用这两个限制。
+
+客户端导入本地目录时，完整目录 ZIP 受 `/resources/temp_upload` 上传大小限制。ZIP
+解压后，`DirectoryParser` 不再设置统一的单文件字节限制；每个入选文件遵循对应内置
+Parser 或 Understanding API 后端自身的限制和上传行为。
+
 | 配置项 | 作用 |
 |---|---|
 | `pdf` | PDF 文本、图片和版面解析 |
@@ -369,7 +391,7 @@ Provider 和密钥管理配置见[加密指南](../guides/08-encryption.md)。
 | `image` | 图片理解和 OCR |
 | `audio`、`video` | 音视频内容解析 |
 | `markdown`、`html`、`text` | 文本文档分段 |
-| `excel` | Excel 工作表解析与分段 |
+| `anydoc` | Office 和 EPUB 转换；`enabled=false` 时拒绝这些格式 |
 | `directory` | 目录扫描和忽略规则 |
 | `feishu` | 飞书文档访问与解析 |
 | `webfeed` | Sitemap、RSS 和 Atom 导入 |

@@ -197,7 +197,11 @@ class VolcEngineVLM(OpenAIVLM):
 
         client = self.get_client()
         t0 = time.perf_counter()
-        response = client.chat.completions.create(**kwargs)
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except Exception as error:
+            self.record_failed_call(duration_seconds=time.perf_counter() - t0, error=error)
+            raise
         elapsed = time.perf_counter() - t0
         self._update_token_usage_from_response(response, duration_seconds=elapsed)
         result = self._build_vlm_response(response, has_tools=bool(tools))
@@ -259,6 +263,7 @@ class VolcEngineVLM(OpenAIVLM):
                     tracer.info(f"message.content={content}")
                 return content
             except Exception as e:
+                self.record_failed_call(duration_seconds=time.perf_counter() - t0, error=e)
                 last_error = e
                 if attempt < self.max_retries:
                     await asyncio.sleep(2**attempt)
@@ -418,7 +423,11 @@ class VolcEngineVLM(OpenAIVLM):
 
         client = self.get_client()
         t0 = time.perf_counter()
-        response = client.chat.completions.create(**kwargs)
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except Exception as error:
+            self.record_failed_call(duration_seconds=time.perf_counter() - t0, error=error)
+            raise
         elapsed = time.perf_counter() - t0
         self._update_token_usage_from_response(response, duration_seconds=elapsed)
         result = self._build_vlm_response(response, has_tools=bool(tools))
@@ -462,7 +471,11 @@ class VolcEngineVLM(OpenAIVLM):
 
         client = self.get_async_client()
         t0 = time.perf_counter()
-        response = await client.chat.completions.create(**kwargs)
+        try:
+            response = await client.chat.completions.create(**kwargs)
+        except Exception as error:
+            self.record_failed_call(duration_seconds=time.perf_counter() - t0, error=error)
+            raise
         elapsed = time.perf_counter() - t0
         self._update_token_usage_from_response(response, duration_seconds=elapsed)
         result = self._build_vlm_response(response, has_tools=bool(tools))

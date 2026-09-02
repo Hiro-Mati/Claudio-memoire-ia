@@ -248,6 +248,7 @@ async def test_connector_watch_stores_only_encrypted_replay_state(
         role=str(Role.USER),
     )
     assert task is not None
+    assert task.source_type == "tos"
     assert task.auth_state["provider"] == "connector_encrypted"
     assert "secret" not in json.dumps(task.auth_state)
     assert "auth_state" not in task.to_dict()
@@ -504,6 +505,41 @@ async def test_connector_watch_allows_plaintext_private_state_without_encryption
         account_id="acct",
         path="tos://bucket/docs/",
     ) == ("secret", "tos", {})
+
+
+@pytest.mark.asyncio
+async def test_declared_connector_watch_returns_original_add_type(
+    connector_config,
+    ctx,
+    service,
+):
+    connector_config.allowed_add_types = ["feishu_project"]
+    watch_manager = WatchManager()
+    service._watch_scheduler = SimpleNamespace(watch_manager=watch_manager)
+    submitted = {}
+
+    async def submit(**kwargs):
+        submitted.update(kwargs)
+        return {"status": "accepted"}
+
+    service._connector.submit = AsyncMock(side_effect=submit)
+    await service.add_resource(
+        path="project-ptat4n",
+        ctx=ctx,
+        add_type="feishu_project",
+        to="viking://resources/Project/ptat4n",
+        watch_interval=5,
+    )
+    await submitted["on_success"]()
+
+    task = await watch_manager.get_task_by_uri(
+        "viking://resources/Project/ptat4n",
+        account_id="acct",
+        user_id="alice",
+        role=str(Role.USER),
+    )
+    assert task is not None
+    assert task.source_type == "feishu_project"
 
 
 @pytest.mark.asyncio
@@ -1377,7 +1413,7 @@ async def test_native_git_nested_auth_is_owned_by_durable_task(
         )
     )
     service._plan_source_job_target = AsyncMock(
-        return_value=("viking://resources/private", None, False)
+        return_value=("viking://resources/private", None, False, False)
     )
     service._execute_resource_ingestion = AsyncMock(
         side_effect=AssertionError("Git source work must run in the queue worker")
@@ -1426,7 +1462,7 @@ async def test_native_git_nested_auth_watch_is_copied_from_task_state_by_worker(
         )
     )
     service._plan_source_job_target = AsyncMock(
-        return_value=("viking://resources/private", None, False)
+        return_value=("viking://resources/private", None, False, False)
     )
     service._enqueue_add_resource_job = AsyncMock(
         return_value=SimpleNamespace(task_id="task-private")
@@ -1469,11 +1505,12 @@ async def test_native_git_watch_refresh_queues_with_restored_task_auth(
         )
     )
     service._plan_source_job_target = AsyncMock(
-        return_value=("viking://resources/private", None, False)
+        return_value=("viking://resources/private", None, False, False)
     )
     service._enqueue_add_resource_job = AsyncMock(
         return_value=SimpleNamespace(task_id="task-refresh")
     )
+    ctx.bypass_acl = True
 
     result = await service.refresh_resource(
         path="https://git.example/org/private.git",
@@ -1486,6 +1523,8 @@ async def test_native_git_watch_refresh_queues_with_restored_task_auth(
     assert result["task_id"] == "task-refresh"
     message = service._enqueue_add_resource_job.await_args.args[0]
     assert message.skip_watch_management is True
+    assert message.bypass_acl is True
+    assert AddResourceMsg.from_dict(message.to_dict()).bypass_acl is True
     assert "secret-token" not in json.dumps(message.to_dict())
     assert service._enqueue_add_resource_job.await_args.kwargs["task_auth"] == {
         "provider": "git_http_basic",
@@ -1624,7 +1663,7 @@ async def test_add_resource_falls_back_for_shared_source_with_parent(
         )
     )
     service._plan_source_job_target = AsyncMock(
-        return_value=("viking://resources/repo/repo", None, False)
+        return_value=("viking://resources/repo/repo", None, False, False)
     )
     service._enqueue_add_resource_job = AsyncMock(
         return_value=SimpleNamespace(task_id="task-standard")

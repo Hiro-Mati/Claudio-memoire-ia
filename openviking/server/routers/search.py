@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Search endpoints for OpenViking HTTP Server."""
 
+import asyncio
 import math
 from typing import Any, Dict, List, Literal, Optional, Sequence, Union
 
@@ -94,9 +95,7 @@ def _resolve_search_filter(
         raise InvalidArgumentError(str(exc)) from exc
 
 
-def _resolve_uri_or_uris(
-    uri: Union[str, List[str]], ctx: RequestContext
-) -> Union[str, List[str]]:
+def _resolve_uri_or_uris(uri: Union[str, List[str]], ctx: RequestContext) -> Union[str, List[str]]:
     """Resolve path variables in a single URI or list of URIs."""
     if isinstance(uri, list):
         return [validate_request_viking_uri(resolve_path_variables(u), ctx) for u in uri]
@@ -137,6 +136,7 @@ class FindRequest(BaseModel):
     until: Optional[str] = None
     time_field: Optional[TimeField] = None
     level: Optional[Union[int, str, List[int]]] = None
+    read_content: bool = False
     telemetry: TelemetryRequest = False
 
 
@@ -198,6 +198,7 @@ class SearchRequest(BaseModel):
     until: Optional[str] = None
     time_field: Optional[TimeField] = None
     level: Optional[Union[int, str, List[int]]] = None
+    read_content: bool = False
     telemetry: TelemetryRequest = False
 
     mode: Literal["list", "context"] = "list"
@@ -225,10 +226,41 @@ class SearchRequest(BaseModel):
                 )
             return self
 
+        if self.read_content:
+            raise ValueError("read_content is only supported in mode='list'")
         if self.target_uri:
             raise ValueError("target_uri is not supported in mode='context'")
         _reject_unknown_quota_and_detail(self.quotas, self.detail)
         return self
+
+
+async def _inline_read_content(
+    result: Any,
+    *,
+    service: Any,
+    ctx: RequestContext,
+) -> Any:
+    """Attach visible file content to ranked hits when it can be read."""
+    if not isinstance(result, dict):
+        return result
+
+    hits = [
+        hit
+        for category in ("memories", "resources", "skills")
+        for hit in result.get(category, [])
+        if isinstance(hit, dict) and isinstance(hit.get("uri"), str)
+    ]
+    semaphore = asyncio.Semaphore(10)
+
+    async def _read(hit: Dict[str, Any]) -> None:
+        async with semaphore:
+            try:
+                hit["content"] = await service.fs.read_visible(hit["uri"], ctx=ctx)
+            except Exception:
+                pass
+
+    await asyncio.gather(*(_read(hit) for hit in hits))
+    return result
 
 
 class RecallRequest(BaseModel):
@@ -276,6 +308,8 @@ class GrepRequest(BaseModel):
     case_insensitive: bool = False
     node_limit: Optional[int] = 256
     level_limit: int = 10
+    tags: Optional[List[str]] = None
+    include_tags: bool = False
 
 
 class GlobRequest(BaseModel):
@@ -284,6 +318,9 @@ class GlobRequest(BaseModel):
     pattern: str
     uri: str = "viking://"
     node_limit: Optional[int] = 256
+    extra_fields: Optional[list[str]] = None
+    tags: Optional[List[str]] = None
+    include_tags: bool = False
 
 
 @router.post("/find")
@@ -321,6 +358,8 @@ async def find(
     result = execution.result
     if hasattr(result, "to_dict"):
         result = result.to_dict(include_provenance=request.include_provenance)
+    if request.read_content:
+        result = await _inline_read_content(result, service=service, ctx=_ctx)
     result = _sanitize_floats(result)
     return Response(
         status="ok",
@@ -438,6 +477,8 @@ async def search(
     result = execution.result
     if hasattr(result, "to_dict"):
         result = result.to_dict(include_provenance=request.include_provenance)
+    if request.read_content:
+        result = await _inline_read_content(result, service=service, ctx=_ctx)
     result = _sanitize_floats(result)
     return Response(
         status="ok",
@@ -495,6 +536,8 @@ async def grep(
             case_insensitive=request.case_insensitive,
             node_limit=request.node_limit,
             level_limit=request.level_limit,
+            tags=request.tags,
+            include_tags=request.include_tags,
         )
     except AGFSNotFoundError:
         raise NotFoundError(resolved_uri, "file")
@@ -521,7 +564,13 @@ async def glob(
     resolved_uri = validate_request_viking_uri(resolve_path_variables(request.uri), _ctx)
     try:
         result = await service.fs.glob(
-            request.pattern, ctx=_ctx, uri=resolved_uri, node_limit=request.node_limit
+            request.pattern,
+            ctx=_ctx,
+            uri=resolved_uri,
+            node_limit=request.node_limit,
+            extra_fields=request.extra_fields,
+            tags=request.tags,
+            include_tags=request.include_tags,
         )
     except AGFSNotFoundError:
         raise NotFoundError(resolved_uri or request.pattern, "file")

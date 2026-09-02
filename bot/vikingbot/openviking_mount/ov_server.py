@@ -577,7 +577,11 @@ class VikingClient:
         to: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """添加资源到 Viking"""
-        result = await self.client.add_resource(path=local_path, to=to, reason=desc)
+        result = await self.client.add_resource(
+            path=local_path,
+            to=to,
+            options={"reason": desc},
+        )
         return result
 
     async def list_resources(
@@ -1165,7 +1169,7 @@ class VikingClient:
 
         return await client.create_session(
             session_id=session_id,
-            memory_policy=memory_policy,
+            options={"memory_policy": memory_policy} if memory_policy else None,
         )
 
     @staticmethod

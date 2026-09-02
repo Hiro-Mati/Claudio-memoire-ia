@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 from . import embedding_config
 from .agfs_config import AGFSConfig
+from .cache_config import CacheConfig
 from .config_loader import (
     load_json_config,
     require_config,
@@ -65,9 +66,9 @@ from .open_viking_config import (
 from .ovcli_config import OVCLIConfig, load_ovcli_config
 from .parser_config import (
     PARSER_CONFIG_REGISTRY,
+    AnydocConfig,
     AudioConfig,
     CodeConfig,
-    ExcelConfig,
     HTMLConfig,
     ImageConfig,
     MarkdownConfig,
@@ -88,6 +89,7 @@ from .vlm_config import VLMConfig
 
 __all__ = [
     "AGFSConfig",
+    "CacheConfig",
     "SYSTEM_CONFIG_DIR",
     "DEFAULT_OV_CONF",
     "DEFAULT_OVCLI_CONF",
@@ -147,7 +149,7 @@ __all__ = [
     "AudioConfig",
     "VideoConfig",
     "MarkdownConfig",
-    "ExcelConfig",
+    "AnydocConfig",
     "HTMLConfig",
     "TextConfig",
     "get_parser_config",

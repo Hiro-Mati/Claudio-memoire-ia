@@ -623,8 +623,9 @@ pub async fn handle_admin(cmd: AdminCommands, ctx: CliContext) -> Result<()> {
             )
             .await
         }
-        AdminCommands::ListAccounts => {
-            commands::admin::list_accounts(&client, ctx.output_format, ctx.compact).await
+        AdminCommands::ListAccounts { name, limit, page } => {
+            commands::admin::list_accounts(&client, name, limit, page, ctx.output_format, ctx.compact)
+                .await
         }
         AdminCommands::DeleteAccount { account_id } => {
             commands::admin::delete_account(&client, &account_id, ctx.output_format, ctx.compact)
@@ -657,6 +658,7 @@ pub async fn handle_admin(cmd: AdminCommands, ctx: CliContext) -> Result<()> {
             limit,
             name,
             role,
+            page,
         } => {
             commands::admin::list_users(
                 &client,
@@ -664,6 +666,79 @@ pub async fn handle_admin(cmd: AdminCommands, ctx: CliContext) -> Result<()> {
                 limit,
                 name,
                 role,
+                page,
+                ctx.output_format,
+                ctx.compact,
+            )
+            .await
+        }
+        AdminCommands::CreateGroup {
+            account_id,
+            group_id,
+        } => {
+            commands::admin::create_group(
+                &client,
+                &account_id,
+                &group_id,
+                ctx.output_format,
+                ctx.compact,
+            )
+            .await
+        }
+        AdminCommands::ListGroups { account_id } => {
+            commands::admin::list_groups(&client, &account_id, ctx.output_format, ctx.compact).await
+        }
+        AdminCommands::ListGroupMembers {
+            account_id,
+            group_id,
+        } => {
+            commands::admin::list_group_members(
+                &client,
+                &account_id,
+                &group_id,
+                ctx.output_format,
+                ctx.compact,
+            )
+            .await
+        }
+        AdminCommands::AddGroupMember {
+            account_id,
+            group_id,
+            user_id,
+        } => {
+            commands::admin::add_group_member(
+                &client,
+                &account_id,
+                &group_id,
+                &user_id,
+                ctx.output_format,
+                ctx.compact,
+            )
+            .await
+        }
+        AdminCommands::RemoveGroupMember {
+            account_id,
+            group_id,
+            user_id,
+        } => {
+            commands::admin::remove_group_member(
+                &client,
+                &account_id,
+                &group_id,
+                &user_id,
+                ctx.output_format,
+                ctx.compact,
+            )
+            .await
+        }
+        AdminCommands::DeleteGroup {
+            account_id,
+            group_id,
+        } => {
+            commands::admin::delete_group(
+                &client,
+                &account_id,
+                &group_id,
                 ctx.output_format,
                 ctx.compact,
             )
@@ -707,6 +782,19 @@ pub async fn handle_admin(cmd: AdminCommands, ctx: CliContext) -> Result<()> {
                 &account_id,
                 &user_id,
                 seed.as_deref(),
+                ctx.output_format,
+                ctx.compact,
+            )
+            .await
+        }
+        AdminCommands::SetAccountSettings {
+            account_id,
+            acl_enabled,
+        } => {
+            commands::admin::set_account_settings(
+                &client,
+                &account_id,
+                acl_enabled,
                 ctx.output_format,
                 ctx.compact,
             )
@@ -1304,6 +1392,8 @@ pub async fn handle_write(
     wait: bool,
     timeout: Option<f64>,
     processing_mode: String,
+    tags: Vec<String>,
+    tag_mode: String,
     ctx: CliContext,
 ) -> Result<()> {
     let client = ctx.get_client();
@@ -1325,6 +1415,8 @@ pub async fn handle_write(
         wait,
         timeout,
         &processing_mode,
+        tags,
+        &tag_mode,
         ctx.output_format,
         ctx.compact,
     )
@@ -1393,6 +1485,7 @@ pub async fn handle_find(
     level: Option<Vec<i32>>,
     context_type: Option<Vec<String>>,
     tags: Option<Vec<String>>,
+    read_content: bool,
     ctx: CliContext,
 ) -> Result<()> {
     let query = query.unwrap_or_default();
@@ -1424,6 +1517,9 @@ pub async fn handle_find(
     if let Some(ref t) = tags {
         params.push(format!("--tags {}", t.join(",")));
     }
+    if read_content {
+        params.push("--read-content".to_string());
+    }
     params.push(format!("\"{}\"", query));
     print_command_echo("ov find", &params.join(" "), ctx.config.echo_command);
     let client = ctx.get_client();
@@ -1440,6 +1536,7 @@ pub async fn handle_find(
         level,
         context_type,
         tags,
+        read_content,
         ctx.output_format,
         ctx.compact,
     )
@@ -1458,6 +1555,7 @@ pub async fn handle_search(
     level: Option<Vec<i32>>,
     context_type: Option<Vec<String>>,
     tags: Option<Vec<String>>,
+    read_content: bool,
     ctx: CliContext,
 ) -> Result<()> {
     let query = query.unwrap_or_default();
@@ -1492,6 +1590,9 @@ pub async fn handle_search(
     if let Some(ref t) = tags {
         params.push(format!("--tags {}", t.join(",")));
     }
+    if read_content {
+        params.push("--read-content".to_string());
+    }
     params.push(format!("\"{}\"", query));
     print_command_echo("ov search", &params.join(" "), ctx.config.echo_command);
     let client = ctx.get_client();
@@ -1509,6 +1610,7 @@ pub async fn handle_search(
         level,
         context_type,
         tags,
+        read_content,
         ctx.output_format,
         ctx.compact,
     )
@@ -1542,6 +1644,8 @@ pub async fn handle_ls(
     abs_limit: i32,
     show_all_hidden: bool,
     node_limit: i32,
+    fields: Option<Vec<String>>,
+    tags: Vec<String>,
     ctx: CliContext,
 ) -> Result<()> {
     let mut params = vec![
@@ -1558,10 +1662,20 @@ pub async fn handle_ls(
     if show_all_hidden {
         params.push("-a".to_string());
     }
+    if !tags.is_empty() {
+        params.push(format!("--tags {}", tags.join(",")));
+    }
+    if let Some(fields) = &fields {
+        params.push(format!("-f {}", fields.join(",")));
+    }
     print_command_echo("ov ls", &params.join(" "), ctx.config.echo_command);
 
     let client = ctx.get_client();
-    let api_output = if ctx.compact { "agent" } else { "original" };
+    let api_output = if fields.is_some() || !ctx.compact {
+        "original"
+    } else {
+        "agent"
+    };
     commands::filesystem::ls(
         &client,
         &uri,
@@ -1573,6 +1687,8 @@ pub async fn handle_ls(
         node_limit,
         ctx.output_format,
         ctx.compact,
+        fields,
+        &tags,
     )
     .await
 }
@@ -1583,6 +1699,9 @@ pub async fn handle_tree(
     show_all_hidden: bool,
     node_limit: i32,
     level_limit: i32,
+    simple: bool,
+    fields: Option<Vec<String>>,
+    tags: Vec<String>,
     ctx: CliContext,
 ) -> Result<()> {
     let mut params = vec![
@@ -1594,10 +1713,23 @@ pub async fn handle_tree(
     if show_all_hidden {
         params.push("-a".to_string());
     }
+    if simple {
+        params.push("-s".to_string());
+    }
+    if !tags.is_empty() {
+        params.push(format!("--tags {}", tags.join(",")));
+    }
+    if let Some(fields) = &fields {
+        params.push(format!("-f {}", fields.join(",")));
+    }
     print_command_echo("ov tree", &params.join(" "), ctx.config.echo_command);
 
     let client = ctx.get_client();
-    let api_output = if ctx.compact { "agent" } else { "original" };
+    let api_output = if fields.is_some() || !ctx.compact {
+        "original"
+    } else {
+        "agent"
+    };
     commands::filesystem::tree(
         &client,
         &uri,
@@ -1608,6 +1740,9 @@ pub async fn handle_tree(
         level_limit,
         ctx.output_format,
         ctx.compact,
+        simple,
+        fields,
+        &tags,
     )
     .await
 }
@@ -1666,6 +1801,39 @@ pub async fn handle_attrs(uri: String, key: Option<String>, ctx: CliContext) -> 
     .await
 }
 
+pub async fn handle_acl(action: crate::AclCommands, ctx: CliContext) -> Result<()> {
+    let client = ctx.get_client();
+    match action {
+        crate::AclCommands::Get { uri } => {
+            commands::acl::get(&client, &uri, ctx.output_format, ctx.compact).await
+        }
+        crate::AclCommands::Set { uri, entries } => {
+            commands::acl::set(&client, &uri, entries, ctx.output_format, ctx.compact).await
+        }
+        crate::AclCommands::Grant {
+            uri,
+            principal,
+            level,
+        } => {
+            commands::acl::grant(
+                &client,
+                &uri,
+                &principal,
+                &level,
+                ctx.output_format,
+                ctx.compact,
+            )
+            .await
+        }
+        crate::AclCommands::Revoke { uri, principal } => {
+            commands::acl::revoke(&client, &uri, &principal, ctx.output_format, ctx.compact).await
+        }
+        crate::AclCommands::Rm { uri } => {
+            commands::acl::remove(&client, &uri, ctx.output_format, ctx.compact).await
+        }
+    }
+}
+
 pub async fn handle_grep(
     uri: String,
     exclude_uri: Option<String>,
@@ -1673,6 +1841,8 @@ pub async fn handle_grep(
     ignore_case: bool,
     node_limit: i32,
     level_limit: i32,
+    tags: Vec<String>,
+    fields: Option<Vec<String>>,
     ctx: CliContext,
 ) -> Result<()> {
     // Prevent grep from root directory to avoid excessive server load and timeouts
@@ -1693,6 +1863,12 @@ pub async fn handle_grep(
     if ignore_case {
         params.push("-i".to_string());
     }
+    if !tags.is_empty() {
+        params.push(format!("--tags {}", tags.join(",")));
+    }
+    if let Some(fields) = &fields {
+        params.push(format!("-f {}", fields.join(",")));
+    }
     params.push(format!("\"{}\"", pattern));
     print_command_echo("ov grep", &params.join(" "), ctx.config.echo_command);
     let client = ctx.get_client();
@@ -1704,6 +1880,8 @@ pub async fn handle_grep(
         ignore_case,
         node_limit,
         level_limit,
+        &tags,
+        fields.as_ref().is_some_and(|items| items.iter().any(|item| item == "tags")),
         ctx.output_format,
         ctx.compact,
     )
@@ -1714,13 +1892,25 @@ pub async fn handle_glob(
     pattern: String,
     uri: String,
     node_limit: i32,
+    simple: bool,
+    fields: Option<Vec<String>>,
+    tags: Vec<String>,
     ctx: CliContext,
 ) -> Result<()> {
-    let params = [
+    let mut params = vec![
         format!("--uri={}", uri),
         format!("-n {}", node_limit),
         format!("\"{}\"", pattern),
     ];
+    if simple {
+        params.push("-s".to_string());
+    }
+    if !tags.is_empty() {
+        params.push(format!("--tags {}", tags.join(",")));
+    }
+    if let Some(fields) = &fields {
+        params.push(format!("-f {}", fields.join(",")));
+    }
     print_command_echo("ov glob", &params.join(" "), ctx.config.echo_command);
     let client = ctx.get_client();
     commands::search::glob(
@@ -1730,6 +1920,9 @@ pub async fn handle_glob(
         node_limit,
         ctx.output_format,
         ctx.compact,
+        simple,
+        fields,
+        &tags,
     )
     .await
 }

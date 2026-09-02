@@ -7,6 +7,7 @@ import re
 import threading
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote, unquote, urlsplit
 
 from openviking.observability.context import (
     bind_root_observability_context,
@@ -42,6 +43,7 @@ from openviking.storage.abstract_overview import (
     plan_abstract_overview_refresh,
     write_abstract_overview,
 )
+from openviking.storage.acl import CreatorAclGrant
 from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.semantic_dag import DagStats, SemanticDagExecutor
@@ -163,10 +165,11 @@ class SemanticProcessor(DequeueHandlerBase):
 
     @staticmethod
     def _ctx_from_semantic_msg(msg: SemanticMsg) -> RequestContext:
-        role = Role(msg.role or Role.ROOT)
         return RequestContext(
             user=UserIdentifier(msg.account_id, msg.user_id),
-            role=role,
+            role=Role(msg.role),
+            group_ids=tuple(msg.group_ids),
+            bypass_acl=True,
         )
 
     def _detect_file_type(self, file_name: str) -> str:
@@ -255,24 +258,34 @@ class SemanticProcessor(DequeueHandlerBase):
         parent_uri = parent.uri.rstrip("/")
         if (
             not parent_uri
-            or parent_uri in {"viking://", "viking:"}
+            or parent_uri in {"viking://", "viking:", "viking://user", "viking://agent"}
             or parent_uri == uri.rstrip("/")
         ):
             return
+        parent_ctx = self._ctx_from_semantic_msg(msg)
         semantic_config = get_openviking_config().semantic
-        decision = await plan_abstract_overview_refresh(
-            viking_fs=get_viking_fs(),
-            dir_uri=parent_uri,
-            changed_entries=1,
-            ctx=self._ctx_from_semantic_msg(msg),
-            l0_body_changed=l0_body_changed,
-            # This helper handles automatic upward propagation only. Manual
-            # refresh/ingest bypasses the threshold for its requested root,
-            # not for every ancestor reached afterwards.
-            force_refresh=False,
-            overview_sample_limit=getattr(semantic_config, "overview_sample_limit", 32),
-            refresh_ratio=getattr(semantic_config, "freshness_refresh_ratio", 0.10),
-        )
+        try:
+            decision = await plan_abstract_overview_refresh(
+                viking_fs=get_viking_fs(),
+                dir_uri=parent_uri,
+                changed_entries=1,
+                ctx=parent_ctx,
+                l0_body_changed=l0_body_changed,
+                # This helper handles automatic upward propagation only. Manual
+                # refresh/ingest bypasses the threshold for its requested root,
+                # not for every ancestor reached afterwards.
+                force_refresh=False,
+                overview_sample_limit=getattr(semantic_config, "overview_sample_limit", 32),
+                refresh_ratio=getattr(semantic_config, "freshness_refresh_ratio", 0.10),
+                lock_timeout_secs=1.0,
+            )
+        except LockAcquisitionError:
+            logger.info(
+                "Skipping best-effort parent freshness update because sidecars are busy: %s",
+                parent_uri,
+            )
+            return
+
         if decision.action is not FreshnessAction.REFRESH_NOW:
             logger.debug(
                 "Parent semantic refresh %s for %s (pending=%d, total=%d)",
@@ -286,8 +299,6 @@ class SemanticProcessor(DequeueHandlerBase):
         from openviking.storage.queuefs import get_queue_manager
 
         queue_manager = get_queue_manager()
-        if queue_manager is None:
-            return
         semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC, allow_create=True)
         parent_msg = SemanticMsg(
             uri=parent_uri,
@@ -295,6 +306,7 @@ class SemanticProcessor(DequeueHandlerBase):
             recursive=False,
             account_id=msg.account_id,
             user_id=msg.user_id,
+            group_ids=msg.group_ids,
             peer_id=msg.peer_id,
             role=msg.role,
             skip_vectorization=msg.skip_vectorization,
@@ -469,6 +481,7 @@ class SemanticProcessor(DequeueHandlerBase):
                                 ctx=current_ctx,
                                 incremental_update=is_incremental,
                                 target_uri=target_uri,
+                                target_preexisting=msg.target_preexisting,
                                 recursive=msg.recursive,
                                 lock=semantic_lock.lock,
                                 is_code_repo=msg.is_code_repo,
@@ -1060,14 +1073,36 @@ class SemanticProcessor(DequeueHandlerBase):
         else:
             return await self._generate_text_summary(file_path, file_name, llm_sem, ctx=ctx)
 
-    def _replace_index_references(
-        self, generated_content: str, file_index_map: Dict[int, str]
+    def _child_summary_line(
+        self,
+        dir_uri: str,
+        idx: int,
+        item: Dict[str, str],
+        link_map: Dict[str, str],
     ) -> str:
-        def replace_index(match):
-            idx = int(match.group(1))
-            return file_index_map.get(idx, match.group(0))
+        """Render a subdirectory summary line with a collision-free link placeholder."""
+        placeholder = f"viking://input_sample_c{idx}"
+        link_map[placeholder] = self._markdown_link_target(dir_uri, item["name"])
+        return f"- {item['name']}/ (link: {placeholder}): {item['abstract']}"
 
-        return re.sub(r"\[(\d+)\]", replace_index, generated_content)
+    @staticmethod
+    def _markdown_link_target(dir_uri: str, entry_name: str) -> str:
+        """Build a Markdown-safe target without changing the stored Viking URI."""
+        entry_uri = VikingURI(dir_uri).join(entry_name).uri
+        return quote(entry_uri, safe=":/")
+
+    def _replace_link_references(self, generated_content: str, link_map: Dict[str, str]) -> str:
+        """Resolve link placeholders (viking://input_sample_fN / cN) to real URIs.
+
+        The model is fed compact, collision-free placeholders and asked to emit
+        Markdown links against them; here we map each placeholder back to the
+        entry's real URI. Unknown placeholders are left untouched.
+        """
+
+        def replace_link(match):
+            return link_map.get(match.group(0), match.group(0))
+
+        return re.sub(r"viking://input_sample_[fc]\d+", replace_link, generated_content)
 
     def _truncate_generated_text(self, text: str, max_chars: int) -> str:
         if max_chars <= 0 or len(text) <= max_chars:
@@ -1165,7 +1200,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 if current_file and current_summary_lines:
                     summaries[current_file] = " ".join(current_summary_lines).strip()
 
-                file_name = header_match.group(1).strip()
+                file_name = self._overview_heading_cache_key(header_match.group(1).strip())
                 parts = file_name.split()
                 if len(parts) >= 2 and parts[0] == parts[1]:
                     file_name = parts[0]
@@ -1191,6 +1226,21 @@ class SemanticProcessor(DequeueHandlerBase):
             summaries[current_file] = " ".join(current_summary_lines).strip()
 
         return summaries
+
+    @staticmethod
+    def _overview_heading_cache_key(heading: str) -> str:
+        """Return the entry name represented by a plain or linked H3 heading."""
+        if heading.startswith("[") and heading.endswith(")"):
+            destination_start = heading.rfind("](")
+            if destination_start > 0:
+                target = heading[destination_start + 2 : -1].strip()
+                if target.startswith("<") and target.endswith(">"):
+                    target = target[1:-1].strip()
+                if target.startswith("viking://"):
+                    path = unquote(urlsplit(target).path).rstrip("/")
+                    if path:
+                        return path.rsplit("/", 1)[-1]
+        return heading
 
     async def _generate_overview(
         self,
@@ -1253,17 +1303,27 @@ class SemanticProcessor(DequeueHandlerBase):
                 "entries; generalize cautiously and do not treat them as exhaustive."
             )
 
-        # Build file index mapping and summary string
-        file_index_map = {}
+        # Build link placeholder mapping and summary string.
+        # The model is fed collision-free placeholders (viking://input_sample_fN)
+        # and asked to emit Markdown links; placeholders are resolved to real
+        # URIs in post-processing. This avoids the fragility of bare [N] indices
+        # and of asking the model to reproduce long/CJK URIs verbatim.
+        link_map: Dict[str, str] = {}
         file_summaries_lines = []
         for idx, item in enumerate(file_summaries, 1):
-            file_index_map[idx] = item["name"]
-            file_summaries_lines.append(f"[{idx}] {item['name']}: {item['summary']}")
+            placeholder = f"viking://input_sample_f{idx}"
+            link_map[placeholder] = self._markdown_link_target(dir_uri, item["name"])
+            file_summaries_lines.append(
+                f"- {item['name']} (link: {placeholder}): {item['summary']}"
+            )
         file_summaries_str = "\n".join(file_summaries_lines) if file_summaries_lines else "None"
 
         # Build subdirectory summary string
         children_abstracts_str = (
-            "\n".join(f"- {item['name']}/: {item['abstract']}" for item in children_abstracts)
+            "\n".join(
+                self._child_summary_line(dir_uri, idx, item, link_map)
+                for idx, item in enumerate(children_abstracts, 1)
+            )
             if children_abstracts
             else "None"
         )
@@ -1295,7 +1355,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 dir_uri,
                 file_summaries,
                 children_abstracts,
-                file_index_map,
+                link_map,
                 llm_sem=llm_sem,
                 output_language=output_language,
                 directory_coverage=directory_coverage,
@@ -1313,13 +1373,15 @@ class SemanticProcessor(DequeueHandlerBase):
             truncated_lines = []
             for idx, item in enumerate(file_summaries, 1):
                 summary = item["summary"][:per_file]
-                truncated_lines.append(f"[{idx}] {item['name']}: {summary}")
+                truncated_lines.append(
+                    f"- {item['name']} (link: viking://input_sample_f{idx}): {summary}"
+                )
             file_summaries_str = "\n".join(truncated_lines)
             overview = await self._single_generate_overview(
                 dir_uri,
                 file_summaries_str,
                 children_abstracts_str,
-                file_index_map,
+                link_map,
                 output_language=output_language,
                 directory_coverage=directory_coverage,
             )
@@ -1328,7 +1390,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 dir_uri,
                 file_summaries_str,
                 children_abstracts_str,
-                file_index_map,
+                link_map,
                 output_language=output_language,
                 directory_coverage=directory_coverage,
             )
@@ -1340,7 +1402,7 @@ class SemanticProcessor(DequeueHandlerBase):
         dir_uri: str,
         file_summaries_str: str,
         children_abstracts_str: str,
-        file_index_map: Dict[int, str],
+        link_map: Dict[str, str],
         output_language: str = "en",
         directory_coverage: str = "",
     ) -> str:
@@ -1363,7 +1425,7 @@ class SemanticProcessor(DequeueHandlerBase):
             with bind_telemetry_stage("resource_summarize"):
                 overview = await vlm.get_completion_async(prompt)
 
-            overview = self._replace_index_references(overview, file_index_map)
+            overview = self._replace_link_references(overview, link_map)
 
             return overview.strip()
 
@@ -1379,7 +1441,7 @@ class SemanticProcessor(DequeueHandlerBase):
         dir_uri: str,
         file_summaries: List[Dict[str, str]],
         children_abstracts: List[Dict[str, str]],
-        file_index_map: Dict[int, str],
+        link_map: Dict[str, str],
         llm_sem: Optional[asyncio.Semaphore] = None,
         output_language: str = "en",
         directory_coverage: str = "",
@@ -1396,28 +1458,33 @@ class SemanticProcessor(DequeueHandlerBase):
         dir_name = dir_uri.split("/")[-1]
 
         work_items = [("file", index, item) for index, item in enumerate(file_summaries, 1)] + [
-            ("child", None, item) for item in children_abstracts
+            ("child", index, item) for index, item in enumerate(children_abstracts, 1)
         ]
         batches = [work_items[i : i + batch_size] for i in range(0, len(work_items), batch_size)]
         logger.info(f"Generating overview for {dir_uri} in {len(batches)} batches")
 
-        # Generate partial overviews concurrently using global file indices.
+        # Generate partial overviews concurrently using global link placeholders.
         if llm_sem is None:
             llm_sem = asyncio.Semaphore(self.max_concurrent_llm)
         partial_overviews = [None] * len(batches)
-        batch_prompts: List[Tuple[int, str, Dict[int, str]]] = []
+        batch_prompts: List[Tuple[int, str, Dict[str, str]]] = []
 
         for batch_idx, batch in enumerate(batches):
             batch_lines = []
             child_lines = []
-            batch_index_map = {}
+            batch_link_map: Dict[str, str] = {}
             for entry_kind, global_idx, item in batch:
+                assert global_idx is not None
                 if entry_kind == "file":
-                    assert global_idx is not None
-                    batch_index_map[global_idx] = item["name"]
-                    batch_lines.append(f"[{global_idx}] {item['name']}: {item['summary']}")
+                    placeholder = f"viking://input_sample_f{global_idx}"
+                    batch_link_map[placeholder] = link_map.get(
+                        placeholder, self._markdown_link_target(dir_uri, item["name"])
+                    )
+                    batch_lines.append(f"- {item['name']} (link: {placeholder}): {item['summary']}")
                 else:
-                    child_lines.append(f"- {item['name']}/: {item['abstract']}")
+                    child_lines.append(
+                        self._child_summary_line(dir_uri, global_idx, item, batch_link_map)
+                    )
 
             prompt = render_prompt(
                 "semantic.overview_generation",
@@ -1429,14 +1496,14 @@ class SemanticProcessor(DequeueHandlerBase):
                     "directory_coverage": directory_coverage,
                 },
             )
-            batch_prompts.append((batch_idx, prompt, batch_index_map))
+            batch_prompts.append((batch_idx, prompt, batch_link_map))
 
-        async def _run_batch(batch_idx: int, prompt: str, batch_index_map: Dict[int, str]) -> None:
+        async def _run_batch(batch_idx: int, prompt: str, batch_link_map: Dict[str, str]) -> None:
             try:
                 async with llm_sem:
                     with bind_telemetry_stage("resource_summarize"):
                         partial = await vlm.get_completion_async(prompt)
-                partial = self._replace_index_references(partial, batch_index_map)
+                partial = self._replace_link_references(partial, batch_link_map)
                 partial_overviews[batch_idx] = partial.strip()
             except Exception as e:
                 logger.warning(
@@ -1455,6 +1522,9 @@ class SemanticProcessor(DequeueHandlerBase):
             return partial_overviews[0]
 
         # Merge partials only; each child abstract is already represented once.
+        # Partials already contain real URIs, but the shared generation prompt can
+        # make the merge model emit placeholders again. Resolve the merged output
+        # with the complete map before persisting it.
         combined = "\n\n---\n\n".join(partial_overviews)
         try:
             prompt = render_prompt(
@@ -1469,7 +1539,7 @@ class SemanticProcessor(DequeueHandlerBase):
             )
             with bind_telemetry_stage("resource_summarize"):
                 overview = await vlm.get_completion_async(prompt)
-            overview = self._replace_index_references(overview, file_index_map)
+            overview = self._replace_link_references(overview, link_map)
             return overview.strip()
         except Exception as e:
             logger.error(
@@ -1486,6 +1556,7 @@ class SemanticProcessor(DequeueHandlerBase):
         overview: str,
         ctx: Optional[RequestContext] = None,
         ingest_options: IngestOptions | None = None,
+        creator_acl_grant: CreatorAclGrant | None = None,
     ) -> None:
         """Create directory Context and enqueue to EmbeddingQueue."""
 
@@ -1499,6 +1570,7 @@ class SemanticProcessor(DequeueHandlerBase):
             context_type=context_type,
             ctx=active_ctx,
             ingest_options=ingest_options,
+            creator_acl_grant=creator_acl_grant,
         )
 
     async def _vectorize_single_file(
@@ -1511,6 +1583,7 @@ class SemanticProcessor(DequeueHandlerBase):
         use_summary: bool = False,
         preserve_existing_created_at: bool = False,
         ingest_options: IngestOptions | None = None,
+        creator_acl_grant: CreatorAclGrant | None = None,
     ) -> None:
         """Vectorize a single file using its content or summary."""
         from openviking.utils.embedding_utils import vectorize_file
@@ -1525,4 +1598,5 @@ class SemanticProcessor(DequeueHandlerBase):
             use_summary=use_summary,
             preserve_existing_created_at=preserve_existing_created_at,
             ingest_options=ingest_options,
+            creator_acl_grant=creator_acl_grant,
         )

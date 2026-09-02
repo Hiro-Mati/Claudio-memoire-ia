@@ -76,6 +76,12 @@ class AddResourceProcessor(DequeueHandlerBase):
         if msg.lock_handoff is not None:
             try:
                 lock = await self._viking_fs._async_agfs.pathlock_adopt(msg.lock_handoff)
+                if msg.cleanup_empty_target_on_failure:
+                    await self._resource_service._cleanup_reserved_target_if_empty(
+                        root_uri=msg.root_uri,
+                        ctx=ctx,
+                        resource_lock=lock,
+                    )
                 await self._viking_fs._async_agfs.pathlock_release(lock)
             except Exception as exc:
                 logger.warning("[AddResource] Failed to release cancelled lock handoff: %s", exc)
@@ -105,7 +111,9 @@ class AddResourceProcessor(DequeueHandlerBase):
         ctx = RequestContext(
             user=UserIdentifier(msg.account_id, msg.user_id),
             role=Role(msg.role),
+            group_ids=tuple(msg.group_ids),
             actor_peer_id=msg.actor_peer_id,
+            bypass_acl=msg.bypass_acl,
         )
         tracker = get_task_tracker()
         task = await tracker.create(
@@ -114,7 +122,10 @@ class AddResourceProcessor(DequeueHandlerBase):
             account_id=ctx.account_id,
             user_id=ctx.user.user_id,
             task_id=msg.task_id,
-            meta={"source_path": msg.source_path},
+            meta={
+                "source_path": msg.source_path,
+                **({"internal": True} if msg.internal_task else {}),
+            },
         )
         if task.status in (
             TaskStatus.CANCELLING,
@@ -291,7 +302,9 @@ class AddResourceProcessor(DequeueHandlerBase):
                 RequestContext(
                     user=UserIdentifier(msg.account_id, msg.user_id),
                     role=Role(msg.role),
+                    group_ids=tuple(msg.group_ids),
                     actor_peer_id=msg.actor_peer_id,
+                    bypass_acl=msg.bypass_acl,
                 ),
             ),
             self._service_loop,

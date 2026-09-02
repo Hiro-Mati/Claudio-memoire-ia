@@ -146,6 +146,10 @@ const activity = {
       terminal: 'Terminal',
       agent: 'Agent',
     },
+    actionPanel: {
+      collapse: 'Collapse panel',
+      expand: 'Open panel',
+    },
     addResource: {
       title: 'Add resource',
       description:
@@ -156,7 +160,9 @@ const activity = {
       title: 'Context tree',
       addResource: 'Add resource',
       abstractLevel: 'L0',
+      collapseDirectory: 'Collapse {{name}}',
       empty: 'empty',
+      expandDirectory: 'Expand {{name}}',
       loading: 'loading',
       overviewLevel: 'L1',
       search: 'Search context',

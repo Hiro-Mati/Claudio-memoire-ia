@@ -46,9 +46,9 @@ each caller.
   `Invalid scope ... Must be one of:` error message never mentions it.
 - Responses always echo the expanded canonical URI, never `viking://~`, and persisted
   data (vector records, watch keys) stays canonical as well.
-- Requires an authenticated user identity. Expansion happens at the request boundary for
-  user and admin callers; root-role and unauthenticated contexts, along with places that
-  demand an already-canonical URI (internal storage paths, background tasks), reject the
+- Requires an authenticated request identity. Expansion uses that identity's effective
+  `user_id` for every request role, including root. Places that demand an already-canonical
+  URI (internal storage paths and background tasks without a request context) reject the
   alias instead of guessing a user.
 - Replaces the removed uid-less shorthand: `viking://user/<segment>/...` for `memories`,
   `resources`, `skills`, `peers`, `privacy`, and `sessions` is rejected at USER/ADMIN
@@ -57,6 +57,10 @@ each caller.
 ## Initial Directory Structure
 
 Moving away from traditional flat database thinking, all context is organized as a filesystem. Agents no longer just find data through vector search, but can locate and browse data through deterministic paths and standard filesystem commands. Each context or directory is assigned a unique URI identifier string in the format viking://{scope}/{path}, allowing the system to precisely locate and access resources stored in different locations.
+
+## File IDs
+
+In addition to its URI, every file is automatically assigned a stable `id` that serves as the primary key of its vector record in VikingDB. The id is deterministically computed as `md5(f"{account_id}:{uri}")` for level 2 (regular file) records, and is returned by `stat()` and other metadata APIs. This allows callers to cross-reference vector index entries without a separate lookup. The id is scoped to the account and changes if the file is moved to a different URI (vector records are re-keyed during URI migration). Directories do not expose a single `id` because a directory may span multiple semantic levels (L0 abstract, L1 overview, L2), each with its own record.
 
 ```
 viking://
@@ -113,6 +117,8 @@ viking://~/resources/                         # Your private resources
 viking://~/resources/docs/                    # Your private resource directory
 viking://user/{user_id}/memories/             # Explicit user path (your own id; other ids need admin/root)
 ```
+
+`viking://resources/...` is the shared scope for the current account and supports per-directory or per-file [ACLs](./15-acl.md). `viking://user/{user}/resources/...` is private; move a resource into the shared scope to share it.
 
 ### User Skills and Peer Content
 
@@ -313,32 +319,32 @@ parent = VikingURI(uri).parent.uri  # viking://resources/docs
 ```python
 # Search only in resources
 results = client.find(
-    "authentication",
-    target_uri="viking://resources/"
+    query="authentication",
+    target_uri="viking://resources/",
 )
 
 # Search only in your own resources
 results = client.find(
-    "private project notes",
+    query="private project notes",
     target_uri="viking://~/resources/"
 )
 
 # Search only in your own memories
 results = client.find(
-    "coding preferences",
+    query="coding preferences",
     target_uri="viking://~/memories/"
 )
 
 # Search only in your own skills
 results = client.find(
-    "web search",
+    query="web search",
     target_uri="viking://~/skills/"
 )
 
 # Search only in global agent skills
 results = client.find(
-    "web search",
-    target_uri="viking://agent/skills/"
+    query="web search",
+    target_uri="viking://agent/skills/",
 )
 ```
 
@@ -346,16 +352,16 @@ results = client.find(
 
 ```python
 # List directory
-entries = await client.ls("viking://resources/")
+entries = await client.ls(uri="viking://resources/")
 
 # Read file
-content = await client.read("viking://resources/docs/api.md")
+content = await client.read(uri="viking://resources/docs/api.md")
 
 # Get abstract
-abstract = await client.abstract("viking://resources/docs/")
+abstract = await client.abstract(uri="viking://resources/docs/")
 
 # Get overview
-overview = await client.overview("viking://resources/docs/")
+overview = await client.overview(uri="viking://resources/docs/")
 ```
 
 ## Special Files

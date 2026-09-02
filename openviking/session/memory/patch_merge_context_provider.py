@@ -10,6 +10,7 @@ from typing import Any
 
 from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import MemoryFile, MemoryTypeSchema
+from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking.session.memory.merge_policy import MEMORY_MERGE_POLICY
 from openviking.session.memory.session_extract_context_provider import (
     SessionExtractContextProvider,
@@ -122,9 +123,11 @@ class PatchMergeContextProvider(SessionExtractContextProvider):
         patches: list[PatchMergePatch],
         required_file_uris: list[str] | None = None,
         output_language: str | None = None,
+        memory_registry: MemoryTypeRegistry | None = None,
     ):
         super().__init__(messages=[])
         self.memory_type = memory_type
+        self._registry = memory_registry
         self.required_file_uris = list(required_file_uris or [])
         self.patches = list(patches)
         self._output_language = output_language or _resolve_patch_output_language(self.patches)
@@ -158,7 +161,8 @@ canonical replacement; if it is only a duplicate new proposal, omit it.
 
     def get_memory_schemas(self, ctx: RequestContext) -> list[MemoryTypeSchema]:
         del ctx
-        schema = self._get_registry().get(self.memory_type)
+        registry = self._get_registry()
+        schema = registry.get(self.memory_type)
         if schema is None or not schema.enabled:
             raise ValueError(f"Memory schema not found or disabled: {self.memory_type}")
         return [schema]

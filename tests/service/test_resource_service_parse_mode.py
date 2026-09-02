@@ -84,7 +84,7 @@ def service(monkeypatch: pytest.MonkeyPatch) -> ResourceService:
     monkeypatch.setattr(
         instance,
         "_plan_source_job_target",
-        AsyncMock(return_value=("viking://resources/test", None, False)),
+        AsyncMock(return_value=("viking://resources/test", None, False, False)),
     )
     return instance
 
@@ -95,7 +95,7 @@ async def test_no_split_is_forwarded_and_persisted_for_watch_replay(
     ctx: RequestContext,
 ):
     watch_manager = SimpleNamespace(
-        get_task_by_uri=AsyncMock(return_value=None),
+        get_upsertable_task_by_uri=AsyncMock(return_value=None),
         create_task=AsyncMock(return_value=SimpleNamespace(task_id="watch-1")),
     )
     scheduler = SimpleNamespace(watch_manager=watch_manager)
@@ -131,6 +131,7 @@ async def test_no_split_watch_replay_preserves_auto_bound_file_target(
             "viking://resources/test",
             None,
             kwargs["defer_candidate_resolution"],
+            False,
         )
     )
 
@@ -179,6 +180,7 @@ async def test_no_split_defers_initial_root_when_parent_targeted(
             "viking://resources/test",
             None,
             kwargs["defer_candidate_resolution"],
+            False,
         )
     )
 
@@ -258,6 +260,62 @@ async def test_rejects_invalid_parse_mode(service: ResourceService, ctx: Request
             to="viking://resources/test",
             args={"parse_mode": "unsupported"},
         )
+
+
+@pytest.mark.asyncio
+async def test_tos_auth_args_require_http_resource_url(
+    service: ResourceService,
+    ctx: RequestContext,
+):
+    with pytest.raises(
+        InvalidArgumentError, match=r"tos_signature and tos_access are only supported"
+    ):
+        await service.add_resource(
+            path="/test/path",
+            ctx=ctx,
+            to="viking://resources/test",
+            args={"tos_signature": "signed-value"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_tos_auth_args_are_mutually_exclusive(
+    service: ResourceService,
+    ctx: RequestContext,
+):
+    with pytest.raises(InvalidArgumentError, match="cannot both be provided"):
+        await service.add_resource(
+            path="https://tos.example.com/object",
+            ctx=ctx,
+            to="viking://resources/test",
+            args={
+                "tos_signature": "signed-value",
+                "tos_access": "access-key",
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_tos_auth_args_are_snapshotted_and_omitted_from_queue(
+    service: ResourceService,
+    ctx: RequestContext,
+):
+    prepare_durable_source = AsyncMock(return_value=None)
+    service._resource_processor.prepare_durable_source = prepare_durable_source
+
+    await service.add_resource(
+        path="https://tos.example.com/object",
+        ctx=ctx,
+        to="viking://resources/test",
+        args={"tos_signature": "signed-value"},
+        allow_local_path_resolution=False,
+    )
+
+    assert prepare_durable_source.await_args.kwargs["snapshot_required"] is True
+    assert prepare_durable_source.await_args.kwargs["tos_signature"] == "signed-value"
+    message = service._enqueue_add_resource_job.await_args.args[0]
+    assert "tos_signature" not in message.args
+    assert "tos_access" not in message.args
 
 
 @pytest.mark.asyncio
@@ -348,7 +406,7 @@ async def test_native_git_enqueue_persists_internal_no_split_mode(
         )
     )
     service._plan_source_job_target = AsyncMock(
-        return_value=("viking://resources/repo", None, False)
+        return_value=("viking://resources/repo", None, False, False)
     )
     service._enqueue_add_resource_job = AsyncMock(return_value=SimpleNamespace(task_id="task-git"))
 

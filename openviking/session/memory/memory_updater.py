@@ -22,8 +22,10 @@ from openviking.message.part import TextPart
 from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import (
     MemoryFile,
+    MemoryOperationSkipCode,
     ResolvedOperation,
     ResolvedOperations,
+    SkippedMemoryOperation,
     StoredLink,
 )
 from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
@@ -711,6 +713,7 @@ class MemoryUpdateResult:
         self.written_uris: List[str] = []
         self.edited_uris: List[str] = []
         self.deleted_uris: List[str] = []
+        self.skipped_operations: List[SkippedMemoryOperation] = []
         self.errors: List[Tuple[str, Exception]] = []
 
     def add_written(self, uri: str) -> None:
@@ -724,6 +727,9 @@ class MemoryUpdateResult:
 
     def add_error(self, uri: str, error: Exception) -> None:
         self.errors.append((uri, error))
+
+    def add_skipped(self, operation: SkippedMemoryOperation) -> None:
+        self.skipped_operations.append(operation)
 
     def summary(self) -> str:
         return (
@@ -809,6 +815,7 @@ class MemoryUpdater:
         memory_type: Optional[str],
         ctx: RequestContext,
         strict: bool = False,
+        ingest_options=None,
     ) -> bool:
         if not vikingdb or not bool(getattr(vikingdb, "has_queue_manager", False)):
             return False
@@ -823,6 +830,7 @@ class MemoryUpdater:
                 result,
                 ctx,
                 uri_memory_type_map={uri: memory_type} if memory_type else {},
+                ingest_options=ingest_options,
             )
             return attempted > 0
         except Exception:
@@ -879,6 +887,33 @@ class MemoryUpdater:
                 continue
             has_unresolved_upserts = True
             error_target = f"{resolved_op.memory_type}(page_id={resolved_op.page_id})"
+            resolution_skip = getattr(resolved_op, "resolution_skip", None)
+            if resolution_skip is not None:
+                # Reporting-only: the operation remains unresolved, preserving
+                # the legacy delete-suppression behavior for direct mixed batches.
+                skipped = SkippedMemoryOperation(
+                    memory_type=resolved_op.memory_type,
+                    page_id=resolved_op.page_id,
+                    reason_code=resolution_skip.reason_code,
+                    reason=resolution_skip.reason,
+                    source=resolved_op.source,
+                )
+                result.add_skipped(skipped)
+                message = (
+                    "Skipping memory operation by resolution policy: "
+                    f"memory_type={resolved_op.memory_type} "
+                    f"page_id={resolved_op.page_id} "
+                    f"reason_code={resolution_skip.reason_code.value}"
+                )
+                if resolution_skip.reason_code in {
+                    MemoryOperationSkipCode.INVALID_PEER_ID,
+                    MemoryOperationSkipCode.INVALID_RANGES,
+                    MemoryOperationSkipCode.PAGE_ID_TYPE_MISMATCH,
+                }:
+                    logger.warning(message)
+                else:
+                    tracer.info(message)
+                continue
             resolution_error = ValueError("Missing resolved URI")
             result.add_error(error_target, resolution_error)
             tracer.error(
@@ -1361,6 +1396,7 @@ class MemoryUpdater:
         extract_context: Any = None,
         uri_memory_type_map: Dict[str, str] = None,
         search_tags_by_uri: Dict[str, List[str]] = None,
+        ingest_options: Any = None,
     ) -> int:
         """Vectorize written and edited memory files.
 
@@ -1370,6 +1406,7 @@ class MemoryUpdater:
             extract_context: Extract context for embedding template rendering
             uri_memory_type_map: Mapping from URI to memory_type
             search_tags_by_uri: Transient search tags to attach while indexing each URI
+            ingest_options: Write options for a single-file content write.
         """
         if not self._vikingdb:
             logger.debug("VikingDB not available, skipping vectorization")
@@ -1457,12 +1494,18 @@ class MemoryUpdater:
                 # Convert to embedding msg and enqueue
                 embedding_msg = EmbeddingMsgConverter.from_context(memory_context)
                 if embedding_msg:
-                    transient_tags = search_tags_by_uri.get(uri)
-                    if transient_tags:
-                        embedding_msg.context_data["search_tags"] = list(transient_tags)
+                    if getattr(ingest_options, "search_tags", None) is not None:
+                        embedding_msg.context_data["search_tags"] = list(ingest_options.search_tags)
                         embedding_msg.context_data["_upsert_options"] = {
-                            "search_tag_mode": "append"
+                            "search_tag_mode": ingest_options.search_tag_mode
                         }
+                    else:
+                        transient_tags = search_tags_by_uri.get(uri)
+                        if transient_tags:
+                            embedding_msg.context_data["search_tags"] = list(transient_tags)
+                            embedding_msg.context_data["_upsert_options"] = {
+                                "search_tag_mode": "append"
+                            }
                     if embedding_msg.telemetry_id:
                         request_wait_tracker.register_embedding_root(
                             embedding_msg.telemetry_id, embedding_msg.id
@@ -1639,6 +1682,16 @@ class MemoryUpdater:
                 ),
                 ctx=ctx,
                 lease_ref=lease_ref,
+            )
+            from openviking.utils.embedding_utils import vectorize_directory_meta
+
+            await vectorize_directory_meta(
+                uri=directory,
+                abstract="",
+                overview=rendered,
+                context_type="memory",
+                ctx=ctx,
+                include_abstract=False,
             )
             return True
         except Exception as e:

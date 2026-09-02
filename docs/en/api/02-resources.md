@@ -15,16 +15,16 @@ OpenViking supports various resource types, categorized by functionality:
 | PDF | `.pdf` | Supports local parsing and MinerU API conversion |
 | Markdown | `.md`, `.markdown`, `.mdown`, `.mkd` | Native support, extracts structure and stores in segments |
 | HTML | `.html`, `.htm` | Cleans navigation/ads and extracts content, converts to Markdown |
-| Word | `.docx` | Extracts text, headings, tables and converts to Markdown |
+| Word | `.doc`, `.docx`, `.docm`, `.odt`, `.rtf` | Uses anydoc to extract text, headings, tables, and embedded images into Markdown |
 | Plain Text | `.txt`, `.text` | Direct import and processing |
-| EPUB | `.epub` | E-book format, supports ebooklib or manual extraction |
+| EPUB | `.epub` | Uses anydoc to convert e-book content and embedded images to Markdown |
 
 **Spreadsheets & Presentations**
 
 | Type | Extensions | Description |
 |------|------------|-------------|
-| Excel | `.xlsx`, `.xls`, `.xlsm` | Supports new and legacy Excel formats, converts to Markdown tables by worksheet |
-| PowerPoint | `.pptx` | Extracts content by slide, supports extracting notes |
+| Excel | `.xlsx`, `.xls`, `.xlsm`, `.xlsb`, `.ods`, `.csv` | Uses anydoc to convert worksheets to Markdown tables |
+| PowerPoint | `.pptx`, `.ppt`, `.pptm`, `.pps`, `.ppsx`, `.ppsm`, `.pot`, `.odp` | Uses anydoc to extract slide content and embedded images into Markdown |
 
 **Code**
 
@@ -47,7 +47,7 @@ OpenViking supports various resource types, categorized by functionality:
 
 | Type | Description |
 |------|-------------|
-| Feishu/Lark | URL-based, supports doc/docx, wiki, sheets, bitable. By default uses app credentials from FEISHU_APP_ID and FEISHU_APP_SECRET; user-token imports can pass `args.feishu_access_token`, and user-token watches also pass `args.feishu_refresh_token` |
+| Feishu/Lark | URL-based, supports doc/docx, wiki, sheets, bitable. By default uses app credentials from FEISHU_APP_ID and FEISHU_APP_SECRET; user-token imports can pass `args.feishu_access_token`, and user-token watches also pass `args.feishu_refresh_token` plus an optional `args.feishu_app_id` / `args.feishu_app_secret` pair |
 
 **Web Pages (recursive web crawler)**
 
@@ -164,7 +164,7 @@ This endpoint is the core entry point for resource management, supporting adding
 |-----------|------|----------|---------|-------------|
 | path | string | No | - | Remote resource URL (HTTP/HTTPS/Git). Mutually exclusive with `temp_file_id` |
 | temp_file_id | string | No | - | Temporary upload file ID. Mutually exclusive with `path` |
-| to | string | No | - | Target Viking URI (exact location). Mutually exclusive with `parent` |
+| to | string | No | - | Final location for this import. If the target already exists, it is refreshed. Mutually exclusive with `parent` |
 | parent | string | No | - | Parent Viking URI (resource placed under this directory). Mutually exclusive with `to` |
 | create_parent | bool | No | False | Automatically create parent directory if it does not exist (server-side flag) |
 | reason | string | No | "" | Reason for adding the resource. When non-empty, OpenViking runs it through the normal session memory extraction pipeline with the resource URI and records resource references in the resulting memory |
@@ -177,19 +177,20 @@ This endpoint is the core entry point for resource management, supporting adding
 | exclude | string | No | None | File patterns to exclude (glob) |
 | directly_upload_media | bool | No | True | Whether to directly upload media files |
 | preserve_structure | bool | No | None | Whether to preserve directory structure |
-| args | object | No | `{}` | Parser-specific import options forwarded to the source parser/accessor. Native HTTPS Git imports and watches accept HTTP Basic credentials over TLS as `args.auth_config={"username":"oauth2","token":"..."}`; `username` defaults to `oauth2`. Git `branch` or `commit` remains at the top level of `args`. `args.parse_mode` accepts `default` (existing splitting behavior) or `no_split` (parse and convert each source document to one Markdown body). E.g. `args.site=true/false` forces/opts out of whole-site (sitemap/RSS) ingestion, `args.max_pages` etc. override the `webfeed` config; the recursive web crawler accepts `args.depth`, `args.max_pages`, `args.include_paths`, `args.exclude_paths`, `args.allow_external_links`, `args.skip_download_links`; Feishu user-token imports pass `args.feishu_access_token`. Core `add_resource` fields such as `path`, `to`, `watch_interval`, `include`, and `exclude` are not allowed inside `args` |
+| args | object | No | `{}` | Parser-specific import options forwarded to the source parser/accessor. Native HTTPS Git imports and watches accept HTTP Basic credentials over TLS as `args.auth_config={"username":"oauth2","token":"..."}`; `username` defaults to `oauth2`. Git `branch` or `commit` remains at the top level of `args`. To import a private TOS object through its HTTP(S) URL, pass exactly one non-empty string: `args.tos_signature` (sent as `X-Tos-Signature`) or `args.tos_access` (sent as `X-Tos-Access`). TOS credentials are used only for the current HEAD/GET fetch, which is staged as a snapshot; they are not persisted to resource metadata or queue jobs. `args.parse_mode` accepts `default` (existing splitting behavior) or `no_split` (parse and convert each source document to one Markdown body). E.g. `args.site=true/false` forces/opts out of whole-site (sitemap/RSS) ingestion, `args.max_pages` etc. override the `webfeed` config; the recursive web crawler accepts `args.depth`, `args.max_pages`, `args.include_paths`, `args.exclude_paths`, `args.allow_external_links`, `args.skip_download_links`; Feishu user-token imports pass `args.feishu_access_token`. Core `add_resource` fields such as `path`, `to`, `watch_interval`, `include`, and `exclude` are not allowed inside `args` |
 | watch_interval | float | No | 0 | Scheduled update interval (minutes). >0 creates a task for a re-readable URL/sitemap/RSS source; uploaded `temp_file_id` content is a static snapshot and must be re-added when it changes. <=0 cancels a task; explicit `to` wins, otherwise binds to the imported `root_uri` |
 | processing_mode | string | No | `semantic_and_vectors` | Post-ingest processing mode. `semantic_and_vectors` is the normal flow: generate semantic artifacts (`.abstract.md`, `.overview.md`) and vectors. `vectors_only` skips semantic understanding/VLM summarization and only vectorizes current resource files |
 | telemetry | TelemetryRequest | No | False | Whether to return telemetry data |
 
 **Additional Notes**:
-- `to` and `parent` cannot be specified together. Use `create_parent=true` with `parent` when the parent directory should be created automatically.
+- `to` and `parent` cannot be specified together. `to` is the final save location: a missing target is created, and an existing target is refreshed. If the target is a directory, old files or subdirectories that are not produced by the current import may be removed. `parent` is the destination directory, and is the right option for adding a new resource under an existing directory; use `create_parent=true` or CLI `--parent-auto-create` when that directory should be created automatically. When the imported `root_uri` is the same as `to`, semantic and vector processing reuse unchanged content and process only the changed parts.
+- Creating a resource requires write access to its target parent; updating an existing explicit `to` requires write access to that target. These checks run before the task is queued. Automatic naming uses actual URI occupancy, so an unreadable collision selects `_1`, `_2`, and so on instead of attempting an overwrite.
+- With `wait=false`, `status=accepted` means that preflight passed and the task was queued; it does not mean resource processing has completed. Use the returned `task_id` for the final status.
 - If both `to` and `parent` are omitted, the server may use the current user's `add_targets.resource_uri` override, then `server.user_config_defaults.add_targets.resource_uri`. If neither is set, legacy target resolution is unchanged.
 - Resource targets may use public `viking://resources/...`, the home alias `viking://~/resources/...`, explicit user `viking://user/{user_id}/resources/...`, or peer `viking://user/{user_id}/peers/{peer_id}/resources/...` paths. The home alias is expanded to the canonical path using the authenticated request identity; the uid-less spelling `viking://user/resources/...` is rejected with an error pointing at `viking://~/resources/...`.
 - `user_id` and `peer_id` path segments must be safe single-segment identifiers, for example `alice` or `web-visitor-alice`. Values with path separators, `.`, `..`, `:`, or `+` are rejected.
 - `path` and `temp_file_id` cannot be specified together
 - Raw HTTP calls for local files require first uploading via [temp_upload](#temp_upload) to obtain `temp_file_id`
-- When `to` is specified and the target already exists, triggers incremental update
 - Only Git repository sources use full background import when `wait=false`; OpenViking performs repository preflight and target planning before returning the `task_id`.
 - Native HTTPS Git credentials in `args.auth_config` remain request-local when `watch_interval <= 0`. When `watch_interval > 0`, OpenViking stores the repository-bound username/token in private watch state and restores it only for later Git fetches. The credentials are excluded from ordinary queue payloads and watch API/MCP/CLI responses. Git PATs have no generic refresh flow; rotate an expired or revoked token by recreating the watch. Legacy URL-embedded credentials such as `https://user:token@host/repo.git` remain accepted and are passed through unchanged; because that URL is also the source identifier, it may be recorded in process arguments, logs, queues, resource metadata, and watch state. Prefer `args.auth_config` for new integrations. Plaintext HTTP authentication and authenticated redirects for `args.auth_config` remain rejected.
 - The token travels in the HTTPS request body. Keep diagnostic request-body dumping disabled in production because explicitly enabling it can record secrets.
@@ -201,13 +202,14 @@ This endpoint is the core entry point for resource management, supporting adding
 - When `watch_interval > 0`, the watch task binds to `to` if provided; otherwise it binds to the `root_uri` returned by this import. If no stable `root_uri` is available, the request fails and asks for an explicit `to`.
 - Feishu/Lark app-token imports do not pass `args.feishu_access_token`. OpenViking keeps the existing app credential flow and the SDK obtains an app/tenant token from `app_id` and `app_secret`. This mode supports both one-time imports and `watch_interval > 0`.
 - Feishu/Lark one-time user-token imports pass `args={"feishu_access_token": "u-..."}` with `watch_interval <= 0`. OpenViking uses that user token only for the current import and does not store it.
-- Feishu/Lark user-token watches pass `args={"feishu_access_token": "u-...", "feishu_refresh_token": "r-..."}` with `watch_interval > 0`. OpenViking stores the token state in the private watch task state, refreshes it with the configured Feishu app credentials, and uses the refreshed user token for later watch runs.
-- Feishu/Lark user-token watches require `FEISHU_APP_ID` and `FEISHU_APP_SECRET` (or `feishu.app_id` and `feishu.app_secret` in `ov.conf`) because Feishu refresh tokens are bound to the app that issued them. The supplied user token must come from the same Feishu app configured in OpenViking.
-- Watch task token state is stored in the internal `viking://resources/.watch_tasks.json` control file and is hidden from watch API/MCP/CLI responses. If VikingFS file encryption is enabled, this control file is encrypted at rest; otherwise the server-side control file contains plaintext token state.
+- Feishu/Lark user-token watches pass `args={"feishu_access_token": "u-...", "feishu_refresh_token": "r-..."}` with `watch_interval > 0`. They may also pass `feishu_app_id` and `feishu_app_secret` together; OpenViking stores the pair in the private watch task state and uses it to refresh that watch's user token.
+- If the request omits the app pair, user-token watches use `FEISHU_APP_ID` and `FEISHU_APP_SECRET`, or `feishu.app_id` and `feishu.app_secret` in `ov.conf`. Feishu refresh tokens are bound to their issuing app, so whichever app credentials are used must match the supplied user token.
+- Watch task token state and request-supplied app credentials are stored in the internal `viking://resources/.watch_tasks.json` control file and hidden from watch API/MCP/CLI responses. If VikingFS file encryption is enabled, this control file is encrypted at rest; otherwise the server-side control file contains this private state in plaintext.
 - For local directory inputs, scanning respects `.gitignore` files (root and nested) with standard Git semantics; `ignore_dirs`, `include`, and `exclude` further refine what is ingested.
-- `args.parse_mode=no_split` still invokes the normal format Parser. PDF, Word, PowerPoint, HTML, and other supported documents are converted to Markdown, but heading-, paragraph-, and size-based splitting is skipped. A directory import applies this independently to each supported document and continues to honor `.gitignore`, filters, and `preserve_structure`.
+- Directory ingestion is best-effort only when at least one selected file succeeds: failed files are reported in `meta.failed_files` while successful files are committed. Leaf failures from nested ZIP files are reported with archive-qualified paths such as `bundle.zip/path/to/file` and retain their remote task IDs. If no file succeeds, or the filters select no processable files, the task fails and no empty resource directory is retained.
+- `args.parse_mode=no_split` still invokes the normal format Parser. PDF, Word, PowerPoint, HTML, and other supported documents are converted to Markdown, but heading-, paragraph-, and size-based splitting is skipped. A directory import applies this independently to each supported document and continues to honor `.gitignore`, filters, and `preserve_structure`. Directory files configured for Understanding fall back to their native Parser in this mode; a file type without native parsing support is recorded in `meta.failed_files` without preventing other selected files from succeeding.
 - For a single-file input in `no_split` mode, when parsing produces exactly one visible file and `to` is omitted, that file is stored directly under the resolved parent (for example, `guide.md` becomes `viking://resources/guide.md`). No wrapper directory or directory-level `.abstract.md` / `.overview.md` is created. If parsing also produces images or other visible files, the wrapper directory is retained. An explicit `to` is always preserved as the exact final URI.
-- `no_split` changes only the stored Markdown layout. Semantic processing, file vectorization, and any internal embedding chunking remain unchanged. Relative Markdown links are resolved against the same no-split output layout, so links do not point to split-only paths. A configured Understanding parser that cannot guarantee a single Markdown body returns an explicit unsupported-mode error.
+- `no_split` changes only the stored Markdown layout. Semantic processing, file vectorization, and any internal embedding chunking remain unchanged. Relative Markdown links are resolved against the same no-split output layout, so links do not point to split-only paths. Understanding is not called for directory files in this mode.
 - To create or update plain text directly, use [content/write](03-filesystem.md#write) instead of `add_resource`. Semantic processing and embeddings are refreshed automatically after resource ingestion and content writes.
 
 #### 3. Usage Examples
@@ -318,7 +320,9 @@ curl -X POST http://localhost:1933/api/v1/resources \
     "watch_interval": 1440,
     "args": {
       "feishu_access_token": "u-...",
-      "feishu_refresh_token": "r-..."
+      "feishu_refresh_token": "r-...",
+      "feishu_app_id": "cli_...",
+      "feishu_app_secret": "..."
     }
   }'
 ```
@@ -333,49 +337,55 @@ client.initialize()
 
 # Add local file
 result = client.add_resource(
-    "./documents/guide.md",
-    reason="User guide documentation"
+    path="./documents/guide.md",
+    options={"reason": "User guide documentation"},
 )
 print(f"Added: {result['root_uri']}")
 
 # Parse each document to Markdown without splitting its body
 result = client.add_resource(
-    "./documents",
-    args={"parse_mode": "no_split"},
+    path="./documents",
+    options={"args": {"parse_mode": "no_split"}},
 )
 
 # Add from URL to specific location
 result = client.add_resource(
-    "https://example.com/api-docs.md",
+    path="https://example.com/api-docs.md",
     to="viking://resources/external/api-docs.md",
-    reason="External API documentation"
+    options={"reason": "External API documentation"},
 )
 
 # Recursively crawl a site (same-host BFS; depth levels, max_pages cap)
 result = client.add_resource(
-    "https://docs.openviking.ai/getting-started/01-introduction",
+    path="https://docs.openviking.ai/getting-started/01-introduction",
     wait=True,
     timeout=180,
-    args={"depth": 1, "max_pages": 10},
+    options={
+        "args": {"depth": 1, "max_pages": 10},
+    },
 )
 
 # Recursive crawl with path-prefix filters, also downloading file links
 result = client.add_resource(
-    "https://docs.openviking.ai/",
-    args={
-        "depth": 2,
-        "max_pages": 50,
-        "include_paths": ["/docs/"],
-        "exclude_paths": ["/changelog"],
-        "skip_download_links": False,
+    path="https://docs.openviking.ai/",
+    options={
+        "args": {
+            "depth": 2,
+            "max_pages": 50,
+            "include_paths": ["/docs/"],
+            "exclude_paths": ["/changelog"],
+            "skip_download_links": False,
+        },
     },
 )
 
 # Add to the current user's private resource root
 result = client.add_resource(
-    "./documents/guide.md",
+    path="./documents/guide.md",
     parent="viking://~/resources/docs",
-    create_parent=True,
+    options={
+        "create_parent": True,
+    },
 )
 
 # Wait for processing to complete
@@ -383,25 +393,31 @@ client.wait_processed()
 
 # Enable scheduled updates
 client.add_resource(
-    "./documents/guide.md",
+    path="./documents/guide.md",
     to="viking://resources/guide.md",
-    watch_interval=60  # Update every 60 minutes
+    options={
+        "watch_interval": 60,  # Update every 60 minutes
+    },
 )
 
 # Add a Feishu document with a one-time user access token
 client.add_resource(
-    "https://example.feishu.cn/docx/doc_token",
-    args={"feishu_access_token": "u-..."},
+    path="https://example.feishu.cn/docx/doc_token",
+    options={"args": {"feishu_access_token": "u-..."}},
 )
 
 # Add a Feishu document with scheduled user-token refresh
 client.add_resource(
-    "https://example.feishu.cn/docx/doc_token",
+    path="https://example.feishu.cn/docx/doc_token",
     to="viking://resources/feishu/doc",
-    watch_interval=1440,
-    args={
-        "feishu_access_token": "u-...",
-        "feishu_refresh_token": "r-...",
+    options={
+        "watch_interval": 1440,
+        "args": {
+            "feishu_access_token": "u-...",
+            "feishu_refresh_token": "r-...",
+            "feishu_app_id": "cli_...",
+            "feishu_app_secret": "...",
+        },
     },
 )
 ```
@@ -475,7 +491,9 @@ ov add-resource https://example.feishu.cn/docx/doc_token \
   --to viking://resources/feishu/doc \
   --watch-interval 1440 \
   --args feishu_access_token:u-... \
-  --args feishu_refresh_token:r-...
+  --args feishu_refresh_token:r-... \
+  --args feishu_app_id:cli_... \
+  --args feishu_app_secret:...
 
 # Add with parent directory (parent must exist)
 ov add-resource ./documents/guide.md --parent viking://resources/docs
@@ -528,12 +546,8 @@ ov add-resource ./documents/guide.md -p viking://resources/docs/{calendar:today}
 {
   "status": "ok",
   "result": {
-    "status": "success",
+    "status": "accepted",
     "root_uri": "viking://resources/guide",
-    "temp_uri": "viking://temp/username/04291108_b62dc7/guide",
-    "source_path": "./documents/guide.md",
-    "meta": {},
-    "errors": [],
     "task_id": "uuid-xxx"
   }
 }
@@ -546,7 +560,7 @@ Use the returned `task_id` to poll `/api/v1/tasks/{task_id}` for queue completio
 ```
 Note: Resource is being processed in the background.
 Use 'ov wait' to wait for completion, or 'ov observer queue' to check status.
-status       success
+status       accepted
 root_uri     viking://resources/01-overview
 task_id      uuid-xxx
 ```
@@ -555,7 +569,7 @@ task_id      uuid-xxx
 
 ```json
 {
-  "status": "success",
+  "status": "accepted",
   "root_uri": "viking://resources/01-overview",
   "task_id": "uuid-xxx"
 }
@@ -565,7 +579,7 @@ task_id      uuid-xxx
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `status` | string | Processing status: "success" or "error" |
+| `status` | string | Processing status: `accepted` means queued, `success` means completed successfully, and `error` means failed. |
 | `root_uri` | string | Final URI of the resource in OpenViking |
 | `task_id` | string | (Optional, only when `wait=false`) Task ID for polling `/api/v1/tasks/{task_id}`. Non-Git imports use it for queue tracking; Git repository imports use it for full background import tracking. |
 | `temp_uri` | string | Temporary URI produced during import |
