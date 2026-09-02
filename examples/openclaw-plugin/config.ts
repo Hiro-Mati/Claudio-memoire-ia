@@ -133,6 +133,8 @@ export type ParsedMemoryOpenVikingConfig = Required<
   apiKey: string;
   agentExperience: Required<NonNullable<MemoryOpenVikingConfig["agentExperience"]>>;
   recallTargetTypes: Array<"resource" | "user" | "agent">;
+  /** Internal provenance sentinel used to decide whether recall requests send a limit. */
+  readonly recallLimitConfigured: boolean;
 };
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:1933";
@@ -143,7 +145,7 @@ const DEFAULT_CAPTURE_MAX_LENGTH = 24000;
 // Session-aware context search may spend up to 5 seconds on query expansion
 // before returning its server-side fallback, so leave headroom for retrieval.
 const DEFAULT_AUTO_RECALL_TIMEOUT_MS = 15000;
-const DEFAULT_RECALL_LIMIT = 6;
+const DEFAULT_RECALL_LIMIT = 10;
 const DEFAULT_RECALL_SCORE_THRESHOLD = 0.15;
 const DEFAULT_RECALL_MAX_CONTENT_CHARS = 5000;
 const DEFAULT_RECALL_PREFER_ABSTRACT = false;
@@ -521,6 +523,7 @@ export const memoryOpenVikingConfigSchema = {
         "autoRecallTimeoutMs",
         "recallResources",
         "recallLimit",
+        "recallLimitConfigured",
         "recallScoreThreshold",
         "recallMaxInjectedChars",
         "recallMaxContentChars",
@@ -614,7 +617,7 @@ export const memoryOpenVikingConfigSchema = {
     );
     const { enabledTools, disabledTools } = normalizeEnabledTools(cfg);
 
-    return {
+    const parsed: ParsedMemoryOpenVikingConfig = {
       mode,
       baseUrl: resolvedBaseUrl,
       peer_role: peerRole,
@@ -638,6 +641,10 @@ export const memoryOpenVikingConfigSchema = {
       ),
       recallResources,
       recallLimit: Math.max(1, Math.floor(toNumber(cfg.recallLimit, DEFAULT_RECALL_LIMIT))),
+      recallLimitConfigured:
+        typeof cfg.recallLimitConfigured === "boolean"
+          ? cfg.recallLimitConfigured
+          : Object.prototype.hasOwnProperty.call(cfg, "recallLimit"),
       recallScoreThreshold: Math.min(
         1,
         Math.max(0, toNumber(cfg.recallScoreThreshold, DEFAULT_RECALL_SCORE_THRESHOLD)),
@@ -768,6 +775,7 @@ export const memoryOpenVikingConfigSchema = {
         ),
       },
     };
+    return parsed;
   },
   uiHints: {
     baseUrl: {
@@ -814,7 +822,7 @@ export const memoryOpenVikingConfigSchema = {
     targetUri: {
       label: "Search Target URI",
       placeholder: DEFAULT_TARGET_URI,
-      help: "Default OpenViking target URI for memory search",
+      help: "Default exact search scope for ov_search and memory_forget. memory_recall uses an exact scope only when targetUri is passed as a tool argument.",
     },
     timeoutMs: {
       label: "Request Timeout (ms)",
@@ -862,6 +870,7 @@ export const memoryOpenVikingConfigSchema = {
       label: "Recall Limit",
       placeholder: String(DEFAULT_RECALL_LIMIT),
       advanced: true,
+      help: "Optional recall result target for auto-recall and memory_recall. When unset, the request omits quotas and uses the OpenViking server default; explicit values use the standard coding quota mapping.",
     },
     recallScoreThreshold: {
       label: "Recall Score Threshold",
@@ -872,7 +881,7 @@ export const memoryOpenVikingConfigSchema = {
       label: "Recall Max Injected Chars",
       placeholder: String(DEFAULT_RECALL_MAX_INJECTED_CHARS),
       advanced: true,
-      help: "Legacy auto-recall character budget. It is converted to the server context token budget at four characters per token.",
+      help: "Character budget for auto-recall and memory_recall. It is converted to the server context token budget at four characters per token.",
     },
     recallMaxContentChars: {
       label: "Deprecated Recall Max Content Chars",
@@ -883,7 +892,7 @@ export const memoryOpenVikingConfigSchema = {
     recallPreferAbstract: {
       label: "Recall Prefer Abstract",
       advanced: true,
-      help: "Pin server-assembled auto-recall entries to abstract detail. When disabled, the server chooses each category's default detail tier.",
+      help: "Pin server-assembled auto-recall and memory_recall entries to abstract detail. When disabled, the server chooses each category's default detail tier.",
     },
     recallTokenBudget: {
       label: "Deprecated Recall Token Budget",
