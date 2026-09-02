@@ -179,7 +179,10 @@ def _report_extraction_telemetry(result: Any, operations: ResolvedOperations) ->
     for operation in result.skipped_operations:
         add(getattr(operation, "memory_type", None), "skipped")
     for uri, _error in result.errors:
-        add(types_by_uri.get(str(uri), MemoryUpdater.memory_type_from_uri(uri)), "failed")
+        # errors[].uri is an error target, not guaranteed to be a valid URI
+        # (it may be a sentinel like "unknown" or "events(page_id=100)"), so
+        # never parse it as a URI here — fall back to "unknown".
+        add(types_by_uri.get(str(uri), "unknown"), "failed")
 
     for memory_type, actions in actions_by_type.items():
         for action, value in actions.items():
