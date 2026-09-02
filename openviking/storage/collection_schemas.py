@@ -469,6 +469,10 @@ class TextEmbeddingHandler(DequeueHandlerBase):
         """Initialize the embedder instance from config."""
         self._embedder = config.embedding.get_embedder()
 
+    async def close(self) -> None:
+        if self._embedder is not None:
+            await asyncio.to_thread(self._embedder.close)
+
     def _log_breaker_open_reenqueue_summary(self) -> None:
         """Log a throttled warning when embeddings are re-enqueued due to an open circuit breaker."""
         now = time.monotonic()

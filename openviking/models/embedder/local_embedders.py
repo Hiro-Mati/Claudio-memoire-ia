@@ -7,8 +7,10 @@ from __future__ import annotations
 import asyncio
 import importlib
 import os
-import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -91,7 +93,6 @@ class LocalDenseEmbedder(DenseEmbedderBase):
         runtime_config.setdefault("provider", "local")
         super().__init__(model_name, runtime_config)
 
-        self._inference_lock = threading.Lock()
         self.model_spec = get_local_model_spec(model_name)
         self.model_path = model_path
         self.cache_dir = cache_dir or DEFAULT_LOCAL_MODEL_CACHE_DIR
@@ -109,6 +110,10 @@ class LocalDenseEmbedder(DenseEmbedderBase):
 
         self._resolved_model_path = self._resolve_model_path()
         self._llama = self._load_model()
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="openviking-local-embedding",
+        )
 
     def _import_llama(self):
         try:
@@ -198,34 +203,40 @@ class LocalDenseEmbedder(DenseEmbedderBase):
         return EmbedResult(dense_vector=self._extract_embedding(payload))
 
     def embed(self, text: str, is_query: bool = False) -> EmbedResult:
-        with self._inference_lock:
-            formatted = self._format_text(text, is_query=is_query)
+        formatted = self._format_text(text, is_query=is_query)
 
-            try:
-                result = self._run_with_retry(
-                    lambda: self._embed_formatted_text(formatted),
-                    logger=logger,
-                    operation_name="local embedding",
-                )
-            except Exception as exc:
-                raise RuntimeError(f"Local embedding failed: {exc}") from exc
-
-            estimated_tokens = self._estimate_tokens(formatted)
-            self.update_token_usage(
-                model_name=self.model_name,
-                provider="local",
-                prompt_tokens=estimated_tokens,
-                completion_tokens=0,
+        try:
+            result = self._run_with_retry(
+                lambda: self._embed_formatted_text(formatted),
+                logger=logger,
+                operation_name="local embedding",
             )
-            return result
+        except Exception as exc:
+            raise RuntimeError(f"Local embedding failed: {exc}") from exc
+
+        estimated_tokens = self._estimate_tokens(formatted)
+        self.update_token_usage(
+            model_name=self.model_name,
+            provider="local",
+            prompt_tokens=estimated_tokens,
+            completion_tokens=0,
+        )
+        return result
 
     async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
-        return await asyncio.to_thread(self.embed, text, is_query=is_query)
+        context = copy_context()
+        call = partial(self.embed, text, is_query=is_query)
+        return await asyncio.get_running_loop().run_in_executor(
+            self._executor,
+            context.run,
+            call,
+        )
 
     def get_dimension(self) -> int:
         return self._dimension
 
     def close(self):
+        self._executor.shutdown(wait=True, cancel_futures=True)
         close_fn = getattr(self._llama, "close", None)
         if callable(close_fn):
             close_fn()

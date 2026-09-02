@@ -1,7 +1,9 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
+import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -99,7 +101,24 @@ async def test_local_embedder_uses_explicit_model_path(monkeypatch, tmp_path):
 
     assert Path(_FakeLlama.init_kwargs[-1]["model_path"]) == model_path.resolve()
     event_loop_thread_id = threading.get_ident()
-    result = await embedder.embed_async("你好", is_query=False)
+    default_executor_blocker = threading.Event()
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    occupied_default_worker = asyncio.create_task(
+        asyncio.to_thread(default_executor_blocker.wait)
+    )
+    await asyncio.sleep(0)
+
+    try:
+        result = await asyncio.wait_for(
+            embedder.embed_async("你好", is_query=False),
+            timeout=1,
+        )
+    finally:
+        default_executor_blocker.set()
+        await occupied_default_worker
+        embedder.close()
+
     assert len(result.dense_vector) == 512
     assert _FakeLlama.inputs[-1] == "你好"
     assert _FakeLlama.thread_ids[-1] != event_loop_thread_id

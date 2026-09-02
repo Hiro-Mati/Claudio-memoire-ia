@@ -259,6 +259,8 @@ class QueueManager:
         await asyncio.gather(*self._workers.values())
         self._workers.clear()
 
+        await asyncio.gather(*(queue.close() for queue in self._queues.values()))
+
         self._agfs = None
         self._queues.clear()
         self._stop_event = None
