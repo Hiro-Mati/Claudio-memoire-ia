@@ -105,7 +105,6 @@ class VLMBase(ABC):
         pass
 
     @abstractmethod
-    @abstractmethod
     async def get_completion_async(
         self,
         prompt: str = "",
