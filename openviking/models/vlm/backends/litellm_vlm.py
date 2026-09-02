@@ -16,6 +16,7 @@ import litellm
 from litellm import acompletion, completion
 
 from openviking.telemetry import tracer
+from openviking.utils.message_format import format_messages, sanitize_openai_messages
 from openviking.utils.model_retry import retry_async, retry_sync
 from openviking.utils.multimodal import redact_image_data_urls
 from openviking_cli.utils import get_logger
@@ -276,16 +277,18 @@ class LiteLLMVLMProvider(VLMBase):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
         thinking: Optional[bool] = None,
+        max_tokens: Optional[int] = None,
     ) -> dict[str, Any]:
         """Build kwargs for LiteLLM call."""
         kwargs: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": sanitize_openai_messages(messages),
             "temperature": self.temperature,
             "timeout": self.timeout,
         }
-        if self.max_tokens is not None:
-            kwargs["max_tokens"] = self.max_tokens
+        effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        if effective_max_tokens is not None:
+            kwargs["max_tokens"] = effective_max_tokens
 
         if self._should_forward_api_key(model):
             kwargs["api_key"] = self.api_key
@@ -384,10 +387,13 @@ class LiteLLMVLMProvider(VLMBase):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
     ) -> dict[str, Any]:
         model = self._resolve_model(self.model or "gpt-4o-mini")
         kwargs_messages = messages or [{"role": "user", "content": prompt}]
-        return self._build_kwargs(model, kwargs_messages, tools, tool_choice, thinking=thinking)
+        return self._build_kwargs(
+            model, kwargs_messages, tools, tool_choice, thinking=thinking, max_tokens=max_tokens
+        )
 
     def _build_vision_kwargs(
         self,
@@ -446,12 +452,16 @@ class LiteLLMVLMProvider(VLMBase):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
     ) -> Union[str, VLMResponse]:
         """Get text completion asynchronously."""
-        kwargs = self._build_text_kwargs(prompt, thinking, tools, tool_choice, messages)
-        # 用 tracer.info 打印请求
+        kwargs = self._build_text_kwargs(
+            prompt, thinking, tools, tool_choice, messages, max_tokens=max_tokens
+        )
+        # 用 tracer.info 打印请求（人类可读格式）
         tracer.info(
-            f"request: {json.dumps(redact_image_data_urls(kwargs), ensure_ascii=False, indent=2)}"
+            "llm_input_messages="
+            + format_messages(redact_image_data_urls(kwargs.get("messages", [])))
         )
 
         async def _call() -> Union[str, VLMResponse]:
