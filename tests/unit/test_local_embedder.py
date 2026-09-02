@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -36,12 +37,14 @@ class _FakeResponse:
 class _FakeLlama:
     init_kwargs = []
     inputs = []
+    thread_ids = []
 
     def __init__(self, **kwargs):
         self.__class__.init_kwargs.append(kwargs)
 
     def create_embedding(self, payload):
         self.__class__.inputs.append(payload)
+        self.__class__.thread_ids.append(threading.get_ident())
         return {"data": [{"embedding": [0.1] * 512}]}
 
 
@@ -49,6 +52,7 @@ class _FakeLlama:
 def _reset_fake_llama():
     _FakeLlama.init_kwargs = []
     _FakeLlama.inputs = []
+    _FakeLlama.thread_ids = []
 
 
 def test_embedding_config_defaults_to_local_dense():
@@ -81,7 +85,8 @@ def test_local_embedder_requires_optional_dependency(monkeypatch, tmp_path):
         LocalDenseEmbedder(model_path=str(model_path))
 
 
-def test_local_embedder_uses_explicit_model_path(monkeypatch, tmp_path):
+@pytest.mark.asyncio
+async def test_local_embedder_uses_explicit_model_path(monkeypatch, tmp_path):
     model_path = tmp_path / "model.gguf"
     model_path.write_bytes(b"gguf")
 
@@ -93,9 +98,11 @@ def test_local_embedder_uses_explicit_model_path(monkeypatch, tmp_path):
     embedder = LocalDenseEmbedder(model_path=str(model_path))
 
     assert Path(_FakeLlama.init_kwargs[-1]["model_path"]) == model_path.resolve()
-    result = embedder.embed("你好", is_query=False)
+    event_loop_thread_id = threading.get_ident()
+    result = await embedder.embed_async("你好", is_query=False)
     assert len(result.dense_vector) == 512
     assert _FakeLlama.inputs[-1] == "你好"
+    assert _FakeLlama.thread_ids[-1] != event_loop_thread_id
 
 
 def test_local_embedder_downloads_default_model_and_prefixes_query(monkeypatch, tmp_path):
