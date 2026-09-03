@@ -1304,7 +1304,7 @@ class Session:
         agent_evolution_enabled: bool = True,
         agent_memory_skip_reason: Optional[str] = None,
         lease_ref: Optional[Any] = None,
-    ) -> None:
+    ) -> Dict[str, Any]:
         """Persist the Phase 1 intent before any destructive root rewrite."""
         payload = {
             "version": 1,
@@ -1320,32 +1320,54 @@ class Session:
             "retained_message_token_budget": retained_message_token_budget,
             "min_raw_tail_steps": min_raw_tail_steps,
         }
-        await self._merge_archive_meta(
-            archive_uri,
-            {
-                "phase1": payload,
-                "agent_evolution": {
-                    "enabled": agent_evolution_enabled,
-                    "skip_reason": agent_memory_skip_reason,
-                },
+        meta_payload = {
+            "phase1": payload,
+            "agent_evolution": {
+                "enabled": agent_evolution_enabled,
+                "skip_reason": agent_memory_skip_reason,
             },
-            lease_ref=lease_ref,
-        )
+        }
+        if self._viking_fs:
+            await self._viking_fs.write_file(
+                uri=f"{archive_uri}/.meta.json",
+                content=json.dumps(meta_payload, ensure_ascii=False),
+                ctx=self.ctx,
+                lease_ref=lease_ref,
+            )
+        return meta_payload
 
     async def _write_phase1_ready_marker(
         self,
         archive_uri: str,
         lease_ref: Optional[Any] = None,
+        *,
+        phase1: Optional[Dict[str, Any]] = None,
+        meta: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Persist that Phase 1 is ready using an optional held PathLock lease."""
-        phase1 = await self._read_phase1_meta(archive_uri)
+        if phase1 is None:
+            if meta is not None:
+                stored_phase1 = meta.get("phase1")
+                phase1 = dict(stored_phase1) if isinstance(stored_phase1, dict) else {}
+            else:
+                phase1 = await self._read_phase1_meta(archive_uri)
         phase1.update(
             {
                 "status": "ready",
                 "ready_at": get_current_timestamp(),
             }
         )
-        await self._merge_archive_meta(archive_uri, {"phase1": phase1}, lease_ref=lease_ref)
+        if meta is None:
+            await self._merge_archive_meta(archive_uri, {"phase1": phase1}, lease_ref=lease_ref)
+            return
+        meta["phase1"] = phase1
+        if self._viking_fs:
+            await self._viking_fs.write_file(
+                uri=f"{archive_uri}/.meta.json",
+                content=json.dumps(meta, ensure_ascii=False),
+                ctx=self.ctx,
+                lease_ref=lease_ref,
+            )
 
     async def _archive_file_exists(self, archive_uri: str, file_name: str) -> bool:
         try:
@@ -1772,7 +1794,7 @@ class Session:
             )
             phase1_stage = "phase1_persist"
             try:
-                await self._write_phase1_marker(
+                phase1_meta = await self._write_phase1_marker(
                     archive_uri,
                     queue_message=queue_msg.to_dict(),
                     original_messages=original_messages,
@@ -1826,7 +1848,6 @@ class Session:
 
                 phase1_stage = "phase1_persist"
                 self._messages = retained_messages
-                await self._write_to_agfs_async(messages=self._messages)
                 self._meta.message_count = len(self._messages)
                 self._meta.pending_tokens = 0
                 self._remember_retention_policy(
@@ -1846,8 +1867,17 @@ class Session:
                     # commit boundary, so an idle scan and a concurrent worker
                     # never see a stale state.
                     self._meta.last_auto_commit_at = get_current_timestamp()
-                await self._save_meta()
-                await self._write_phase1_ready_marker(archive_uri)
+                await asyncio.gather(
+                    self._write_to_agfs_async(messages=self._messages),
+                    self._save_meta(),
+                )
+                await self._write_phase1_ready_marker(
+                    archive_uri,
+                    meta=phase1_meta if retention_plan is None else None,
+                    phase1=(
+                        phase1_meta.get("phase1") if retention_plan is not None else None
+                    ),
+                )
             except Exception as e:
                 logger.error(f"[commit] Failed during {phase1_stage}: {e}")
                 # Whether the queue write failed or a queued Phase 1 stopped
@@ -4926,44 +4956,47 @@ class Session:
         overview = self._generate_overview(turn_count)
 
         content = await asyncio.to_thread(messages_to_jsonl, messages)
-
-        await viking_fs.write_file(
-            uri=f"{self._session_uri}/messages.jsonl",
-            content=content,
-            ctx=self.ctx,
-            lease_ref=lease_ref,
+        abstract_content = render_abstract_overview(
+            ContextLevel.ABSTRACT,
+            self._session_uri,
+            abstract,
+            {
+                "generated_by": {
+                    "component": "Session",
+                    "trigger": "session_update",
+                }
+            },
         )
-        await viking_fs.write_file(
-            uri=f"{self._session_uri}/.abstract.md",
-            content=render_abstract_overview(
-                ContextLevel.ABSTRACT,
-                self._session_uri,
-                abstract,
-                {
-                    "generated_by": {
-                        "component": "Session",
-                        "trigger": "session_update",
-                    }
-                },
-            ),
-            ctx=self.ctx,
-            lease_ref=lease_ref,
+        overview_content = render_abstract_overview(
+            ContextLevel.OVERVIEW,
+            self._session_uri,
+            overview,
+            {
+                "generated_by": {
+                    "component": "Session",
+                    "trigger": "session_update",
+                }
+            },
         )
-        await viking_fs.write_file(
-            uri=f"{self._session_uri}/.overview.md",
-            content=render_abstract_overview(
-                ContextLevel.OVERVIEW,
-                self._session_uri,
-                overview,
-                {
-                    "generated_by": {
-                        "component": "Session",
-                        "trigger": "session_update",
-                    }
-                },
+        await asyncio.gather(
+            viking_fs.write_file(
+                uri=f"{self._session_uri}/messages.jsonl",
+                content=content,
+                ctx=self.ctx,
+                lease_ref=lease_ref,
             ),
-            ctx=self.ctx,
-            lease_ref=lease_ref,
+            viking_fs.write_file(
+                uri=f"{self._session_uri}/.abstract.md",
+                content=abstract_content,
+                ctx=self.ctx,
+                lease_ref=lease_ref,
+            ),
+            viking_fs.write_file(
+                uri=f"{self._session_uri}/.overview.md",
+                content=overview_content,
+                ctx=self.ctx,
+                lease_ref=lease_ref,
+            ),
         )
 
     def _generate_abstract(self) -> str:

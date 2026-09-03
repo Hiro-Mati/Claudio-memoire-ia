@@ -6,11 +6,26 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from concurrent.futures import Executor
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import partial
 from typing import Any, BinaryIO, Dict, List, Union
 
 from .protocols import AGFSSyncClientProtocol
 
 _SYSTEM_ACCOUNT_ID = "_system"
+_AGFS_EXECUTOR: ContextVar[Executor | None] = ContextVar("agfs_executor", default=None)
+
+
+@contextmanager
+def bind_agfs_executor(executor: Executor) -> Iterator[None]:
+    """Route AGFS binding calls in this async context to a dedicated executor."""
+    token = _AGFS_EXECUTOR.set(executor)
+    try:
+        yield
+    finally:
+        _AGFS_EXECUTOR.reset(token)
 
 
 def fs_ctx_from_agfs_path(path: str) -> Dict[str, str]:
@@ -92,17 +107,23 @@ class AsyncAGFSClient:
 
     async def run(self, method_name: str, /, *args: Any, **kwargs: Any) -> Any:
         """Run a sync client method in a worker thread, preserving ctx when supported."""
+        async def run_call(call_kwargs: Dict[str, Any]) -> Any:
+            method = getattr(self._client, method_name)
+            executor = _AGFS_EXECUTOR.get()
+            if executor is None:
+                return await asyncio.to_thread(method, *args, **call_kwargs)
+            call = partial(method, *args, **call_kwargs)
+            return await asyncio.get_running_loop().run_in_executor(executor, call)
+
         try:
-            return await asyncio.to_thread(getattr(self._client, method_name), *args, **kwargs)
+            return await run_call(kwargs)
         except TypeError as exc:
             message = str(exc)
             if "ctx" not in kwargs or "unexpected keyword argument 'ctx'" not in message:
                 raise
             legacy_kwargs = dict(kwargs)
             legacy_kwargs.pop("ctx", None)
-            return await asyncio.to_thread(
-                getattr(self._client, method_name), *args, **legacy_kwargs
-            )
+            return await run_call(legacy_kwargs)
 
     async def ls(
         self, path: str = "/", *, fs_ctx: Dict[str, str] | None = None

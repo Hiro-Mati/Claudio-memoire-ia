@@ -51,13 +51,14 @@ async def test_commit_async_keeps_working_when_session_metrics_fail(
     service = SessionService(viking_fs=Mock())
     ctx = _make_ctx()
     session = Mock()
+    session.exists = AsyncMock(return_value=True)
     session.commit_async = AsyncMock(return_value={"status": "queued", "archived": False})
     debug = Mock()
 
     def _boom(*_args, **_kwargs):
         raise RuntimeError("metrics failed")
 
-    monkeypatch.setattr(service, "get", AsyncMock(return_value=session))
+    monkeypatch.setattr(service, "session", Mock(return_value=session))
     monkeypatch.setattr(SessionLifecycleDataSource, "record_lifecycle", staticmethod(_boom))
     monkeypatch.setattr(SessionLifecycleDataSource, "record_archive", staticmethod(_boom))
     monkeypatch.setattr(session_service_module.logger, "debug", debug)
@@ -65,6 +66,7 @@ async def test_commit_async_keeps_working_when_session_metrics_fail(
     result = await service.commit_async("sess-1", ctx)
 
     assert result == {"status": "queued", "archived": False}
+    session.exists.assert_awaited_once()
     session.commit_async.assert_awaited_once()
     assert debug.call_count == 2
 

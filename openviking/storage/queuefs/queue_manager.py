@@ -7,8 +7,10 @@ All queues are managed through NamedQueue.
 
 import asyncio
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional, Set, Union
 
+from openviking.pyagfs.async_client import bind_agfs_executor
 from openviking.service.task_work_index import TaskWorkIndex
 from openviking_cli.utils.logger import get_logger
 
@@ -107,6 +109,7 @@ class QueueManager:
         self._queues: Dict[str, NamedQueue] = {}
         self._workers: Dict[str, asyncio.Task[None]] = {}
         self._stop_event: Optional[asyncio.Event] = None
+        self._worker_io_executor: Optional[ThreadPoolExecutor] = None
         self._poll_interval = 0.2
         self._task_work_index = TaskWorkIndex()
 
@@ -120,6 +123,7 @@ class QueueManager:
             return
 
         self._stop_event = asyncio.Event()
+        self._worker_io_executor = ThreadPoolExecutor(thread_name_prefix="queuefs-io")
         for queue in list(self._queues.values()):
             self._start_queue_worker(queue)
 
@@ -199,18 +203,22 @@ class QueueManager:
 
         async def process_one(data: Dict[str, Any]) -> None:
             msg_id = data.get("id", "")
-            try:
-                await queue.process_dequeued(data)
-                await queue.ack(msg_id, data)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                queue._on_process_error(str(exc), data)
-                logger.error(
-                    "[QueueManager] Worker error for %s: %s",
-                    queue.name,
-                    exc,
-                )
+            executor = self._worker_io_executor
+            if executor is None:
+                raise RuntimeError("QueueManager worker executor is not initialized")
+            with bind_agfs_executor(executor):
+                try:
+                    await queue.process_dequeued(data)
+                    await queue.ack(msg_id, data)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    queue._on_process_error(str(exc), data)
+                    logger.error(
+                        "[QueueManager] Worker error for %s: %s",
+                        queue.name,
+                        exc,
+                    )
 
         while not stop_event.is_set():
             active_tasks = {task for task in active_tasks if not task.done()}
@@ -262,6 +270,9 @@ class QueueManager:
         self._agfs = None
         self._queues.clear()
         self._stop_event = None
+        if self._worker_io_executor is not None:
+            self._worker_io_executor.shutdown(wait=False, cancel_futures=True)
+            self._worker_io_executor = None
 
         if _instance is self:
             _instance = None

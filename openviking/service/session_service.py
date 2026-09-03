@@ -423,7 +423,9 @@ class SessionService:
             archive_uri, archived
         """
         self._ensure_initialized()
-        session = await self.get(session_id, ctx)
+        session = self.session(ctx, session_id)
+        if not await session.exists():
+            raise NotFoundError(session_id, "session")
         commit_kwargs: Dict[str, Any] = {"keep_recent_count": keep_recent_count}
         optional_retention = {
             "retention_mode": retention_mode,

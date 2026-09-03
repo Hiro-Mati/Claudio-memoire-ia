@@ -27,9 +27,6 @@ class _FakeSession:
     async def exists(self) -> bool:
         return True
 
-    async def load(self) -> None:
-        return None
-
     async def resume_queued_commit(self, msg) -> bool:
         root = get_root_observability_context()
         self._captured["account_id"] = root.account_id if root else None
