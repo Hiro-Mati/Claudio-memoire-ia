@@ -130,7 +130,7 @@ def test_auth_takes_precedence_over_quota():
 
 def test_classify_400_is_permanent():
     """A 400 parameter error is request-level permanent (fail-fast)."""
-    error = RuntimeError("Error code: 400 - invalid parameter `model`")
+    error = _ProviderError(status_code=400, code="InvalidParameter")
     assert classify_api_error(error) == ERROR_CLASS_PERMANENT
 
 

@@ -191,6 +191,7 @@ def classify_api_error(error: Exception) -> str:
     """Classify an API error into one of the ERROR_CLASS_* categories.
 
     Order matters:
+    - structured HTTP status codes are checked before falling back to text matching.
     - ``content_safety`` is checked before ``permanent`` so a moderation
       rejection that happens to embed "400" in its message is not misclassified.
     - ``auth`` (401/403) is separated from ``permanent`` (400): auth errors are
@@ -216,6 +217,16 @@ def classify_api_error(error: Exception) -> str:
     for exc in (error, getattr(error, "__cause__", None)):
         if exc is not None and isinstance(exc, _PERMANENT_IO_ERRORS):
             return ERROR_CLASS_PERMANENT
+
+    error_code = extract_metric_error_code(error)
+    if error_code == "413":
+        return ERROR_CLASS_INPUT_TOO_LARGE
+    if error_code == "400":
+        return ERROR_CLASS_PERMANENT
+    if error_code in ("401", "403"):
+        return ERROR_CLASS_AUTH
+    if error_code in ("429", "500", "502", "503", "504"):
+        return ERROR_CLASS_TRANSIENT
 
     texts = [str(error)]
     if error.__cause__ is not None:
