@@ -342,12 +342,13 @@ class TestOpenAIVLMClientRetries:
         assert call_kwargs["max_retries"] == 0
 
     @patch("volcenginesdkarkruntime.AsyncArk")
-    def test_volcengine_async_client_does_not_retry_provider_errors(
+    def test_volcengine_async_client_does_not_retry_permanent_provider_errors(
         self,
         mock_async_ark_class,
     ):
-        error = RuntimeError("RateLimitExceeded")
-        error.status_code = 429
+        error = RuntimeError("InvalidParameter")
+        error.status_code = 400
+        error.code = "InvalidParameter"
         mock_client = MagicMock()
         mock_client.chat.completions.create = AsyncMock(side_effect=error)
         mock_async_ark_class.return_value = mock_client
@@ -361,7 +362,7 @@ class TestOpenAIVLMClientRetries:
             }
         )
 
-        with pytest.raises(RuntimeError, match="RateLimitExceeded"):
+        with pytest.raises(RuntimeError, match="InvalidParameter"):
             asyncio.run(vlm.get_completion_async("hello"))
 
         mock_async_ark_class.assert_called_once()
@@ -526,6 +527,7 @@ class TestVLMExtraRequestBody:
 
         # Ollama models also get a default num_ctx; the explicit think is kept.
         assert kwargs["extra_body"] == {"think": False, "num_ctx": 16384}
+        assert kwargs["max_retries"] == 0
 
     def test_ollama_defaults_num_ctx_and_think(self):
         """Ollama models get a larger context window and thinking disabled by default."""
