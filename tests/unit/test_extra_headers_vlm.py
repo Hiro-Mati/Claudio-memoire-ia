@@ -342,14 +342,12 @@ class TestOpenAIVLMClientRetries:
         assert call_kwargs["max_retries"] == 0
 
     @patch("volcenginesdkarkruntime.AsyncArk")
-    def test_volcengine_async_client_does_not_retry_bad_request(
+    def test_volcengine_async_client_does_not_retry_provider_errors(
         self,
         mock_async_ark_class,
     ):
-        error = RuntimeError(
-            "InvalidParameter: Total tokens of multi-modal content and text exceed max message tokens"
-        )
-        error.status_code = 400
+        error = RuntimeError("RateLimitExceeded")
+        error.status_code = 429
         mock_client = MagicMock()
         mock_client.chat.completions.create = AsyncMock(side_effect=error)
         mock_async_ark_class.return_value = mock_client
@@ -363,7 +361,7 @@ class TestOpenAIVLMClientRetries:
             }
         )
 
-        with pytest.raises(RuntimeError, match="InvalidParameter"):
+        with pytest.raises(RuntimeError, match="RateLimitExceeded"):
             asyncio.run(vlm.get_completion_async("hello"))
 
         mock_async_ark_class.assert_called_once()
