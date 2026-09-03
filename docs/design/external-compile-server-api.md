@@ -14,14 +14,13 @@ ov compile
 
 OV 负责公开任务的持久化、查询、取消、重试和重启恢复。Compile Server 负责实际执行和 session 状态。外部服务是多实例时，session 必须放在共享存储中。
 
-所有内部请求都必须同时校验：
+所有请求都必须校验当前用户的 OV API Key：
 
 ```http
 X-API-Key: <当前用户的 OV API Key>
-X-Gateway-Token: <compile_api.gateway_token>
 ```
 
-`X-API-Key` 用于解析用户和对应 OV 实例；`X-Gateway-Token` 用于确认请求来自 OV。两者都不能写入日志或任务公开状态。
+`X-API-Key` 用于解析用户和对应 OV 实例。外部服务需要额外确认请求来自 OV 时，可配置 `compile_api.gateway_token` 并校验 `X-Gateway-Token`。两种凭证都不能写入日志或任务公开状态。
 
 ## 1. 创建 session
 
@@ -98,13 +97,13 @@ POST /compile/cancel
 ```json
 {
   "compile_api": {
-    "enable": true,
     "base_url": "https://compile.example.com",
-    "gateway_token": "$OPENVIKING_COMPILE_GATEWAY_TOKEN",
     "http_timeout_seconds": 10,
     "poll_interval_ms": 3000
   }
 }
 ```
+
+配置非空 `base_url` 即启用外部 Compile。`gateway_token` 可选；仅在外部服务要求网关身份时配置。
 
 `408`、`425`、`429` 和 `5xx` 会被 OV 当作暂时错误重试；其他 `4xx` 会结束任务。VikingBot 已实现同一套 session 接口，可用于本地联调，但不实现 MA 专用的 `args`。

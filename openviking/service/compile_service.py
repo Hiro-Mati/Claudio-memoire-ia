@@ -122,8 +122,9 @@ class CompileAPIClient:
     ) -> dict[str, str]:
         headers = {
             "Content-Type": "application/json",
-            "X-Gateway-Token": self._endpoint.gateway_token,
         }
+        if self._endpoint.gateway_token:
+            headers["X-Gateway-Token"] = self._endpoint.gateway_token
         api_key = str(connection.get("api_key") or "").strip()
         if api_key:
             headers["X-API-Key"] = api_key
@@ -257,7 +258,7 @@ class CompileService:
         return self._endpoint().poll_interval_ms / 1000.0
 
     def configure_local_backend(self, base_url: str, gateway_token: str) -> None:
-        if self._config.enable:
+        if self._config.base_url:
             return
         self._local_endpoint = _CompileEndpoint(
             base_url=base_url.rstrip("/"),
@@ -268,7 +269,7 @@ class CompileService:
         )
 
     def _endpoint(self) -> _CompileEndpoint:
-        if self._config.enable:
+        if self._config.base_url:
             return _CompileEndpoint(
                 base_url=self._config.base_url,
                 gateway_token=self._config.gateway_token,
@@ -277,7 +278,7 @@ class CompileService:
             )
         if self._local_endpoint is not None:
             return self._local_endpoint
-        raise UnavailableError("compile API", "compile_api is not enabled")
+        raise UnavailableError("compile API", "compile_api.base_url is not configured")
 
     def _client(self) -> CompileAPIClient:
         return CompileAPIClient(self._endpoint())

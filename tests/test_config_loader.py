@@ -173,15 +173,14 @@ def test_parser_and_compile_api_validation():
         ParserApiConfig(max_concurrent=9)
 
     assert exc_info.value.errors()[0]["type"] == "extra_forbidden"
-    with pytest.raises(ValueError, match="compile_api.base_url is required"):
-        CompileApiConfig(enable=True)
+    with pytest.raises(ValueError, match="compile_api.base_url must include scheme"):
+        CompileApiConfig(base_url="compile.example.com")
 
     config = CompileApiConfig(
-        enable=True,
         base_url="https://compile.example.com/",
-        gateway_token="service-key",
     )
     assert config.base_url == "https://compile.example.com"
+    assert config.gateway_token == ""
 
 
 def test_parser_api_upload_defaults():

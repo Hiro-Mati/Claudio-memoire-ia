@@ -314,7 +314,7 @@ async def test_compile_routes_use_ov_owned_task_and_forward_identity(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_compile_api_client_uses_session_protocol_and_documented_auth(monkeypatch):
+async def test_compile_api_client_uses_session_protocol_and_api_key_auth(monkeypatch):
     forwarded = []
 
     class FakeResponse:
@@ -362,9 +362,7 @@ async def test_compile_api_client_uses_session_protocol_and_documented_auth(monk
     monkeypatch.setattr(compile_service_module.httpx, "AsyncClient", FakeClient)
     service = CompileService(
         CompileApiConfig(
-            enable=True,
             base_url="https://compile.example.com",
-            gateway_token="compile-gateway-token",
         ),
         ExternalTaskService(),
         SimpleNamespace(),
@@ -414,7 +412,7 @@ async def test_compile_api_client_uses_session_protocol_and_documented_auth(monk
         "https://compile.example.com/compile/cancel",
     ]
     assert all(request["method"] == "POST" for request in forwarded)
-    assert forwarded[0]["headers"]["X-Gateway-Token"] == "compile-gateway-token"
+    assert "X-Gateway-Token" not in forwarded[0]["headers"]
     assert forwarded[0]["headers"]["Idempotency-Key"] == "cmp_ov_1"
     assert forwarded[0]["headers"]["X-API-Key"] == "active-user-key"
     assert forwarded[0]["body"]["args"]["user_key"] == "model-user-key"

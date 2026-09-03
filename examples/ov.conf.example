@@ -113,9 +113,8 @@
         "external_task": {"max_concurrent": 10},
     },
     "compile_api": {
-        "enable": false,
-        "host": "https://compile.example.com",
-        "api_key": "$OPENVIKING_COMPILE_API_KEY",
+        "base_url": "",
+        "gateway_token": "",
         "http_timeout_seconds": 10,
         "poll_interval_ms": 3000,
     },

@@ -139,7 +139,6 @@ class ParserApiConfig(BaseModel):
 class CompileApiConfig(BaseModel):
     """Configuration for the external Compile task API."""
 
-    enable: bool = False
     base_url: str = ""
     gateway_token: str = ""
     http_timeout_seconds: float = 10.0
@@ -148,13 +147,6 @@ class CompileApiConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> "CompileApiConfig":
-        if self.enable:
-            if not self.base_url.strip():
-                raise ValueError("compile_api.base_url is required when compile_api.enable=true")
-            if not self.gateway_token.strip():
-                raise ValueError(
-                    "compile_api.gateway_token is required when compile_api.enable=true"
-                )
         if self.base_url and "://" not in self.base_url:
             raise ValueError("compile_api.base_url must include scheme (e.g., https://...)")
         if self.http_timeout_seconds <= 0:

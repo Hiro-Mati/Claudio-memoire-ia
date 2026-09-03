@@ -28,7 +28,7 @@ def test_service_passes_queue_worker_concurrency_to_storage(monkeypatch) -> None
         ),
         vlm=SimpleNamespace(max_concurrent=32),
         parser_api=SimpleNamespace(),
-        compile_api=SimpleNamespace(enable=False),
+        compile_api=SimpleNamespace(base_url=""),
         queue_workers=SimpleNamespace(
             external_parse=SimpleNamespace(max_concurrent=9),
             add_resource=SimpleNamespace(max_concurrent=7),

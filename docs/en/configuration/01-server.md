@@ -236,13 +236,12 @@ This setting controls queue-job concurrency. It is separate from `vlm.media.max_
 
 | Field | Type | Default | Description |
 |---|---|---:|---|
-| `enable` | boolean | `false` | Enable the external Compile server |
-| `base_url` | string | `""` | External service base URL, including `http://` or `https://` |
-| `gateway_token` | string | `""` | Service credential used by OV to call the Compile Gateway |
+| `base_url` | string | `""` | External service base URL, including `http://` or `https://`; a non-empty value enables external Compile |
+| `gateway_token` | string | `""` | Optional service credential used by OV to call the Compile Gateway |
 | `http_timeout_seconds` | number | `10` | Timeout for one HTTP request |
 | `poll_interval_ms` | integer | `3000` | External task polling interval |
 
-When enabled, OV sends the current user's OV API key in `X-API-Key` and its service identity in `X-Gateway-Token`.
+When `base_url` is configured, OV sends the current user's OV API key in `X-API-Key`. It sends `X-Gateway-Token` only when `gateway_token` is configured.
 
 ## Reindex Settings
 
