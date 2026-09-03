@@ -458,7 +458,9 @@ class MemoryStore:
                         "limit": quota,
                     }
                     if getattr(client, "actor_peer_id", None):
-                        find_kwargs["context_type"] = "memory"
+                        # context_type moved from a top-level find() kwarg into
+                        # FindOptions after the SDK find/search sync.
+                        find_kwargs["options"] = {"context_type": "memory"}
                     result = await client.find(**find_kwargs)
                 except Exception as e:
                     logger.warning(f"Failed to search {target_uri}: {e}")
