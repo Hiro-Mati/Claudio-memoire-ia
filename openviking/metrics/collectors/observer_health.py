@@ -35,7 +35,7 @@ class ObserverHealthCollector(StateMetricCollector):
     data_source: ObserverStateDataSource
     config: CollectorConfig = CollectorConfig(ttl_seconds=10.0, timeout_seconds=0.8)
     _known_components: list[str] = field(
-        default_factory=lambda: ["queue", "models", "lock", "retrieval", "vikingdb"],
+        default_factory=lambda: ["queue", "models", "lock", "retrieval", "vikingdb", "filesystem"],
         init=False,
         repr=False,
     )

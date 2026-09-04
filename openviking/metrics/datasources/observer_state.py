@@ -49,6 +49,7 @@ class ObserverStateDataSource(DomainStatsMetricDataSource):
                 self.normalize_str("models"): observer.models,
                 self.normalize_str("lock"): observer.lock,
                 self.normalize_str("retrieval"): observer.retrieval,
+                self.normalize_str("filesystem"): observer.filesystem,
             }
             try:
                 components[self.normalize_str("vikingdb")] = observer.vikingdb(ctx=None)
