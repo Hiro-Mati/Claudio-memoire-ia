@@ -12,7 +12,7 @@ import {
   markExperiencesSeen,
   normalizeExperienceFiles,
   normalizeOutcomeDistribution,
-  normalizeRelations,
+  normalizeSourceTrajectoryLinks,
   normalizeTrajectoryPage,
   resolveTimeRange,
 } from './experience'
@@ -231,18 +231,38 @@ describe('resolveTimeRange', () => {
   })
 })
 
-describe('normalizeRelations', () => {
-  it('keeps entries with a uri and optional reason', () => {
+describe('normalizeSourceTrajectoryLinks', () => {
+  it('keeps unique derived-from trajectory links from memory attrs', () => {
     expect(
-      normalizeRelations([
-        {
-          uri: 'viking://user/u/memories/trajectories/t1.md',
-          reason: 'distilled',
+      normalizeSourceTrajectoryLinks({
+        attrs: {
+          memory: {
+            links: [
+              {
+                to_uri: 'viking://user/u/memories/trajectories/t1.md',
+                link_type: 'derived_from',
+                description: 'distilled',
+              },
+              {
+                to_uri: 'viking://user/u/memories/trajectories/t2.md',
+                link_type: 'derived_from',
+              },
+              {
+                to_uri: 'viking://user/u/memories/trajectories/t1.md',
+                link_type: 'derived_from',
+              },
+              {
+                to_uri: 'viking://user/u/memories/events/e1.md',
+                link_type: 'derived_from',
+              },
+              {
+                to_uri: 'viking://user/u/memories/trajectories/t3.md',
+                link_type: 'evolved_from',
+              },
+            ],
+          },
         },
-        { uri: 'viking://user/u/memories/trajectories/t2.md' },
-        { reason: 'missing uri' },
-        'junk',
-      ]),
+      }),
     ).toEqual([
       {
         uri: 'viking://user/u/memories/trajectories/t1.md',
@@ -252,9 +272,12 @@ describe('normalizeRelations', () => {
     ])
   })
 
-  it('returns an empty list for non-array payloads', () => {
-    expect(normalizeRelations(undefined)).toEqual([])
-    expect(normalizeRelations({})).toEqual([])
+  it('returns an empty list for malformed attrs payloads', () => {
+    expect(normalizeSourceTrajectoryLinks(undefined)).toEqual([])
+    expect(normalizeSourceTrajectoryLinks({})).toEqual([])
+    expect(
+      normalizeSourceTrajectoryLinks({ attrs: { memory: { links: {} } } }),
+    ).toEqual([])
   })
 })
 

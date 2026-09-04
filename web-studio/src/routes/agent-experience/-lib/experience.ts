@@ -208,21 +208,45 @@ export function formatFileSize(size: number | undefined): string | undefined {
   return `${value >= 10 ? Math.round(value) : Math.round(value * 10) / 10} ${unit}`
 }
 
-export type RelationLink = {
+export type SourceTrajectoryLink = {
   uri: string
   reason?: string
 }
 
-/** Normalize `GET /api/v1/relations` result into linked resources. */
-export function normalizeRelations(value: unknown): RelationLink[] {
-  if (!Array.isArray(value)) return []
+/**
+ * Normalize Experience `memory.links` returned by `GET /api/v1/fs/attrs`.
+ *
+ * Experience source trajectories are stored as forward `derived_from` links
+ * (`experience -> trajectory`). Other memory relations are intentionally not
+ * shown in the source trace panel.
+ */
+export function normalizeSourceTrajectoryLinks(
+  value: unknown,
+): SourceTrajectoryLink[] {
+  const result = isRecord(value) ? value : null
+  const attrs = result && isRecord(result.attrs) ? result.attrs : null
+  const memory = attrs && isRecord(attrs.memory) ? attrs.memory : null
+  const links = memory && Array.isArray(memory.links) ? memory.links : []
+  const seen = new Set<string>()
 
-  return value.flatMap((raw) => {
-    const entry = isRecord(raw) ? raw : null
-    const uri = entry ? readString(entry.uri) : undefined
-    if (!entry || !uri) return []
+  return links.flatMap((raw) => {
+    const link = isRecord(raw) ? raw : null
+    const uri = link ? readString(link.to_uri) : undefined
+    const linkType = link ? readString(link.link_type) : undefined
 
-    return [{ uri, reason: readString(entry.reason) } satisfies RelationLink]
+    if (
+      !link ||
+      !uri ||
+      linkType !== 'derived_from' ||
+      !uri.includes('/memories/trajectories/') ||
+      seen.has(uri)
+    ) {
+      return []
+    }
+
+    seen.add(uri)
+    const reason = readString(link.description) ?? readString(link.match_text)
+    return [{ uri, reason } satisfies SourceTrajectoryLink]
   })
 }
 

@@ -5,34 +5,33 @@ import { useTranslation } from 'react-i18next'
 import { Button } from '#/components/ui/button'
 import { useAppConnection } from '#/hooks/use-app-connection'
 
-import { fetchRelations } from '../-lib/api'
+import { fetchSourceTrajectories } from '../-lib/api'
 
 /**
- * Source lineage: outgoing relations of the experience, i.e. the
- * trajectories that generated or evolved it (`GET /api/v1/relations`).
+ * Source lineage: `derived_from` links stored in the Experience memory attrs.
  */
 export function SourceTracePanel({ experienceUri }: { experienceUri: string }) {
   const { t } = useTranslation('agentExperiencePage')
   const { identityScopeKey } = useAppConnection()
-  const relationsQuery = useQuery({
-    queryFn: ({ signal }) => fetchRelations(experienceUri, signal),
-    queryKey: ['agent-experience-relations', identityScopeKey, experienceUri],
+  const sourceQuery = useQuery({
+    queryFn: ({ signal }) => fetchSourceTrajectories(experienceUri, signal),
+    queryKey: ['agent-experience-sources', identityScopeKey, experienceUri],
     staleTime: 60_000,
   })
 
-  const links = relationsQuery.data ?? []
+  const links = sourceQuery.data ?? []
 
   return (
     <section className="grid gap-3">
       <p className="text-sm text-muted-foreground">
         {t('detail.sourceDescription')}
       </p>
-      {relationsQuery.isLoading ? (
+      {sourceQuery.isLoading ? (
         <div className="flex min-h-24 items-center gap-2 text-sm text-muted-foreground">
           <LoaderCircleIcon className="size-4 animate-spin" />
           {t('detail.sourceLoading')}
         </div>
-      ) : relationsQuery.isError ? (
+      ) : sourceQuery.isError ? (
         <div className="grid min-h-24 place-items-center gap-2 text-center">
           <p className="text-sm text-muted-foreground">
             {t('detail.sourceLoadFailed')}
@@ -41,7 +40,7 @@ export function SourceTracePanel({ experienceUri }: { experienceUri: string }) {
             type="button"
             size="xs"
             variant="outline"
-            onClick={() => void relationsQuery.refetch()}
+            onClick={() => void sourceQuery.refetch()}
           >
             {t('refresh')}
           </Button>

@@ -4,10 +4,10 @@ import {
   DEFAULT_TRAJECTORY_PAGE_SIZE,
   normalizeExperienceFiles,
   normalizeOutcomeDistribution,
-  normalizeRelations,
+  normalizeSourceTrajectoryLinks,
   normalizeTrajectoryPage,
 } from './experience'
-import type { RelationLink } from './experience'
+import type { SourceTrajectoryLink } from './experience'
 import type {
   AgentEvolutionStatus,
   ExperienceFileItem,
@@ -144,24 +144,21 @@ export async function fetchOutcomeDistribution(options: {
 }
 
 /**
- * Query the outgoing relations of a resource
- * (`GET /api/v1/relations?uri=...`).
- *
- * For an experience this returns the trajectories that generated or evolved
- * it (source lineage).
+ * Read the Experience memory attributes and return the trajectories from
+ * which it was derived.
  */
-export async function fetchRelations(
+export async function fetchSourceTrajectories(
   uri: string,
   signal?: AbortSignal,
-): Promise<RelationLink[]> {
+): Promise<SourceTrajectoryLink[]> {
   const result = await getOvResult<unknown>(
     ovClient.client.get({
       query: { uri },
       signal,
-      url: '/api/v1/relations',
+      url: '/api/v1/fs/attrs',
     }),
   )
-  return normalizeRelations(result)
+  return normalizeSourceTrajectoryLinks(result)
 }
 
 /**
