@@ -41,8 +41,17 @@ export function SkillCard({
   const ScopeIcon = SKILL_SCOPE_ICONS[skill.scope]
 
   return (
-    <Card size="sm" className="h-full transition-colors hover:bg-muted/35">
-      <CardHeader>
+    <Card
+      size="sm"
+      className="relative h-full transition-colors hover:bg-muted/35"
+    >
+      <button
+        type="button"
+        className="absolute inset-0 z-0 rounded-xl outline-none focus-visible:ring-3 focus-visible:ring-inset focus-visible:ring-ring/50"
+        aria-label={t('viewDetail', { name: skill.name })}
+        onClick={onOpen}
+      />
+      <CardHeader className="pointer-events-none relative z-10">
         <div className="flex items-start justify-between gap-3">
           <div className="flex min-w-0 items-center gap-2.5">
             <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
@@ -61,7 +70,7 @@ export function SkillCard({
           </CardDescription>
         ) : null}
       </CardHeader>
-      <CardContent className="mt-auto">
+      <CardContent className="pointer-events-none relative z-10 mt-auto">
         <div className="flex items-center justify-between gap-3">
           <code className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
             {skill.uri}
@@ -72,6 +81,7 @@ export function SkillCard({
                 type="button"
                 variant="outline"
                 size="xs"
+                className="pointer-events-auto"
                 disabled={isSharing}
                 aria-label={t('shareSkill', { name: skill.name })}
                 onClick={onShare}
@@ -84,16 +94,10 @@ export function SkillCard({
                 {isSharing ? t('sharing') : t('share')}
               </Button>
             ) : null}
-            <Button
-              type="button"
-              variant="ghost"
-              size="xs"
-              aria-label={t('viewDetail', { name: skill.name })}
-              onClick={onOpen}
-            >
+            <span className="flex h-6 items-center gap-1 px-2 text-xs font-medium text-primary">
               {t('detail')}
               <ChevronRightIcon />
-            </Button>
+            </span>
           </div>
         </div>
       </CardContent>

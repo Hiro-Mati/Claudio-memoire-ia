@@ -224,6 +224,7 @@ const workspace = {
     share: 'Share',
     sharing: 'Sharing...',
     shareSkill: 'Set {{name}} as a shared skill',
+    shareFailed: 'Could not share skill',
     shareSuccess: '{{name}} is now a shared skill',
     openPlayground: 'Open in Playground',
     viewDetail: 'View {{name}} details',

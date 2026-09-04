@@ -230,7 +230,10 @@ function SkillsRoute() {
       setActiveScope('agent')
       toast.success(t('shareSuccess', { name: skill.name }))
     },
-    onError: (error) => toast.error(getErrorMessage(error)),
+    onError: (error) =>
+      toast.error(t('shareFailed'), {
+        description: getErrorMessage(error),
+      }),
   })
 
   return (

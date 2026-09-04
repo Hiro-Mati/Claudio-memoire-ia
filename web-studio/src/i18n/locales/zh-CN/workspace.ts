@@ -219,6 +219,7 @@ const workspace = {
     share: '共享',
     sharing: '共享中...',
     shareSkill: '将 {{name}} 设为共享技能',
+    shareFailed: '共享技能失败',
     shareSuccess: '已将 {{name}} 设为共享技能',
     openPlayground: '在工作台中打开',
     viewDetail: '查看 {{name}} 详情',

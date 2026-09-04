@@ -31,14 +31,36 @@ describe('SkillCard', () => {
     uri: 'viking://user/default/skills/private-reviewer',
   }
 
+  it('opens the skill detail from the full-card action', () => {
+    const onOpen = vi.fn()
+
+    render(
+      <SkillCard
+        isSharing={false}
+        skill={userSkill}
+        onOpen={onOpen}
+        onShare={vi.fn()}
+      />,
+    )
+
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: '查看 private-reviewer 详情',
+      }),
+    )
+
+    expect(onOpen).toHaveBeenCalledOnce()
+  })
+
   it('offers the share action for a user skill', () => {
+    const onOpen = vi.fn()
     const onShare = vi.fn()
 
     render(
       <SkillCard
         isSharing={false}
         skill={userSkill}
-        onOpen={vi.fn()}
+        onOpen={onOpen}
         onShare={onShare}
       />,
     )
@@ -50,6 +72,7 @@ describe('SkillCard', () => {
     )
 
     expect(onShare).toHaveBeenCalledOnce()
+    expect(onOpen).not.toHaveBeenCalled()
   })
 
   it('does not offer the share action for a shared skill', () => {
