@@ -49,7 +49,6 @@ class CompileLimits(BaseModel):
     concurrent_tasks: int = 10
     accepted_tasks: int = 40
     accepted_tasks_per_principal: int = 10
-    task_runtime_seconds: float = 60 * 60
     salvage_grace_seconds: float = 120
     cleanup_grace_seconds: float = 40
     terminal_task_retention_seconds: float = 24 * 60 * 60

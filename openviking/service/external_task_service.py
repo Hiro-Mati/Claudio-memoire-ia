@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping, Protocol
 from uuid import uuid4
@@ -48,6 +49,7 @@ class ExternalTaskProvider(Protocol):
     task_type: str
     task_id_prefix: str
     poll_max_attempts: int | None
+    runtime_timeout_seconds: float
 
     @property
     def poll_interval_seconds(self) -> float: ...
@@ -182,6 +184,16 @@ class ExternalTaskService:
         connection = self._mapping(auth.get("openviking_connection"))
         private_payload = self._mapping(auth.get("external_request_private"))
         external_task_id = str(auth.get("external_task_id") or "").strip() or None
+        runtime_started_at = auth.get("external_runtime_started_at")
+        if runtime_started_at is None:
+            runtime_started_at = time.time()
+            await tracker.update_task_auth(
+                task_id,
+                {"external_runtime_started_at": runtime_started_at},
+                account_id=account_id,
+                user_id=user_id,
+            )
+        runtime_deadline = float(runtime_started_at) + provider.runtime_timeout_seconds
         try:
             await tracker.start(
                 task_id,
@@ -203,13 +215,35 @@ class ExternalTaskService:
                     user_id=user_id,
                 )
             while True:
-                snapshot = await self._retry(
-                    lambda: provider.get(external_task_id, connection),
-                    task_id=task_id,
-                    operation_name="poll",
-                    poll_interval=provider.poll_interval_seconds,
-                    max_attempts=provider.poll_max_attempts,
-                )
+                remaining = runtime_deadline - time.time()
+                try:
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
+                    snapshot = await asyncio.wait_for(
+                        self._retry(
+                            lambda: provider.get(external_task_id, connection),
+                            task_id=task_id,
+                            operation_name="poll",
+                            poll_interval=provider.poll_interval_seconds,
+                            max_attempts=provider.poll_max_attempts,
+                        ),
+                        timeout=remaining,
+                    )
+                except asyncio.TimeoutError:
+                    await run_to_completion(
+                        lambda: self._cancel_external(
+                            provider,
+                            ov_task_id=task_id,
+                            payload=payload,
+                            private_payload=private_payload,
+                            connection=connection,
+                            external_task_id=external_task_id,
+                            account_id=account_id,
+                            user_id=user_id,
+                            timed_out=True,
+                        )
+                    )
+                    return
                 if await self._apply_snapshot(
                     snapshot,
                     task_id=task_id,
@@ -217,7 +251,9 @@ class ExternalTaskService:
                     user_id=user_id,
                 ):
                     return
-                await asyncio.sleep(provider.poll_interval_seconds)
+                await asyncio.sleep(
+                    min(provider.poll_interval_seconds, max(0.0, runtime_deadline - time.time()))
+                )
         except ExternalTaskError as exc:
             await tracker.fail(
                 task_id,
@@ -340,6 +376,7 @@ class ExternalTaskService:
         external_task_id: str | None,
         account_id: str,
         user_id: str,
+        timed_out: bool = False,
     ) -> None:
         if external_task_id is None:
             external_task_id = await self._retry(
@@ -360,21 +397,25 @@ class ExternalTaskService:
             operation_name="cancel",
             poll_interval=provider.poll_interval_seconds,
         )
-        if await self._apply_snapshot(
-            snapshot,
-            task_id=ov_task_id,
-            account_id=account_id,
-            user_id=user_id,
-        ):
-            return
-        while snapshot.status not in _TERMINAL_STATUSES:
-            await asyncio.sleep(provider.poll_interval_seconds)
-            snapshot = await self._retry(
-                lambda: provider.get(external_task_id, connection),
-                task_id=ov_task_id,
-                operation_name="poll cancellation",
-                poll_interval=provider.poll_interval_seconds,
-            )
+        while True:
+            if timed_out and snapshot.status in _TERMINAL_STATUSES:
+                tracker = get_task_tracker()
+                await tracker.update_stage(
+                    ov_task_id,
+                    "timed_out",
+                    account_id=account_id,
+                    user_id=user_id,
+                )
+                await tracker.fail(
+                    ov_task_id,
+                    self._format_error(
+                        "DEADLINE_EXCEEDED",
+                        "External task exceeded its runtime limit.",
+                    ),
+                    account_id=account_id,
+                    user_id=user_id,
+                )
+                return
             if await self._apply_snapshot(
                 snapshot,
                 task_id=ov_task_id,
@@ -382,6 +423,13 @@ class ExternalTaskService:
                 user_id=user_id,
             ):
                 return
+            await asyncio.sleep(provider.poll_interval_seconds)
+            snapshot = await self._retry(
+                lambda: provider.get(external_task_id, connection),
+                task_id=ov_task_id,
+                operation_name="poll cancellation",
+                poll_interval=provider.poll_interval_seconds,
+            )
 
     @staticmethod
     async def _retry(

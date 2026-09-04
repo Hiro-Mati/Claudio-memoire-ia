@@ -12,6 +12,7 @@ from fastapi import FastAPI
 import openviking.server.routers.bot as bot_router_module
 import openviking.server.routers.compile as compile_router_module
 import openviking.service.compile_service as compile_service_module
+import openviking.service.external_task_service as external_task_service_module
 from openviking.server.auth.plugins import DevAuthPlugin, TrustedAuthPlugin
 from openviking.server.config import ServerConfig
 from openviking.server.identity import AuthMode
@@ -293,7 +294,7 @@ async def test_compile_route_uses_ov_owned_task_and_rejects_legacy_routes(monkey
 
 
 @pytest.mark.asyncio
-async def test_compile_api_client_uses_session_protocol_and_api_key_auth(monkeypatch):
+async def test_compile_api_client_session_protocol_and_runtime_timeout(monkeypatch):
     forwarded = []
 
     class FakeResponse:
@@ -339,13 +340,16 @@ async def test_compile_api_client_uses_session_protocol_and_api_key_auth(monkeyp
             )
 
     monkeypatch.setattr(compile_service_module.httpx, "AsyncClient", FakeClient)
+    tasks = ExternalTaskService()
     service = CompileService(
         CompileApiConfig(
             base_url="https://compile.example.com",
         ),
-        ExternalTaskService(),
+        tasks,
         SimpleNamespace(),
     )
+    tasks.register(service)
+    assert service.runtime_timeout_seconds == 60 * 60
     public_payload, private_payload = service._split_payload(
         compile_service_module.CompileRequest.model_validate(
             {
@@ -399,6 +403,68 @@ async def test_compile_api_client_uses_session_protocol_and_api_key_auth(monkeyp
     assert forwarded[1]["body"] == {"session_id": "ma-session-1"}
     assert status_snapshot.meta == {"token_usage": {"total_tokens": 12}}
     assert cancel_snapshot.status == "cancelled"
+
+    class Tracker:
+        def __init__(self):
+            self.task = TaskRecord(
+                task_id="cmp_ov_1",
+                task_type="compile",
+                status=TaskStatus.RUNNING,
+                stage="polling",
+                account_id="acct",
+                user_id="alice",
+                meta={
+                    "request": {
+                        "from": ["viking://resources/source"],
+                        "to": "viking://resources/wiki",
+                        "skill": "viking://agent/skills/wiki",
+                    }
+                },
+            )
+            self.auth = {
+                "openviking_connection": {"api_key": "active-user-key"},
+                "external_request_private": {},
+                "external_task_id": "ma-session-1",
+                "external_runtime_started_at": (
+                    external_task_service_module.time.time()
+                    - service.runtime_timeout_seconds
+                    - 1
+                ),
+            }
+            self.stage = None
+            self.error = None
+
+        async def get(self, *args, **kwargs):
+            return self.task
+
+        async def get_task_auth(self, *args, **kwargs):
+            return self.auth
+
+        async def start(self, *args, **kwargs):
+            return None
+
+        async def update_stage(self, _task_id, stage, **kwargs):
+            self.stage = stage
+
+        async def fail(self, _task_id, error, **kwargs):
+            self.error = error
+            self.task.status = TaskStatus.FAILED
+
+        def is_cancellation_requested(self, _task_id):
+            return False
+
+    tracker = Tracker()
+    monkeypatch.setattr(external_task_service_module, "get_task_tracker", lambda: tracker)
+    forwarded.clear()
+
+    await tasks.execute("cmp_ov_1", "acct", "alice")
+
+    assert [request["url"] for request in forwarded] == [
+        "https://compile.example.com/compile/cancel"
+    ]
+    assert tracker.stage == "timed_out"
+    assert tracker.task.status == TaskStatus.FAILED
+    assert tracker.error == "DEADLINE_EXCEEDED: External task exceeded its runtime limit."
 
 
 @pytest.mark.asyncio
