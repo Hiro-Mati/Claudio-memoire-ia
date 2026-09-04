@@ -60,6 +60,12 @@ _SAFE_STRING_METHODS = {
     "strip",
     "upper",
 }
+# Upper bound on the size of a value produced by a DSL expression. Multiplying or
+# joining a small literal by a huge count would otherwise allocate a massive
+# string/list in the server process before schema validation runs; the check is
+# applied to the would-be result size before any allocation.
+_MAX_EXPRESSION_SIZE = 1_000_000
+_REPEATABLE_SEQUENCES = (str, bytes, list, tuple)
 _CONTRACT_PREAMBLE = (
     "## Output Format: restricted Python memory SDK",
     "Return only Python code, optionally wrapped in one ```python code fence.",
@@ -161,7 +167,6 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         self._last_error_allows_tool_retry = False
 
     def render_contract(self, context: ExtractionOutputContext) -> str:
-        self._validate_schema_identifiers(context.schemas)
         lines = list(_CONTRACT_PREAMBLE)
         for schema in context.schemas:
             lines.extend(self._render_schema_contract(context, schema))
@@ -175,12 +180,18 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         self, context: ExtractionOutputContext, schema: MemoryTypeSchema
     ) -> list[str]:
         fields = _protocol_fields(context, schema)
-        signature = ", ".join(f"{name}: {type_name}" for name, type_name, _description in fields)
+        type_alias = _identifier_alias(schema.memory_type)
+        signature = ", ".join(
+            f"{_identifier_alias(name)}: {type_name}" for name, type_name, _description in fields
+        )
         verb = "create" if schema.filename_has_variables() else "set"
         identity_fields = _model_visible_identity_fields(context, schema)
-        identity_label = ", ".join(identity_fields) or "target scope (fixed to self)"
+        identity_label = (
+            ", ".join(_identifier_alias(name) for name in identity_fields)
+            or "target scope (fixed to self)"
+        )
         lines = [
-            f"- sdk.{verb}_{schema.memory_type}(*, {signature})",
+            f"- sdk.{verb}_{type_alias}(*, {signature})",
             f"  - Identity fields (primary key): {identity_label}. Calls with identical "
             "identity field values address the same memory object.",
         ]
@@ -204,7 +215,7 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         for name, _type_name, description in fields:
             normalized_description = " ".join(str(description or "").split())
             qualifier = f" [{merge_ops[name]}]" if name in merge_ops else ""
-            lines.append(f"  - {name}{qualifier}: {normalized_description}")
+            lines.append(f"  - {_identifier_alias(name)}{qualifier}: {normalized_description}")
         return lines
 
     @staticmethod
@@ -213,9 +224,10 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         schema: MemoryTypeSchema,
         identity_fields: tuple[str, ...],
     ) -> list[str]:
+        type_alias = _identifier_alias(schema.memory_type)
         lines = [
-            f"  - {schema.memory_type} is a SINGLETON per identity: sdk.create_{schema.memory_type}() "
-            f"does not exist, and sdk.set_{schema.memory_type}() must appear AT MOST ONCE for each "
+            f"  - {type_alias} is a SINGLETON per identity: sdk.create_{type_alias}() "
+            f"does not exist, and sdk.set_{type_alias}() must appear AT MOST ONCE for each "
             "identity in the whole program. Never call it twice for the same identity (e.g. the same "
             "peer_id). If several people or sections belong to one identity, put them all as separate "
             "H1 sections inside a SINGLE content argument of one call — different headings or person "
@@ -225,13 +237,13 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         if "peer_id" in identity_fields and context.role_scope is not None:
             if context.role_scope.user_ids:
                 lines.append(
-                    f"  - Current self identity: exactly one sdk.set_{schema.memory_type}() call "
+                    f"  - Current self identity: exactly one sdk.set_{type_alias}() call "
                     "without peer_id; combine all content sections into its single content argument."
                 )
             for peer_id in context.role_scope.peer_ids:
                 lines.append(
                     f"  - Current identity peer_id={peer_id!r}: exactly one "
-                    f"sdk.set_{schema.memory_type}(peer_id={peer_id!r}, ...) call; combine every "
+                    f"sdk.set_{type_alias}(peer_id={peer_id!r}, ...) call; combine every "
                     "person and section for this peer_id into that one content argument."
                 )
         return lines
@@ -495,7 +507,9 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         if name is None:
             count = self._type_counts.get(memory_type, 0) + 1
             self._type_counts[memory_type] = count
-            name = f"{memory_type}_{count}"
+            # Binding variable names must be valid Python identifiers, so alias
+            # the memory_type on the DSL surface (real name is kept everywhere else).
+            name = f"{_identifier_alias(memory_type)}_{count}"
             self._uri_to_name[uri] = name
         fields = _visible_memory_fields(memory_file, schema, context)
         maintenance_notice = None
@@ -506,7 +520,7 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         if isinstance(content, str) and every_line_has_line_numbers(content):
             fields["content"] = strip_line_numbers(content)
         args = [f"memory_type={memory_type!r}"]
-        args.extend(f"{key}={value!r}" for key, value in fields.items())
+        args.extend(f"{_identifier_alias(key)}={value!r}" for key, value in fields.items())
         binding = (
             f"# Existing memory loaded by {source}; this binding is system-provided.\n"
             f"{name} = sdk.existing({', '.join(args)})"
@@ -546,13 +560,6 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
 
     def binding_name(self, uri: str) -> str | None:
         return self._uri_to_name.get(uri)
-
-    @staticmethod
-    def _validate_schema_identifiers(schemas: tuple[MemoryTypeSchema, ...]) -> None:
-        for schema in schemas:
-            _require_identifier(schema.memory_type, "memory_type")
-            for memory_field in schema.fields:
-                _require_identifier(memory_field.name, f"field in {schema.memory_type}")
 
 
 def _parse_tool_result_message(
@@ -596,6 +603,18 @@ class _PythonProgramCompiler:
         self.context = context
         self.protocol = protocol
         self.schemas = {schema.memory_type: schema for schema in context.schemas}
+        # DSL surface uses identifier aliases; map them back to real schema names.
+        self._type_alias_to_real = {
+            _identifier_alias(schema.memory_type): schema.memory_type
+            for schema in context.schemas
+        }
+        self._field_alias_to_real = {
+            schema.memory_type: {
+                _identifier_alias(name): name
+                for name, _type, _description in _protocol_fields(context, schema)
+            }
+            for schema in context.schemas
+        }
         self.objects: dict[str, _MemoryObject] = {}
         self.values: dict[str, Any] = {}
         self.links: list[dict[str, Any]] = []
@@ -723,8 +742,14 @@ class _PythonProgramCompiler:
             owner = self._eval(node.value)
             if not isinstance(owner, _MemoryObject):
                 self._error(node, "attribute reads are only allowed on memory objects")
-            if node.attr.startswith("_") or node.attr not in owner.fields:
-                available = ", ".join(sorted(owner.fields)) or "(none)"
+            # Field names use identifier aliases on the DSL surface; map back to
+            # the real schema field name before resolving the write handle.
+            alias_map = self._field_alias_to_real.get(owner.memory_type, {})
+            real_field = alias_map.get(node.attr, node.attr)
+            if node.attr.startswith("_") or real_field not in owner.fields:
+                available = ", ".join(
+                    sorted(_identifier_alias(name) for name in owner.fields)
+                ) or "(none)"
                 hint = (
                     " Use the real field name (e.g. content), not the literal word 'field'."
                     if node.attr == "field"
@@ -737,7 +762,7 @@ class _PythonProgramCompiler:
                 )
             # obj.<field> is a write handle, not the raw value: it exposes
             # .update()/.edit()/.drop() and cannot be read as a string.
-            return _FieldHandle(owner=owner, field_name=node.attr)
+            return _FieldHandle(owner=owner, field_name=real_field)
         if isinstance(node, ast.Subscript):
             return self._eval(node.value)[self._eval_slice(node.slice)]
         if isinstance(node, ast.JoinedStr):
@@ -801,32 +826,47 @@ class _PythonProgramCompiler:
         if isinstance(owner, _FieldHandle):
             return self._call_field(owner, node.func.attr, node)
         if isinstance(owner, str) and node.func.attr in _SAFE_STRING_METHODS:
-            return getattr(owner, node.func.attr)(
-                *(self._eval(arg) for arg in node.args),
-                **{item.arg: self._eval(item.value) for item in node.keywords},
-            )
+            args = [self._eval(arg) for arg in node.args]
+            kwargs = {item.arg: self._eval(item.value) for item in node.keywords}
+            if node.func.attr == "join" and args and isinstance(args[0], (list, tuple)):
+                pieces = [str(piece) for piece in args[0]]
+                projected = sum(len(piece.encode("utf-8")) for piece in pieces) + (
+                    len(owner.encode("utf-8")) * max(len(pieces) - 1, 0)
+                )
+                if projected > _MAX_EXPRESSION_SIZE:
+                    self._error(
+                        node,
+                        f"joined string would exceed the {_MAX_EXPRESSION_SIZE:,}-character size limit",
+                    )
+            return getattr(owner, node.func.attr)(*args, **kwargs)
         self._error(node, f"method {node.func.attr!r} is not allowed")
 
     def _call_sdk(self, node: ast.Call, *, statement: bool) -> Any:
         method = node.func.attr
         if method.startswith(("create_", "set_")):
-            verb, memory_type = method.split("_", 1)
+            verb, type_alias = method.split("_", 1)
             if node.args:
                 self._error(node, f"{verb} methods accept keyword arguments only")
+            memory_type = self._type_alias_to_real.get(type_alias, type_alias)
             schema = self.schemas.get(memory_type)
             if schema is None:
-                self._error(node, f"memory type {memory_type!r} is not available")
+                self._error(node, f"memory type {type_alias!r} is not available")
             expected_verb = "create" if schema.filename_has_variables() else "set"
             if verb != expected_verb:
                 self._error(
                     node,
-                    f"sdk.{method}() is unavailable for {memory_type!r}; "
-                    f"use sdk.{expected_verb}_{memory_type}()",
+                    f"sdk.{method}() is unavailable for {type_alias!r}; "
+                    f"use sdk.{expected_verb}_{type_alias}()",
                 )
             allowed_fields = {
                 name for name, _type, _description in _protocol_fields(self.context, schema)
             }
-            kwargs = self._eval_keywords(node, allowed=allowed_fields, ignore_unknown=True)
+            kwargs = self._eval_keywords(
+                node,
+                allowed=allowed_fields,
+                ignore_unknown=True,
+                alias_map=self._field_alias_to_real.get(memory_type),
+            )
             if _contains_memory_object(kwargs):
                 self._error(node, "memory objects cannot be used as business field values")
             if any(isinstance(value, _FieldHandle) for value in kwargs.values()):
@@ -852,8 +892,8 @@ class _PythonProgramCompiler:
                     target = f"peer {peer_id!r}" if peer_id is not None else "self"
                     self._error(
                         node,
-                        f"duplicate {memory_type} identity ({identity_text}); "
-                        f"sdk.set_{memory_type}() may be called only once for {target}; "
+                        f"duplicate {type_alias} identity ({identity_text}); "
+                        f"sdk.set_{type_alias}() may be called only once for {target}; "
                         "combine all people and content sections for that target into "
                         "one content argument",
                     )
@@ -898,7 +938,12 @@ class _PythonProgramCompiler:
             allowed_fields = {
                 name for name, _type, _description in _protocol_fields(self.context, schema)
             }
-            kwargs = self._eval_keywords(node, allowed=allowed_fields, ignore_unknown=True)
+            kwargs = self._eval_keywords(
+                node,
+                allowed=allowed_fields,
+                ignore_unknown=True,
+                alias_map=self._field_alias_to_real.get(owner.memory_type),
+            )
             if _contains_memory_object(kwargs):
                 self._error(node, "memory objects cannot be used as business field values")
             if any(isinstance(value, _FieldHandle) for value in kwargs.values()):
@@ -1049,10 +1094,15 @@ class _PythonProgramCompiler:
         *,
         allowed: set[str] | None = None,
         ignore_unknown: bool = False,
+        alias_map: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         values: dict[str, Any] = {}
         for item in node.keywords:
             name = item.arg
+            if alias_map is not None:
+                # Field names use identifier aliases on the DSL surface; map back
+                # to the real schema field name before validating/storing.
+                name = alias_map.get(name, name)
             if name in values:
                 self._error(node, f"keyword argument {name!r} was provided more than once")
             if allowed is not None and name not in allowed and ignore_unknown:
@@ -1179,11 +1229,12 @@ class _PythonProgramCompiler:
         return format(value, format_spec)
 
     def _eval_binop(self, node: ast.BinOp) -> Any:
+        if isinstance(node.op, ast.Mult):
+            return self._eval_mult(node)
         left, right = self._eval(node.left), self._eval(node.right)
         operations = {
-            ast.Add: lambda: left + right,
+            ast.Add: lambda: self._checked_concat(node, left, right),
             ast.Sub: lambda: left - right,
-            ast.Mult: lambda: left * right,
             ast.Div: lambda: left / right,
             ast.FloorDiv: lambda: left // right,
             ast.Mod: lambda: left % right,
@@ -1192,6 +1243,76 @@ class _PythonProgramCompiler:
         if operation is None:
             self._error(node, "unsupported binary operator")
         return operation()
+
+    def _sequence_repeat_size(self, sequence: Any, count: Any, node: ast.AST) -> int:
+        if not isinstance(count, int) or isinstance(count, bool):
+            self._error(node, "a repeated literal must be multiplied by an integer count")
+        if count < 0:
+            self._error(node, "a repeated literal count cannot be negative")
+        if isinstance(sequence, str):
+            unit = len(sequence.encode("utf-8"))
+        elif isinstance(sequence, (bytes, bytearray)):
+            unit = len(sequence)
+        else:
+            unit = len(sequence)
+        return unit * count
+
+    def _checked_repeat(self, node: ast.AST, sequence: Any, count: Any) -> Any:
+        if not isinstance(sequence, _REPEATABLE_SEQUENCES):
+            self._error(node, "multiplication is only supported for repeating a literal")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            self._error(node, "a repeated literal must be multiplied by a non-negative integer")
+        if self._sequence_repeat_size(sequence, count, node) > _MAX_EXPRESSION_SIZE:
+            self._error(
+                node,
+                f"repeated literal would exceed the {_MAX_EXPRESSION_SIZE:,}-character size limit",
+            )
+        return sequence * count
+
+    def _eval_mult(self, node: ast.BinOp) -> Any:
+        left_node, right_node = node.left, node.right
+        # Repeat a literal sequence by an integer count. Both a bare literal
+        # and a literal nested inside another repeatable expression
+        # (e.g. ["..."] * n inside "".join(...)) are accepted; evaluate only
+        # after the would-be result size is bounded, before any allocation.
+        left_seq, left_count = self._repeat_operands(left_node, right_node)
+        right_seq, right_count = self._repeat_operands(right_node, left_node)
+        if left_seq is not None:
+            return self._checked_repeat(node, left_seq, left_count)
+        if right_seq is not None:
+            return self._checked_repeat(node, right_seq, right_count)
+        self._error(
+            node,
+            "multiplication is only supported to repeat a string/list literal "
+            "by a non-negative integer count",
+        )
+
+    def _repeat_operands(self, seq_node: ast.AST, count_node: ast.AST) -> tuple[Any, Any]:
+        if isinstance(seq_node, ast.Constant) and isinstance(seq_node.value, _REPEATABLE_SEQUENCES):
+            return seq_node.value, self._eval(count_node)
+        # A 1-element list literal (ast.List with one Constant element) is a
+        # common way to build a repeatable argument for str.join.
+        if (
+            isinstance(seq_node, ast.List)
+            and len(seq_node.elts) == 1
+            and isinstance(seq_node.elts[0], ast.Constant)
+        ):
+            return [seq_node.elts[0].value], self._eval(count_node)
+        return None, None
+
+    def _checked_concat(self, node: ast.AST, left: Any, right: Any) -> Any:
+        if isinstance(left, str) and isinstance(right, str):
+            if len(left.encode("utf-8")) + len(right.encode("utf-8")) > _MAX_EXPRESSION_SIZE:
+                self._error(
+                    node,
+                    f"concatenated string exceeds the {_MAX_EXPRESSION_SIZE:,}-character size limit",
+                )
+        elif isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+            if len(left) + len(right) > _MAX_EXPRESSION_SIZE:
+                self._error(
+                    node, f"concatenated list exceeds the {_MAX_EXPRESSION_SIZE:,}-item size limit"
+                )
+        return left + right
 
     def _eval_compare(self, node: ast.Compare) -> bool:
         left = self._eval(node.left)
@@ -1353,7 +1474,8 @@ def _protocol_fields(
     for name, model_field in dynamic_fields.items():
         if name == "page_id" or name in static_names:
             continue
-        _require_identifier(name, f"field in {schema.memory_type}")
+        # Non-identifier field names are aliased on the DSL surface (see
+        # _identifier_alias), so they need not be valid Python identifiers here.
         extras.append(
             (name, _annotation_type_name(model_field.annotation), model_field.description or "")
         )
@@ -1417,3 +1539,20 @@ def _require_identifier(value: str, label: str) -> None:
         raise ValueError(
             f"Python memory output requires {label} {value!r} to be a valid identifier"
         )
+
+
+def _identifier_alias(name: str) -> str:
+    """Map a schema name to a Python-identifier alias used only on the DSL surface.
+
+    memory_type and field names keep their real value everywhere (URI, storage,
+    JSON protocol); only the Python method/parameter names need to be valid
+    identifiers, so non-identifier characters are folded to underscores.
+    """
+    alias = re.sub(r"\W", "_", name)
+    if alias and alias[0].isdigit():
+        alias = f"_{alias}"
+    if not alias:
+        alias = "_"
+    if keyword.iskeyword(alias):
+        alias = f"{alias}_"
+    return alias

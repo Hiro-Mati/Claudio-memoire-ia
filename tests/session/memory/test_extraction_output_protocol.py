@@ -484,6 +484,95 @@ def test_resolution_repair_matches_protocol_output_shape():
     assert "JSON object" not in python_repair
 
 
+def _kebab_schema() -> MemoryTypeSchema:
+    return MemoryTypeSchema(
+        memory_type="project-notes",
+        description="Project notes",
+        directory="viking://user/{{ user_space }}/memories/project-notes",
+        filename_template="{{ project_name }}.md",
+        fields=[
+            MemoryField(
+                name="project_name",
+                field_type=FieldType.STRING,
+                merge_op=MergeOp.IMMUTABLE,
+            ),
+            MemoryField(
+                name="note-body",
+                field_type=FieldType.STRING,
+                merge_op=MergeOp.PATCH,
+            ),
+        ],
+    )
+
+
+def test_python_contract_aliases_non_identifier_schema_names():
+    context = _context([_kebab_schema()])
+    protocol = create_extraction_output_protocol("python")
+
+    contract = protocol.render_contract(context)
+
+    # Method/parameter names are folded to valid identifiers on the DSL surface.
+    assert "sdk.create_project_notes(" in contract
+    assert "note_body" in contract
+    assert "sdk.create_project-notes" not in contract
+
+
+def test_python_compiles_aliased_names_back_to_real_schema():
+    context = _context([_kebab_schema()])
+    protocol = create_extraction_output_protocol("python")
+
+    operations, error = protocol.parse(
+        """
+sdk.create_project_notes(
+    project_name="atlas",
+    note_body=\"\"\"Kickoff on 2023-06-09.\"\"\",
+)
+sdk.commit()
+""",
+        context,
+    )
+
+    assert error is None, error
+    dumped = operations.model_dump()
+    # Real schema name and real field name are preserved in the operations.
+    assert dumped["project-notes"] == [
+        {"page_id": 100, "project_name": "atlas", "note-body": "Kickoff on 2023-06-09."}
+    ]
+
+
+def test_python_edits_aliased_field_on_existing_object():
+    existing = MemoryFile(
+        uri="viking://user/alice/memories/project-notes/atlas.md",
+        memory_type="project-notes",
+        content="",
+        extra_fields={
+            "project_name": "atlas",
+            "note-body": "Kickoff on 2023-06-09.",
+            "version": 3,
+            "_uri": "x",
+        },
+    )
+    context = _context([_kebab_schema()], files=[existing])
+    protocol = create_extraction_output_protocol("python")
+
+    bindings = _bind(protocol, context)
+    # Existing-object binding exposes the field under its identifier alias.
+    assert "note_body=" in bindings
+
+    var = bindings.split(" = ", 1)[0].strip().splitlines()[-1]
+    operations, error = protocol.parse(
+        f"""
+{var}.note_body.edit(search=\"\"\"Kickoff on 2023-06-09.\"\"\", replace=\"\"\"Kickoff moved to 2023-07-01.\"\"\")
+sdk.commit()
+""",
+        context,
+    )
+
+    assert error is None, error
+    edited = operations.model_dump()["project-notes"]
+    assert edited and edited[0]["page_id"] == 1
+
+
 def test_python_syntax_error_includes_offending_source_line():
     context = _context([_preference_schema()])
     protocol = create_extraction_output_protocol("python")
@@ -1137,14 +1226,15 @@ def test_python_rejects_add_only_delete_when_another_schema_enables_deletes():
     assert "delete() is unavailable" in error
 
 
-def test_python_requires_identifier_safe_schema_names():
+def test_python_aliases_non_identifier_memory_type_instead_of_raising():
     schema = _preference_schema()
     schema.memory_type = "user-preferences"
     context = _context([schema])
     protocol = create_extraction_output_protocol("python")
 
-    with pytest.raises(ValueError, match="valid identifier"):
-        protocol.render_contract(context)
+    contract = protocol.render_contract(context)
+    assert "sdk.set_user_preferences(" in contract or "sdk.create_user_preferences(" in contract
+    assert "user-preferences" not in contract.split("Memory type rules")[0]
 
 
 def test_python_accepts_one_fence_with_surrounding_text():
@@ -1334,3 +1424,84 @@ def test_python_accepts_update_only_program_with_markdown_content():
 
     assert error is None
     assert "# Editor" in operations.model_dump()["preferences"][0]["content"]
+
+
+def test_python_rejects_huge_string_multiplication_before_allocation():
+    context = _context([_profile_schema()])
+    protocol = create_extraction_output_protocol("python")
+
+    operations, error = protocol.parse(
+        'sdk.set_profile(content="x" * 1_000_000_000)\nsdk.commit()',
+        context,
+    )
+
+    assert operations is None
+    assert "size limit" in error
+
+
+def test_python_rejects_huge_string_multiplication_reversed_operands():
+    context = _context([_profile_schema()])
+    protocol = create_extraction_output_protocol("python")
+
+    operations, error = protocol.parse(
+        'sdk.set_profile(content=1_000_000_000 * "x")\nsdk.commit()',
+        context,
+    )
+
+    assert operations is None
+    assert "size limit" in error
+
+
+def test_python_allows_small_string_repetition():
+    context = _context([_profile_schema()])
+    protocol = create_extraction_output_protocol("python")
+
+    operations, error = protocol.parse(
+        "sdk.set_profile(content='ab' * 3)\nsdk.commit()",
+        context,
+    )
+
+    assert error is None
+    assert operations.model_dump()["profile"][0]["content"] == "ababab"
+
+
+def test_python_rejects_multiplication_between_two_non_literals():
+    context = _context([_preference_schema()])
+    protocol = create_extraction_output_protocol("python")
+
+    # Multiplying a non-literal local value by a non-literal local value has
+    # no bounded literal to repeat and must not be evaluated.
+    operations, error = protocol.parse(
+        "a = 'ab'\nn = 3\nsdk.create_preferences(topic='x', score=1, content=a * n)\nsdk.commit()",
+        context,
+    )
+
+    assert operations is None
+    assert "multiplication is only supported" in error
+
+
+def test_python_rejects_numeric_multiplication():
+    context = _context([_profile_schema()])
+    protocol = create_extraction_output_protocol("python")
+
+    # Number * number cannot repeat a literal and is useless for memory content.
+    operations, error = protocol.parse(
+        "sdk.set_profile(content=str(2 * 3))\nsdk.commit()",
+        context,
+    )
+
+    assert operations is None
+    assert "multiplication is only supported" in error
+
+
+def test_python_rejects_huge_join_before_allocation():
+    context = _context([_profile_schema()])
+    protocol = create_extraction_output_protocol("python")
+
+    operations, error = protocol.parse(
+        'sdk.set_profile(content="".join(["xxxxxxxxxx"] * 200_000))\nsdk.commit()',
+        context,
+    )
+
+    assert operations is None
+    assert "size limit" in error

@@ -1360,3 +1360,37 @@ class TestFinalOperationsHydration:
             message for message in logged_messages if message.startswith("final_operations=")
         )
         assert '"old_memory_file_content":null' not in final_log
+
+
+class TestExtractionMaxOutputTokens:
+    """The extraction floor (32768) suits Doubao; vlm.max_tokens must override it."""
+
+    def _loop(self, *, vlm_max_tokens, per_loop=None):
+        loop = ExtractLoop(
+            vlm=Mock(model="test-model"),
+            viking_fs=Mock(),
+            context_provider=Mock(),
+            isolation_handler=Mock(),
+            max_output_tokens=per_loop,
+        )
+        with patch(
+            "openviking.session.memory.extract_loop.get_openviking_config"
+        ) as mock_config:
+            mock_config.return_value = SimpleNamespace(
+                memory=SimpleNamespace(link_enabled=False, extraction_output_format="python"),
+                vlm=SimpleNamespace(max_tokens=vlm_max_tokens),
+            )
+            loop._resolve_effective_max_output_tokens()
+        return loop
+
+    def test_default_floor_used_when_unconfigured(self):
+        loop = self._loop(vlm_max_tokens=None)
+        assert loop._effective_max_output_tokens == 32768
+
+    def test_vlm_max_tokens_overrides_default_for_small_models(self):
+        loop = self._loop(vlm_max_tokens=16384)
+        assert loop._effective_max_output_tokens == 16384
+
+    def test_per_loop_value_wins_over_config(self):
+        loop = self._loop(vlm_max_tokens=16384, per_loop=8192)
+        assert loop._effective_max_output_tokens == 8192

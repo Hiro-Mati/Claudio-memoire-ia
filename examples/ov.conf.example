@@ -156,6 +156,7 @@
         "max_retries": 2,
         "provider": "volcengine",
         "thinking": false,
+        "_max_tokens_comment": "Optional output cap. Memory extraction needs ~32768 output tokens to avoid truncating a full memory-file rewrite; that default suits Doubao. If your model's max output is lower (e.g. gpt-4o-mini at 16384), set max_tokens to its limit here to override the extraction default.",
         "media": {
             "enabled": false,
             "file_processing_timeout": 1800,

@@ -328,11 +328,13 @@ class LiteLLMVLMProvider(VLMBase):
         # See BerriAI/litellm#17304 and PR #25659. Remove when LiteLLM ships
         # the fix.
         if provider == "gemini" and tools:
+            # Strip cache_control from the ALREADY-sanitized messages, not the raw
+            # input, so empty assistant turns removed above are not reintroduced.
             kwargs["messages"] = [
                 {k: v for k, v in msg.items() if k != "cache_control"}
                 if isinstance(msg, dict)
                 else msg
-                for msg in messages
+                for msg in kwargs["messages"]
             ]
 
         return kwargs

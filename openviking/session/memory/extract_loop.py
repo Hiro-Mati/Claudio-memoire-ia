@@ -44,7 +44,10 @@ logger = get_logger(__name__)
 
 # Memory extraction may rewrite an entire memory file in one response. Without an
 # explicit cap, providers fall back to a small server-side default (e.g. Ark's
-# 4096) and truncate the program mid-string. Request enough room for a full rewrite.
+# 4096) and truncate the program mid-string, making the output unusable. This is
+# a functional floor for extraction, tuned for the primary Doubao models.
+# Models whose max output tokens is BELOW this value (e.g. gpt-4o-mini at 16384)
+# must set `vlm.max_tokens` in ov.conf to their own limit to override this default.
 _DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS = 32768
 
 
@@ -151,6 +154,13 @@ class ExtractLoop:
         self.context_provider = context_provider
         self.thinking = bool(thinking)
         self.max_output_tokens = max_output_tokens
+        # Resolved in run() via _resolve_effective_max_output_tokens(); default to
+        # the extraction floor so a direct _call_llm() before run() stays safe.
+        self._effective_max_output_tokens = (
+            max_output_tokens
+            if max_output_tokens is not None
+            else _DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS
+        )
         # Use provided isolation_handler or create one in run()
         self._isolation_handler = isolation_handler
         # Track format error retry (max 1 retry)
@@ -219,16 +229,7 @@ class ExtractLoop:
         config = get_openviking_config()
         self._link_enabled = config.memory.link_enabled if config.memory else False
 
-        # Resolve the extraction output cap: explicit per-loop value wins, then the
-        # configured vlm.max_tokens, then a default large enough for a full memory
-        # rewrite so providers do not apply a small server-side default and truncate.
-        if self.max_output_tokens is None:
-            configured = getattr(getattr(config, "vlm", None), "max_tokens", None)
-            self._effective_max_output_tokens = (
-                configured if configured is not None else _DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS
-            )
-        else:
-            self._effective_max_output_tokens = self.max_output_tokens
+        self._resolve_effective_max_output_tokens(config)
 
         # 获取 ExtractContext（整个流程复用）
         self._extract_context = self.context_provider.get_extract_context()
@@ -460,6 +461,24 @@ class ExtractLoop:
         await self.finalize_operations(final_operations, raw_links)
 
         return final_operations, tools_used
+
+    def _resolve_effective_max_output_tokens(self, config: Any = None) -> None:
+        """Resolve the extraction output cap.
+
+        Priority: explicit per-loop value > configured vlm.max_tokens >
+        _DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS. The default is a functional floor
+        that suits the primary Doubao models; a model with a lower max output
+        (e.g. gpt-4o-mini) must set vlm.max_tokens in ov.conf to override it.
+        """
+        if config is None:
+            config = get_openviking_config()
+        if self.max_output_tokens is not None:
+            self._effective_max_output_tokens = self.max_output_tokens
+            return
+        configured = getattr(getattr(config, "vlm", None), "max_tokens", None)
+        self._effective_max_output_tokens = (
+            configured if configured is not None else _DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS
+        )
 
     def _retryable_resolution_issues(self, operations: ResolvedOperations) -> List[Dict[str, Any]]:
         issues: List[Dict[str, Any]] = []

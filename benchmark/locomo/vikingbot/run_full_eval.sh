@@ -121,15 +121,6 @@ mkdir -p "$RESULTS_ROOT"
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
-# auto-commit 逻辑（提前确定 commit ID）
-if [ "$AUTO_COMMIT" = "true" ]; then
-    if [ -n "$(cd "$SCRIPT_DIR/../../.." && git status --porcelain)" ]; then
-        ui_info "检测到未提交变更，正在自动提交…"
-        (cd "$SCRIPT_DIR/../../.." && git add -A && git commit -m "auto-commit before eval $(date +%Y%m%d_%H%M%S)")
-    fi
-fi
-GIT_COMMIT_ID=$(cd "$SCRIPT_DIR/../../.." && git rev-parse --short HEAD 2>/dev/null || echo "nogit")
-
 RUN_DIR_NAME="${TIMESTAMP}"
 RUN_DIR="$RESULTS_ROOT/runs/$RUN_DIR_NAME"
 mkdir -p "$RUN_DIR"
@@ -250,6 +241,16 @@ if [ -n "$PREV_ARG" ]; then
     ui_error "$PREV_ARG requires a value"
     exit 1
 fi
+
+# auto-commit runs AFTER arg parsing so --auto-commit is actually honored, and
+# GIT_COMMIT_ID is captured AFTER the commit so run metadata records the real HEAD.
+if [ "$AUTO_COMMIT" = "true" ]; then
+    if [ -n "$(cd "$SCRIPT_DIR/../../.." && git status --porcelain)" ]; then
+        ui_info "检测到未提交变更，正在自动提交…"
+        (cd "$SCRIPT_DIR/../../.." && git add -A && git commit -m "auto-commit before eval $(date +%Y%m%d_%H%M%S)")
+    fi
+fi
+GIT_COMMIT_ID=$(cd "$SCRIPT_DIR/../../.." && git rev-parse --short HEAD 2>/dev/null || echo "nogit")
 
 # 过滤掉开关参数和带值参数，获取位置参数
 ARGS=()

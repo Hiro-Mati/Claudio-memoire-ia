@@ -16,6 +16,11 @@ def sanitize_openai_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, A
     """
     sanitized: List[Dict[str, Any]] = []
     for message in messages:
+        if not isinstance(message, dict):
+            # Non-dict entries are passed through untouched; only dict messages
+            # carry the role/content structure this filter reasons about.
+            sanitized.append(message)
+            continue
         copied = dict(message)
         if copied.get("role") == "assistant":
             has_content = _has_message_content(copied.get("content"))
