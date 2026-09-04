@@ -142,7 +142,7 @@ def test_compile_limit_defaults_match_the_resource_envelope():
     assert limits.concurrent_tasks == 10
     assert limits.accepted_tasks == 40
     assert limits.accepted_tasks_per_principal == 10
-    assert limits.queue_wait_seconds == 60 * 60
+    assert limits.task_runtime_seconds == 60 * 60
     assert limits.agent_iterations == 60
     assert limits.source_files == 5000
     assert limits.source_total_bytes == 1024 * 1024 * 1024
@@ -4327,16 +4327,16 @@ async def test_compile_admission_is_bounded_per_principal_and_globally(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_compile_queue_wait_has_a_deadline(tmp_path: Path):
+async def test_compile_runtime_has_a_deadline(monkeypatch, tmp_path: Path):
     service = _compile_service(
         tmp_path,
         auth_mode="api_key",
         backend=SandboxBackend.AIOSANDBOX,
-        limits=CompileLimits(concurrent_tasks=1, queue_wait_seconds=0.01),
+        limits=CompileLimits(task_runtime_seconds=0.01),
     )
     request = _sanitized_compile_request()
     task = CompileTask(
-        task_id="cmp_queued",
+        task_id="cmp_runtime",
         principal_scope="owner",
         sanitized_request=request,
         status="accepted",
@@ -4345,19 +4345,23 @@ async def test_compile_queue_wait_has_a_deadline(tmp_path: Path):
         updated_at=utc_now(),
     )
     await service.store.create(task)
-    await service._semaphore.acquire()
-    try:
-        await service._run_task(task.task_id, request, {"api_key": "secret"})
-    finally:
-        service._semaphore.release()
+
+    async def execute(task_id, _request, connection, *, runtime_deadline):
+        del _request, connection, runtime_deadline
+        await service._set_state(task_id, status="running", stage="agent")
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(service, "_execute_task", execute)
+    await service._run_task(task.task_id, request, {"api_key": "secret"})
 
     failed = await service.store.get(task.task_id)
     assert failed is not None
     assert failed.status == "failed"
-    assert failed.stage == "queued"
+    assert failed.stage == "agent"
     assert failed.error is not None
     assert failed.error.code == "DEADLINE_EXCEEDED"
     assert service._target_locks == {}
+
 
 @pytest.mark.asyncio
 async def test_salvage_copies_workspace_and_repairs_links(tmp_path: Path):
@@ -4764,8 +4768,8 @@ async def test_cleanup_grace_releases_execution_slot_and_target_lock(tmp_path: P
                 await release_cleanup.wait()
             cleanup_finished.set()
 
-    async def execute(task_id, _request, connection):
-        del connection
+    async def execute(task_id, _request, connection, *, runtime_deadline):
+        del connection, runtime_deadline
         if task_id == "cmp_first":
             await service._cleanup_execution_resources(
                 sandbox_manager=StubbornManager(),
