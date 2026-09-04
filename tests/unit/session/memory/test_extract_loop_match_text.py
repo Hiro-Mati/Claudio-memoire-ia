@@ -17,6 +17,9 @@ from openviking.session.memory.dataclass import (
     WikiLink,
 )
 from openviking.session.memory.extract_loop import ExtractLoop
+from openviking.session.memory.extraction_output_protocol import (
+    create_extraction_output_protocol,
+)
 from openviking.session.memory.merge_op import FieldType, MergeOp
 from openviking.session.memory.page_id_map import PageIdMap
 
@@ -726,7 +729,8 @@ class TestResolutionRepair:
             errors=[],
         )
 
-        issues = self._loop()._retryable_resolution_issues(operations)
+        loop = self._loop()
+        issues = loop._retryable_resolution_issues(operations)
 
         assert issues == [
             {
@@ -737,7 +741,8 @@ class TestResolutionRepair:
                 "operation": {"ranges": "99"},
             }
         ]
-        instruction = ExtractLoop._build_resolution_repair_instruction(issues)
+        loop._output_protocol = create_extraction_output_protocol("json")
+        instruction = loop._build_resolution_repair_instruction(issues)
         assert "valid in-bounds message indexes" in instruction
         assert '"reason_code": "invalid_ranges"' in instruction
         assert "server has preserved all successful operations" in instruction

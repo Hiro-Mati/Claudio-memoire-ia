@@ -332,6 +332,21 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             "\n\nFailed edits:\n" + details
         )
 
+    def render_resolution_repair(self, issues: list[dict[str, Any]]) -> str:
+        details = json.dumps(issues, ensure_ascii=False, indent=2)
+        return (
+            "Some sdk.create_events(...) calls could not resolve a safe write target. "
+            "Re-emit ONLY corrected create_events() calls for the failed items below; do not "
+            "emit any other memory type, delete, or link statements. The server has preserved "
+            "all successful operations from the previous program. "
+            "For event ranges, pass ranges= with valid in-bounds message indexes that include the "
+            "user-role message establishing the event so its owner can be resolved (e.g. "
+            'ranges="3-5"). Do not target a disallowed or ambiguous peer. Keep the same event_name '
+            "shown for each failed item so it maps back to that event. Use triple-quoted strings "
+            '("""...""") for every natural-language argument. Output only Python code.'
+            "\n\nResolution issues:\n" + details
+        )
+
     def render_new_bindings(self, context: ExtractionOutputContext, *, source: str) -> str:
         declarations = []
         for uri, memory_file in context.read_file_contents.items():

@@ -463,6 +463,27 @@ def test_python_non_string_syntax_error_omits_quote_guidance():
     assert "offending line is shown above" not in retry
 
 
+def test_resolution_repair_matches_protocol_output_shape():
+    issues = [
+        {
+            "memory_type": "events",
+            "page_id": 100,
+            "reason_code": "no_writable_target",
+            "reason": "range out of bounds",
+            "operation": {"event_name": "yoga_class_started", "ranges": "99"},
+        }
+    ]
+
+    json_repair = create_extraction_output_protocol("json").render_resolution_repair(issues)
+    assert "ONLY one JSON object" in json_repair
+    assert "yoga_class_started" in json_repair
+
+    python_repair = create_extraction_output_protocol("python").render_resolution_repair(issues)
+    assert "sdk.create_events" in python_repair
+    assert "Output only Python code." in python_repair
+    assert "JSON object" not in python_repair
+
+
 def test_python_syntax_error_includes_offending_source_line():
     context = _context([_preference_schema()])
     protocol = create_extraction_output_protocol("python")

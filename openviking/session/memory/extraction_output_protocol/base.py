@@ -65,6 +65,15 @@ class ExtractionOutputProtocol(ABC):
     def render_patch_repair(self, patch_errors: list[dict[str, Any]]) -> str:
         """Render guidance after a patch cannot be applied."""
 
+    @abstractmethod
+    def render_resolution_repair(self, issues: list[dict[str, Any]]) -> str:
+        """Render guidance after event operations fail to resolve a write target.
+
+        The loop preserves every already-successful operation and asks the model
+        to re-emit only the corrected event operations, so the wording MUST match
+        this protocol's own output shape (JSON object vs restricted Python SDK).
+        """
+
     def render_new_bindings(self, context: ExtractionOutputContext, *, source: str) -> str:
         """Render newly available existing-memory references, if the protocol needs them."""
         del context, source
