@@ -30,7 +30,7 @@ from openviking.storage.vectordb.utils.logging_init import init_cpp_logging
 from openviking.storage.vectordb_adapters import create_collection_adapter
 from openviking.utils.tags import merge_search_tags
 from openviking.utils.time_utils import get_current_timestamp
-from openviking_cli.exceptions import ConflictError
+from openviking_cli.exceptions import ConflictError, InvalidArgumentError
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config.vectordb_config import DEFAULT_INDEX_NAME, VectorDBBackendConfig
 from openviking_cli.utils.uri import VikingURI
@@ -147,13 +147,50 @@ class _AsyncVectorAdapter:
     async def run(self, func: Any, /, *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(func, *args, **kwargs)
 
-    async def collection_meta(self) -> Dict[str, Any]:
-        return await asyncio.to_thread(lambda: self._adapter.get_collection().get_meta_data() or {})
+    async def collection_meta(self, index_name: str) -> Dict[str, Any]:
+        def _get() -> Dict[str, Any]:
+            collection = self._adapter.get_collection()
+            meta = collection.get_meta_data() or {}
+            if self._adapter.mode in {"local", "cuvs"}:
+                index_meta = collection.get_index_meta_data(index_name) or {}
+                if "ScalarIndex" in index_meta:
+                    meta["ScalarIndex"] = index_meta["ScalarIndex"]
+            return meta
+
+        return await asyncio.to_thread(_get)
 
     async def update_collection_description(self, description: str) -> None:
         await asyncio.to_thread(
             lambda: self._adapter.get_collection().update(description=description)
         )
+
+    async def update_collection_schema(
+        self, fields: List[Dict[str, Any]], scalar_index: List[str], index_name: str
+    ) -> None:
+        def _update() -> None:
+            collection = self._adapter.get_collection()
+            existing_fields = {
+                field.get("FieldName") for field in collection.get_meta_data().get("Fields", [])
+            }
+            missing_fields = [
+                field for field in fields if field.get("FieldName") not in existing_fields
+            ]
+            if missing_fields:
+                collection.update(fields=missing_fields)
+
+            index_meta = collection.get_index_meta_data(index_name) or {}
+            current_scalar_index = index_meta.get("ScalarIndex", [])
+            indexed_fields = set(current_scalar_index)
+            missing_scalar_fields = [
+                field for field in scalar_index if field not in indexed_fields
+            ]
+            if missing_scalar_fields:
+                collection.update_index(
+                    index_name,
+                    scalar_index=[*current_scalar_index, *missing_scalar_fields],
+                )
+
+        await asyncio.to_thread(_update)
 
 
 class _SingleAccountBackend:
@@ -274,7 +311,7 @@ class _SingleAccountBackend:
         return "not found" in message or "does not exist" in message
 
     async def _refresh_meta_data_async(self) -> None:
-        self._meta_data_cache = await self._async_adapter.collection_meta()
+        self._meta_data_cache = await self._async_adapter.collection_meta(self._index_name)
 
     # =========================================================================
     # Collection Management
@@ -340,7 +377,7 @@ class _SingleAccountBackend:
     async def get_collection_meta(self) -> Optional[Dict[str, Any]]:
         if not await self.collection_exists():
             return None
-        return await self._async_adapter.collection_meta()
+        return await self._async_adapter.collection_meta(self._index_name)
 
     async def update_collection_description(self, description: str) -> bool:
         if not await self.collection_exists():
@@ -348,6 +385,14 @@ class _SingleAccountBackend:
         await self._async_adapter.update_collection_description(description)
         await self._refresh_meta_data_async()
         return True
+
+    async def update_collection_schema(
+        self, fields: List[Dict[str, Any]], scalar_index: List[str]
+    ) -> None:
+        await self._async_adapter.update_collection_schema(
+            fields, scalar_index, self._index_name
+        )
+        await self._refresh_meta_data_async()
 
     # =========================================================================
     # Data Operations (with tenant enforcement)
@@ -987,6 +1032,15 @@ class VikingVectorIndexBackend:
     async def update_collection_description(self, description: str) -> bool:
         return await self._get_default_backend().update_collection_description(description)
 
+    async def update_collection_schema(
+        self, fields: List[Dict[str, Any]], scalar_index: List[str]
+    ) -> None:
+        default_backend = self._get_default_backend()
+        await default_backend.update_collection_schema(fields, scalar_index)
+        for backend in [*self._account_backends.values(), self._root_backend]:
+            if backend is not None and backend is not default_backend:
+                await backend._refresh_meta_data_async()
+
     # =========================================================================
     # 公开数据操作 API（强制要求 ctx）
     # =========================================================================
@@ -1469,6 +1523,43 @@ class VikingVectorIndexBackend:
         return await self.search(
             query_vector=query_vector,
             sparse_query_vector=sparse_query_vector,
+            filter=scope_filter,
+            limit=limit,
+            offset=offset,
+            output_fields=RETRIEVAL_OUTPUT_FIELDS,
+            ctx=ctx,
+        )
+
+    async def filter_in_tenant(
+        self,
+        ctx: RequestContext,
+        context_type: Optional[str] = None,
+        target_directories: Optional[List[str]] = None,
+        extra_filter: Optional[FilterExpr | Dict[str, Any]] = None,
+        level: Optional[List[int]] = None,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Metadata-only lookup scoped exactly like search_in_tenant.
+
+        Used when a caller supplies a filter but no query, so there is no vector
+        to search by. Scoping goes through the same _build_scope_filter as the
+        vector path, which keeps tenant isolation and target-directory limits
+        identical between the two — a separately hand-built filter would be one
+        refactor away from silently losing them.
+        """
+        scope_filter = self._build_scope_filter(
+            ctx=ctx,
+            context_type=context_type,
+            target_directories=target_directories,
+            extra_filter=extra_filter,
+            level=level,
+        )
+        if scope_filter is None:
+            raise InvalidArgumentError(
+                "A query-less lookup needs a filter or a target directory to scope by."
+            )
+        return await self.filter(
             filter=scope_filter,
             limit=limit,
             offset=offset,
