@@ -143,7 +143,6 @@ data: {"event":"response","data":{"content":"当前知识库包含……","respo
 | `skill` | string | 是 | - | Skill 目录或其 `SKILL.md` URI |
 | `reason` | string | 否 | Skill 驱动的默认值 | 本次 Compile 的补充指令 |
 | `args` | object | 否 | - | Provider 扩展参数，例如 `model_name` 和 `user_key` |
-| `runtime_timeout_seconds` | number | 否 | 3600 | 正数且有限，且不得超过服务端最大运行时限（默认 3600 秒） |
 
 **HTTP API**
 
@@ -170,11 +169,10 @@ ov compile \
   --from viking://resources/research \
   --to viking://resources/research-wiki \
   --skill viking://user/default/skills/research-compiler \
-  --reason "追踪历史进展，并保留支撑证据。" \
-  --wait
+  --reason "追踪历史进展，并保留支撑证据。"
 ```
 
-`--wait` 会轮询状态接口，直到任务进入终态。`--timeout` 只限制本地等待时间，不会取消服务端任务；`--runtime-timeout` 用于设置本次任务的 `runtime_timeout_seconds`，只能缩短服务端拥有的最大运行时限，超限请求会以 `429 RESOURCE_EXHAUSTED` 拒绝。在 Agent 执行期间达到该时限，或达到配置的 AgentLoop 迭代上限（`bot.agents.max_tool_iterations`，默认 50）时，会在独立的短 grace period 内尝试保存符合条件的 Resource 阶段性产物；没有可保存产物时任务失败，非 Resource 目标以及后续阶段超时不使用该 fallback。
+命令提交后立即返回 Task ID；通过 `ov task status` 查询状态，通过 `ov task cancel` 取消任务。达到配置的 AgentLoop 迭代上限（`bot.agents.max_tool_iterations`，默认 50）时，会在独立的短 grace period 内尝试保存符合条件的 Resource 阶段性产物；没有可保存产物时任务失败，非 Resource 目标不使用该 fallback。
 
 `direct` backend 会以 Bot 宿主机权限执行 Compile 的 `exec` 命令。`bot.sandbox.backends.direct.allow_compile_exec` 默认为 `true`：Compile 工具链开源，`exec` 默认直接以用户 shell 权限运行，普通 Wiki 和产物文件整理仍通过文件工具运行。声明了 `requires.bins` 或 `requires.env` 的 Skill 仍会先探测命令；将该选项设为 `false` 时 Compile 不会暴露 `exec`，此类 Skill 会在执行任何命令探测前以 `SKILL_CAPABILITY_UNAVAILABLE` 失败。依赖 CLI 的 Skill 推荐使用具备文件系统和网络策略的隔离 backend。超过 admission 上限时返回 `429 RESOURCE_EXHAUSTED`。
 
@@ -195,7 +193,15 @@ HTTP 接口返回 `202 Accepted`：
 }
 ```
 
-公开接口返回 OV TaskRecord。`POST /bot/v1/compile` 保留为兼容入口，返回同一个 OV Task ID。
+公开接口返回 OV TaskRecord。以下旧接口不再执行 Compile 操作，会返回迁移错误：
+
+```http
+POST /bot/v1/compile
+GET /bot/v1/compile/{task_id}
+POST /bot/v1/compile/{task_id}/cancel
+```
+
+请改用 `POST /api/v1/compile` 创建任务、`GET /api/v1/tasks/{task_id}` 轮询状态，并通过 `POST /api/v1/tasks/{task_id}/cancel` 取消任务。
 
 ### compile_status()
 
@@ -276,8 +282,6 @@ curl -X POST http://localhost:1933/api/v1/tasks/cmp_01abc/cancel \
 | `completed` | `completed`、`salvaged` |
 | `failed` | 失败发生时的 Stage；响应包含 `error` |
 | `cancelled` | `cancelled` |
-
-旧的 `/bot/v1/compile/{task_id}` 查询和取消路径继续保留，响应维持原 Compile 结构。
 
 ### feedback()
 

@@ -20,7 +20,7 @@ from openviking.service.external_task_service import (
     ExternalTaskSnapshot,
 )
 from openviking.service.fs_service import FSService
-from openviking.service.task_tracker import TaskRecord, TaskStatus, get_task_tracker
+from openviking.service.task_tracker import TaskRecord
 from openviking_cli.exceptions import (
     InvalidArgumentError,
     NotFoundError,
@@ -41,9 +41,6 @@ class CompileRequest(BaseModel):
     skill: str = Field(min_length=1)
     reason: str | None = None
     args: dict[str, Any] | None = None
-    # Kept for the existing CLI/local VikingBot path. The documented external
-    # service protocol uses `args` for provider-specific extensions.
-    runtime_timeout_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _normalize(self) -> "CompileRequest":
@@ -64,16 +61,6 @@ class CompileRequest(BaseModel):
         if not self.skill:
             raise ValueError("skill must not be empty")
         return self
-
-
-class CompileAccepted(BaseModel):
-    """Legacy `/bot/v1/compile` response retained for existing clients."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    task_id: str
-    status: str = "accepted"
-    to: str
 
 
 class CompileErrorInfo(BaseModel):
@@ -139,13 +126,10 @@ class CompileAPIClient:
         connection: Mapping[str, Any],
         idempotency_key: str,
     ) -> CompileSessionAccepted:
-        body = dict(payload)
-        if not self._endpoint.local:
-            body.pop("runtime_timeout_seconds", None)
         response = await self._request(
             "POST",
             "/bot/v1/compile",
-            json=body,
+            json=payload,
             headers=self._headers(connection, idempotency_key=idempotency_key),
         )
         return self._validate(CompileSessionAccepted, response)
@@ -241,6 +225,7 @@ class CompileService:
 
     task_type = "compile"
     task_id_prefix = "cmp_"
+    poll_max_attempts = 3
 
     def __init__(
         self,
@@ -339,24 +324,6 @@ class CompileService:
         connection: Mapping[str, Any],
     ) -> ExternalTaskSnapshot:
         return self._snapshot(await self._client().cancel(external_task_id, connection=connection))
-
-    async def get_owned_task(self, task_id: str, ctx: RequestContext) -> TaskRecord | None:
-        task = await get_task_tracker().get(
-            task_id,
-            account_id=ctx.account_id,
-            user_id=ctx.user.user_id,
-        )
-        return task if task is not None and task.task_type == self.task_type else None
-
-    async def cancel_owned_task(self, task_id: str, ctx: RequestContext) -> TaskRecord | None:
-        task = await self.get_owned_task(task_id, ctx)
-        if task is None:
-            return None
-        return await get_task_tracker().cancel(
-            task_id,
-            account_id=ctx.account_id,
-            user_id=ctx.user.user_id,
-        )
 
     async def _normalize_request(
         self,
@@ -501,37 +468,8 @@ class CompileService:
             error_message=error_message,
         )
 
-    @staticmethod
-    def compatibility_accepted(task: TaskRecord) -> CompileAccepted:
-        request = task.meta.get("request")
-        to = str(request.get("to") or "") if isinstance(request, dict) else ""
-        return CompileAccepted(task_id=task.task_id, to=to)
-
-    @staticmethod
-    def compatibility_status(task: TaskRecord) -> dict[str, Any]:
-        data = task.to_dict()
-        status = "accepted" if task.status is TaskStatus.PENDING else task.status.value
-        result: dict[str, Any] = {
-            "task_id": task.task_id,
-            "status": status,
-            "stage": task.stage or status,
-            "created_at": data["created_at_iso"],
-            "updated_at": data["updated_at_iso"],
-        }
-        if task.result is not None:
-            result["result"] = task.result
-        if task.error:
-            code, separator, message = task.error.partition(": ")
-            result["error"] = {
-                "code": code if separator else "UNKNOWN",
-                "message": message if separator else task.error,
-            }
-        return result
-
-
 __all__ = [
     "CompileAPIClient",
-    "CompileAccepted",
     "CompileRequest",
     "CompileService",
     "CompileSessionAccepted",

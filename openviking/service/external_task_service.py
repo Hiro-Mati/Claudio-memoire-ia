@@ -47,6 +47,7 @@ class ExternalTaskProvider(Protocol):
 
     task_type: str
     task_id_prefix: str
+    poll_max_attempts: int | None
 
     @property
     def poll_interval_seconds(self) -> float: ...
@@ -207,6 +208,7 @@ class ExternalTaskService:
                     task_id=task_id,
                     operation_name="poll",
                     poll_interval=provider.poll_interval_seconds,
+                    max_attempts=provider.poll_max_attempts,
                 )
                 if await self._apply_snapshot(
                     snapshot,
@@ -388,13 +390,18 @@ class ExternalTaskService:
         task_id: str,
         operation_name: str,
         poll_interval: float,
+        max_attempts: int | None = None,
     ) -> Any:
         delay = max(poll_interval, 0.2)
+        attempts = 0
         while True:
             try:
                 return await action()
             except ExternalTaskError as exc:
                 if not exc.transient:
+                    raise
+                attempts += 1
+                if max_attempts is not None and attempts >= max_attempts:
                     raise
                 logger.warning(
                     "External task %s will retry task=%s code=%s: %s",

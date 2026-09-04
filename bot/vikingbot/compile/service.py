@@ -613,16 +613,6 @@ class BotCompileService:
                 "VikingBot Compile does not implement provider-specific args.",
                 stage="queued",
             )
-        if (
-            request.runtime_timeout_seconds is not None
-            and request.runtime_timeout_seconds > self.limits.task_runtime_seconds
-        ):
-            raise CompileFailure(
-                "RESOURCE_EXHAUSTED",
-                "Compile runtime_timeout_seconds exceeds the server limit of "
-                f"{self.limits.task_runtime_seconds:g} seconds.",
-                stage="queued",
-            )
         raw_sources = [str(value).strip() for value in request.from_]
         if not raw_sources or any(not value for value in raw_sources):
             raise CompileFailure(
@@ -699,7 +689,6 @@ class BotCompileService:
                 "reason": reason or DEFAULT_COMPILE_REASON,
                 "reason_provided": bool(reason),
                 "skill": canonical_skill,
-                "runtime_timeout_seconds": request.runtime_timeout_seconds,
             }
         )
 
@@ -819,30 +808,7 @@ class BotCompileService:
                 return
 
             try:
-                runtime_timeout = min(
-                    request.runtime_timeout_seconds or self.limits.task_runtime_seconds,
-                    self.limits.task_runtime_seconds,
-                )
-                runtime_deadline = asyncio.get_running_loop().time() + runtime_timeout
-                await asyncio.wait_for(
-                    self._execute_task(
-                        task_id,
-                        request,
-                        connection,
-                        runtime_deadline=runtime_deadline,
-                    ),
-                    timeout=runtime_timeout,
-                )
-            except asyncio.TimeoutError:
-                task = await self.store.get(task_id)
-                await self._fail(
-                    task_id,
-                    CompileFailure(
-                        "DEADLINE_EXCEEDED",
-                        "Compile task exceeded its runtime limit.",
-                        stage=task.stage if task else "agent",
-                    ),
-                )
+                await self._execute_task(task_id, request, connection)
             except CompileFailure as exc:
                 await self._fail(task_id, exc)
             except Exception as exc:
@@ -862,8 +828,6 @@ class BotCompileService:
         task_id: str,
         request: SanitizedCompileRequest,
         connection: dict[str, Any],
-        *,
-        runtime_deadline: float | None = None,
     ) -> None:
         capabilities = self._compile_capabilities()
         target_type = classify_uri(request.to).context_type
@@ -882,7 +846,6 @@ class BotCompileService:
         sandbox: WorkspaceSandbox | None = None
         workspace_baseline: set[str] | None = None
         submit_tool: Any = None
-        salvage_allowed = False
         compile_started_at = time.monotonic()
         agent_usage: dict[str, int] = {}
         try:
@@ -1056,7 +1019,6 @@ class BotCompileService:
                 )
 
             await self._set_state(task_id, status="running", stage="agent")
-            salvage_allowed = True
             try:
                 bundle, _tools, usage, _iterations = await request_loop.run_structured_task(
                     system_prompt=system_prompt,
@@ -1072,7 +1034,6 @@ class BotCompileService:
                 )
                 agent_usage = _merge_usage(agent_usage, usage or {})
             except AgentIterationLimitExceeded as exc:
-                salvage_allowed = False
                 agent_usage = _merge_usage(agent_usage, getattr(exc, "usage", None) or {})
                 if target_type != "resource":
                     raise CompileFailure("AGENT_OUTPUT_INVALID", str(exc), stage="agent") from exc
@@ -1088,10 +1049,8 @@ class BotCompileService:
                 )
                 return
             except ValueError as exc:
-                salvage_allowed = False
                 raise CompileFailure("AGENT_OUTPUT_INVALID", str(exc), stage="agent") from exc
 
-            salvage_allowed = False
             await self._set_state(task_id, status="running", stage="rendering")
             file_payloads = list(getattr(submit_tool, "file_payloads", []))
             if is_skill_target:
@@ -1103,7 +1062,7 @@ class BotCompileService:
                         bundle=bundle,
                         file_payloads=file_payloads,
                         skill_name=str(getattr(submit_tool, "skill_name", "") or ""),
-                        timeout=min(300.0, self.limits.task_runtime_seconds),
+                        timeout=300.0,
                     )
                 except OpenVikingError as exc:
                     if exc.code == "CONFLICT":
@@ -1198,7 +1157,7 @@ class BotCompileService:
                         root_uri=request.to,
                         operations=rendered.operations,
                         wait=False,
-                        timeout=min(300.0, self.limits.task_runtime_seconds),
+                        timeout=300.0,
                     )
                 except OpenVikingError as exc:
                     if exc.code == "CONFLICT":
@@ -1240,29 +1199,6 @@ class BotCompileService:
                 task.error = None
 
             await self.store.update(task_id, complete)
-        except asyncio.CancelledError:
-            if (
-                runtime_deadline is None
-                or asyncio.get_running_loop().time() < runtime_deadline
-                or client is None
-                or target_type != "resource"
-                or not salvage_allowed
-                or getattr(submit_tool, "bundle", None) is not None
-            ):
-                raise
-            task = await self.store.get(task_id)
-            if task is None or task.status in TERMINAL_STATUSES or task.stage != "agent":
-                raise
-            assert sandbox is not None
-            await self._complete_salvaged_task(
-                task_id=task_id,
-                client=client,
-                request=request,
-                sandbox=sandbox,
-                workspace_baseline=workspace_baseline,
-                reason="reached its runtime deadline",
-                failure_code="DEADLINE_EXCEEDED",
-            )
         finally:
             await self._record_usage(task_id, agent_usage)
             self._log_compile_usage(
@@ -1398,7 +1334,7 @@ class BotCompileService:
         request: SanitizedCompileRequest,
         sandbox: WorkspaceSandbox,
         workspace_baseline: set[str] | None,
-        reason: str = "reached its runtime deadline",
+        reason: str = "reached its iteration limit",
     ) -> CompileResult | None:
         baseline = workspace_baseline or set()
         workspace_entries = sorted(

@@ -228,24 +228,8 @@ async def test_chat_proxy_forwards_trusted_request_without_root_api_key(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_compile_routes_use_ov_owned_task_and_forward_identity(monkeypatch):
+async def test_compile_route_uses_ov_owned_task_and_rejects_legacy_routes(monkeypatch):
     calls = {}
-    running = TaskRecord(
-        task_id="cmp_1",
-        task_type="compile",
-        status=TaskStatus.RUNNING,
-        stage="agent",
-        account_id="acct",
-        user_id="alice",
-    )
-    cancelling = TaskRecord(
-        task_id="cmp_1",
-        task_type="compile",
-        status=TaskStatus.CANCELLING,
-        stage="agent",
-        account_id="acct",
-        user_id="alice",
-    )
 
     class FakeCompileService:
         async def create(self, body, *, connection, ctx):
@@ -263,17 +247,8 @@ async def test_compile_routes_use_ov_owned_task_and_forward_identity(monkeypatch
                 meta={"request": {"to": "viking://resources/wiki"}},
             )
 
-        async def get_owned_task(self, task_id, ctx):
-            calls["get"] = (task_id, ctx.account_id, ctx.user.user_id)
-            return running
-
-        async def cancel_owned_task(self, task_id, ctx):
-            calls["cancel"] = (task_id, ctx.account_id, ctx.user.user_id)
-            return cancelling
-
     service = SimpleNamespace(compile=FakeCompileService())
     monkeypatch.setattr(compile_router_module, "get_service", lambda: service)
-    monkeypatch.setattr(bot_router_module, "get_service", lambda: service)
 
     app = FastAPI()
     app.state.config = ServerConfig(auth_mode="trusted", host="127.0.0.1", port=1944)
@@ -296,21 +271,25 @@ async def test_compile_routes_use_ov_owned_task_and_forward_identity(monkeypatch
                 "skill": "viking://agent/skills/wiki",
             },
         )
-        status_response = await client.get("/bot/v1/compile/cmp_1", headers=headers)
-        cancel_response = await client.post(
+        legacy_created = await client.post("/bot/v1/compile", headers=headers, json={})
+        legacy_status = await client.get("/bot/v1/compile/cmp_1", headers=headers)
+        legacy_cancel = await client.post(
             "/bot/v1/compile/cmp_1/cancel",
             headers=headers,
         )
 
     assert created.status_code == 202
     assert created.json()["result"]["task_id"] == "cmp_1"
-    assert status_response.json()["result"]["stage"] == "agent"
-    assert cancel_response.json()["result"]["status"] == "cancelling"
+    assert legacy_created.status_code == 400
+    assert "POST /api/v1/compile" in legacy_created.json()["detail"]
+    assert "GET /api/v1/tasks/{task_id}" in legacy_created.json()["detail"]
+    assert legacy_status.status_code == 400
+    assert "GET /api/v1/tasks/{task_id}" in legacy_status.json()["detail"]
+    assert legacy_cancel.status_code == 400
+    assert "POST /api/v1/tasks/{task_id}/cancel" in legacy_cancel.json()["detail"]
     assert calls["connection"]["api_key"] == "active-user-key"
     assert calls["connection"]["server_url"] == "http://127.0.0.1:1944"
     assert calls["owner"] == ("acct", "alice")
-    assert calls["get"] == ("cmp_1", "acct", "alice")
-    assert calls["cancel"] == ("cmp_1", "acct", "alice")
 
 
 @pytest.mark.asyncio

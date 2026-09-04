@@ -522,9 +522,9 @@ JSON 输出 - 错误：
 | POST | `/bot/v1/chat` | VikingBot 非流式对话 |
 | POST | `/bot/v1/chat/stream` | VikingBot 流式对话 |
 | POST | `/bot/v1/feedback` | 提交 VikingBot 回答反馈 |
-| POST | `/bot/v1/compile` | Compile 创建兼容入口 |
-| GET | `/bot/v1/compile/{task_id}` | Compile 状态兼容入口 |
-| POST | `/bot/v1/compile/{task_id}/cancel` | Compile 取消兼容入口 |
+| POST | `/bot/v1/compile` | 已停用；返回新接口迁移提示 |
+| GET | `/bot/v1/compile/{task_id}` | 已停用；返回 Task 接口迁移提示 |
+| POST | `/bot/v1/compile/{task_id}/cancel` | 已停用；返回 Task 取消接口迁移提示 |
 
 ---
 

@@ -12,12 +12,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
 from openviking.server.auth import get_request_context
-from openviking.server.dependencies import get_service
 from openviking.server.identity import RequestContext
-from openviking.server.models import Response
 from openviking.server.openviking_connection import attach_openviking_connection
-from openviking.service.compile_service import CompileRequest, CompileService
-from openviking_cli.exceptions import FailedPreconditionError, NotFoundError
 from openviking_cli.utils.logger import get_logger
 
 router = APIRouter(prefix="", tags=["bot"])
@@ -61,26 +57,17 @@ def get_bot_url() -> str:
     return BOT_API_URL
 
 
-@router.post("/compile", status_code=status.HTTP_202_ACCEPTED)
+@router.post("/compile")
 async def create_compile(
-    request: Request,
-    body: CompileRequest,
     _ctx: RequestContext = Depends(get_request_context),
 ):
-    """Compatibility route backed by the OV-owned Compile task."""
-    enriched = attach_openviking_connection(
-        {},
-        request,
-        _ctx,
-        include_legacy_user_id=False,
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=(
+            "This endpoint is no longer supported. Use POST /api/v1/compile, "
+            "then poll GET /api/v1/tasks/{task_id}."
+        ),
     )
-    task = await get_service().compile.create(
-        body,
-        connection=enriched.get("openviking_connection", {}),
-        ctx=_ctx,
-    )
-    accepted = CompileService.compatibility_accepted(task)
-    return Response(status="ok", result=accepted.model_dump(mode="json"))
 
 
 @router.get("/compile/{task_id}")
@@ -88,11 +75,13 @@ async def get_compile(
     task_id: str,
     _ctx: RequestContext = Depends(get_request_context),
 ):
-    """Read the OV-owned task using the legacy Compile response shape."""
-    task = await get_service().compile.get_owned_task(task_id, _ctx)
-    if task is None:
-        raise NotFoundError(task_id, "compile task")
-    return Response(status="ok", result=CompileService.compatibility_status(task))
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=(
+            "This endpoint is no longer supported. "
+            "Poll GET /api/v1/tasks/{task_id} instead."
+        ),
+    )
 
 
 @router.post("/compile/{task_id}/cancel")
@@ -100,13 +89,13 @@ async def cancel_compile(
     task_id: str,
     _ctx: RequestContext = Depends(get_request_context),
 ):
-    try:
-        task = await get_service().compile.cancel_owned_task(task_id, _ctx)
-    except ValueError as exc:
-        raise FailedPreconditionError(str(exc)) from exc
-    if task is None:
-        raise NotFoundError(task_id, "compile task")
-    return Response(status="ok", result=CompileService.compatibility_status(task))
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=(
+            "This endpoint is no longer supported. "
+            "Use POST /api/v1/tasks/{task_id}/cancel instead."
+        ),
+    )
 
 
 @router.get("/health")

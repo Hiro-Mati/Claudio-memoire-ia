@@ -50,7 +50,6 @@ class CompileLimits(BaseModel):
     accepted_tasks: int = 40
     accepted_tasks_per_principal: int = 10
     queue_wait_seconds: float = 60 * 60
-    task_runtime_seconds: float = 60 * 60
     salvage_grace_seconds: float = 120
     cleanup_grace_seconds: float = 40
     terminal_task_retention_seconds: float = 24 * 60 * 60
@@ -65,11 +64,6 @@ class CompileRequest(BaseModel):
     reason: str | None = None
     skill: str = Field(min_length=1)
     args: dict[str, Any] | None = None
-    runtime_timeout_seconds: float | None = Field(
-        default=None,
-        gt=0,
-        allow_inf_nan=False,
-    )
     openviking_connection: OpenVikingConnection | None = None
     _principal_scope: str = PrivateAttr(default="local")
 
@@ -82,11 +76,6 @@ class SanitizedCompileRequest(BaseModel):
     reason: str
     reason_provided: bool = False
     skill: str
-    runtime_timeout_seconds: float | None = Field(
-        default=None,
-        gt=0,
-        allow_inf_nan=False,
-    )
 
 
 class WikiPageDraft(BaseModel):
