@@ -1,3 +1,13 @@
+# Claudio-memoire-ia
+
+> **Claudio-memoire-ia** est un fork personnel d'[OpenViking](https://github.com/volcengine/OpenViking), la base de données de contexte pour agents IA de Volcengine.
+> Objectif : une mémoire d'agent locale qui tient sur un portable sans GPU, puis une mémoire qui se comprend et se corrige.
+> Le nom du paquet Python reste `openviking` pour rester fusionnable avec l'amont. Licence AGPL-3.0, comme l'original.
+>
+> Feuille de route et documentation : voir `docs/fr/` (à venir) et le manuel v1 publié avec le projet.
+
+---
+
 <div align="center">
 
 <a href="https://openviking.ai/" target="_blank">
