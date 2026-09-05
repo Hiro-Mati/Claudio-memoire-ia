@@ -56,6 +56,14 @@ class MemoryConfig(BaseModel):
             "When multiple directories are searched, results are merged and top-N are read."
         ),
     )
+    snapshot_on_commit: bool = Field(
+        default=False,
+        description=(
+            "After each session commit that changed memories, record a snapshot of the "
+            "user's memory tree so /api/v1/memory/as-of can answer 'what did I know at "
+            "this date'. Requires git.enabled (default)."
+        ),
+    )
     extraction_enabled: bool = Field(
         default=True,
         description=(

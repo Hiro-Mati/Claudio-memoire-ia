@@ -1650,6 +1650,7 @@ For memory-related settings, add a `memory` section in `ov.conf`:
 |-------|-------------|---------|
 | `version` | Deprecated and ignored. OpenViking always uses the v3 memory extraction pipeline; existing configs that set this field still load without error. | `"v3"` |
 | `custom_templates_dir` | Custom memory templates directory. If set, templates from this directory are loaded in addition to built-in templates. | `""` |
+| `snapshot_on_commit` | Record a snapshot of `viking://~/memories` after each session commit that changed memories, so `GET /api/v1/memory/as-of` can read a memory as it was at a given instant. | `false` |
 | `extraction_enabled` | Whether session commit runs long-term memory extraction. | `true` |
 | `session_skill_extraction_enabled` | Whether session commit also extracts reusable skills into the current user's skill directory. | `false` |
 | `link_enabled` | Whether memory extraction writes and resolves memory links. | `false` |

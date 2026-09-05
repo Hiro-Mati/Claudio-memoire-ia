@@ -144,9 +144,7 @@ def _memory_type_by_uri(operations: ResolvedOperations) -> dict[str, str]:
     for file_content in getattr(operations, "delete_file_contents", []) or []:
         uri = str(getattr(file_content, "uri", "") or "")
         if uri:
-            types_by_uri[uri] = str(
-                getattr(file_content, "memory_type", "") or "unknown"
-            )
+            types_by_uri[uri] = str(getattr(file_content, "memory_type", "") or "unknown")
     return types_by_uri
 
 
@@ -232,6 +230,54 @@ async def _commit_experience_snapshot(
         )
     except Exception as exc:
         logger.warning("Failed to commit experience snapshot for %s: %s", paths, exc, exc_info=True)
+
+
+async def _commit_memory_snapshot(
+    *,
+    ctx: Optional[RequestContext],
+    archive_uri: str,
+    memory_diffs: list[Any],
+) -> None:
+    """Record the user's memory tree when ``memory.snapshot_on_commit`` is on.
+
+    Only runs after a commit that actually changed memory files, so the
+    snapshot history stays readable. Failures are logged, never raised.
+    """
+    if ctx is None:
+        return
+    try:
+        from openviking_cli.utils.config import get_openviking_config
+
+        if not getattr(get_openviking_config().memory, "snapshot_on_commit", False):
+            return
+        viking_fs = get_viking_fs()
+    except Exception:
+        return
+    if viking_fs is None:
+        return
+    changed = 0
+    for diff in memory_diffs:
+        if isinstance(diff, dict):
+            summary = diff.get("summary") or {}
+            changed += sum(
+                int(summary.get(key, 0) or 0)
+                for key in ("total_adds", "total_updates", "total_deletes")
+            )
+    if changed <= 0:
+        return
+    commit = getattr(viking_fs, "commit", None)
+    if not callable(commit):
+        return
+    memories_root = f"viking://user/{ctx.user.user_id}/memories"
+    archive_ref = archive_uri.rstrip("/") if archive_uri else "unknown"
+    try:
+        await commit(
+            message=f"Memory snapshot after session commit {archive_ref} ({changed} change(s))",
+            paths=[memories_root],
+            ctx=ctx,
+        )
+    except Exception as exc:
+        logger.warning("Memory snapshot after %s failed: %s", archive_ref, exc)
 
 
 class SessionCompressorV3:
@@ -502,6 +548,14 @@ class SessionCompressorV3:
             await self._write_final_memory_diff(
                 archive_uri=archive_uri or "",
                 ctx=ctx,
+                memory_diffs=[
+                    getattr(result, "memory_diff", None),
+                    train_result.get("memory_diff"),
+                ],
+            )
+            await _commit_memory_snapshot(
+                ctx=ctx,
+                archive_uri=archive_uri or "",
                 memory_diffs=[
                     getattr(result, "memory_diff", None),
                     train_result.get("memory_diff"),

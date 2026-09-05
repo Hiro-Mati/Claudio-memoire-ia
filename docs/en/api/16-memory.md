@@ -123,3 +123,43 @@ The public Python, TypeScript, Go SDKs and the `ov` CLI do not wrap this endpoin
 - [Sessions](05-sessions.md) - commit and extract
 - [Retrieval](06-retrieval.md) - search memory
 - [Content](12-content.md) - read memory content
+
+## Provenance, revert and as-of reads
+
+Every session commit records the memory files it added, updated or deleted in
+`memory_diff.json` next to its archive. These endpoints expose that record.
+
+### provenance()
+
+```
+GET /api/v1/memory/provenance?uri={uri}&limit=50
+```
+
+Returns `{"uri": ..., "events": [...]}`, newest first. Each event has `op`
+(`add`, `update`, `delete`), `memory_type`, `archive_uri`, `session_id`,
+`extracted_at`, `trace_id`, and the recorded `before` / `after` /
+`deleted_content` bodies.
+
+### revert()
+
+```
+POST /api/v1/memory/revert
+{"uri": "viking://~/memories/preferences/editor.md",
+ "archive_uri": "viking://~/sessions/s1/history/archive_001"}
+```
+
+Undoes the change recorded for `uri` in that archive through the regular
+write and delete paths (vectors and sidecars are refreshed): an `add` deletes
+the file, an `update` restores the `before` body, a `delete` recreates the
+file. The revert is appended to `memory_reverts.json` in the archive.
+
+### as_of()
+
+```
+GET /api/v1/memory/as-of?uri={uri}&at=2026-09-01T12:00:00Z&branch=main
+```
+
+Reads `uri` from the latest snapshot committed at or before `at`. Enable
+`memory.snapshot_on_commit` so each memory-changing session commit records a
+snapshot of `viking://~/memories`; otherwise only manual `snapshot/commit`
+calls are visible.

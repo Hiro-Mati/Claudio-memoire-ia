@@ -10,6 +10,7 @@ from openviking.server.routers.console import router as console_router
 from openviking.server.routers.content import router as content_router
 from openviking.server.routers.debug import router as debug_router
 from openviking.server.routers.filesystem import router as filesystem_router
+from openviking.server.routers.memory_timeline import router as memory_timeline_router
 from openviking.server.routers.metrics import router as metrics_router
 from openviking.server.routers.observer import router as observer_router
 from openviking.server.routers.openviking_assets import router as openviking_assets_router
@@ -45,6 +46,7 @@ __all__ = [
     "pack_router",
     "privacy_configs_router",
     "debug_router",
+    "memory_timeline_router",
     "metrics_router",
     "observer_router",
     "openviking_assets_router",
