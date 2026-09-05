@@ -68,3 +68,38 @@ d'ensemble de dossiers, l'extraction de mémoire et les médias restent sur
 `OpenVikingConfig.get_file_summarizer()` et
 `SemanticProcessor._generate_text_summary`. Tests :
 `tests/storage/test_file_summarizer_tiering.py`.
+
+## 3. Repli lexical local (BM25) fusionné avec la recherche dense
+
+Un petit modèle d'embedding rate les jetons exacts : noms de fonctions,
+identifiants, codes d'erreur. La collection vectorielle locale n'a pas de
+recherche par mots-clés (elle lève `NotImplementedError`) et les vecteurs
+épars ne sont fournis que par quelques services hébergés.
+
+Le fork ajoute un index BM25 (SQLite FTS5, intégré à Python) dans
+`{storage.workspace}/_system/lexical/lexical.db`, alimenté aux écritures de
+l'index vectoriel et reconstruit tout seul depuis celui-ci s'il est vide.
+Les identifiants sont indexés tels quels et découpés (`parse_abstract_overview`
+et `parse abstract overview`), donc le symbole exact et ses mots trouvent.
+
+Fusion dans `find` et `search`, à la recherche globale comme à la descente par
+dossier : `score = min(1, dense + lexical_boost × bm25)`. Un résultat exact
+absent des candidats denses est récupéré depuis l'index vectoriel avec le score
+`lexical_boost × bm25` ; une entrée lexicale dont l'enregistrement vectoriel a
+disparu est purgée à la lecture. L'index vectoriel reste la source de vérité.
+
+```json
+{
+  "retrieval": {
+    "lexical_index_enabled": true,
+    "lexical_boost": 0.3,
+    "lexical_limit": 20
+  }
+}
+```
+
+Code : `openviking/retrieve/lexical_index.py`, miroir dans
+`VikingVectorIndexBackend` (`_lexical_mirror`), fusion dans
+`HierarchicalRetriever` (`_lexical_hits`, `_apply_lexical_hits`,
+`_rebuild_lexical_index`). Tests : `tests/retrieve/test_lexical_index.py`,
+`tests/retrieve/test_lexical_fusion.py`.

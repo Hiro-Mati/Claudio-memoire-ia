@@ -46,4 +46,29 @@ class RetrievalConfig(BaseModel):
         ),
     )
 
+    lexical_index_enabled: bool = Field(
+        default=False,
+        description=(
+            "Maintain a local BM25 (SQLite FTS5) index of context records next to the vector "
+            "index. Required for lexical_boost > 0. The index is filled on vector writes and "
+            "rebuilt lazily from the vector index when empty."
+        ),
+    )
+    lexical_boost: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Bonus added to a candidate's similarity score from its normalized BM25 match "
+            "(score = min(1, dense + lexical_boost * bm25)). Exact-token hits missing from "
+            "the dense results are recovered with score lexical_boost * bm25. 0 disables "
+            "lexical fusion."
+        ),
+    )
+    lexical_limit: int = Field(
+        default=20,
+        ge=1,
+        description="Maximum lexical hits considered per search scope.",
+    )
+
     model_config = {"extra": "forbid"}

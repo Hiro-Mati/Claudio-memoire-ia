@@ -1008,6 +1008,28 @@ The `mode="context"` assembly face on `/search` uses two timeout fuses:
 
 Both LLM steps are strictly opt-in: expansion needs a `session_id`, the rewrite needs `rewrite`. Either one failing degrades gracefully and never blocks recall.
 
+#### Lexical fusion (local BM25)
+
+Dense embeddings from small local models miss exact tokens such as function names, identifiers or error codes, and the local vector backend has no keyword search. OpenViking can keep a lightweight BM25 index (SQLite FTS5, `{storage.workspace}/_system/lexical/lexical.db`) next to the vector index and fuse it into `find`/`search`:
+
+```json
+{
+  "retrieval": {
+    "lexical_index_enabled": true,
+    "lexical_boost": 0.3,
+    "lexical_limit": 20
+  }
+}
+```
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `lexical_index_enabled` | bool | Mirror vector writes into the local BM25 index. When the index is empty it is rebuilt lazily from the vector index on the first search. | `false` |
+| `lexical_boost` | float | Bonus added to a candidate's similarity from its normalized BM25 match: `score = min(1, dense + lexical_boost * bm25)`. Exact-token hits missing from the dense results are recovered with score `lexical_boost * bm25`. `0` disables fusion. | `0.0` |
+| `lexical_limit` | int | Maximum lexical hits considered per search scope (global and per directory). | `20` |
+
+Identifiers are indexed verbatim and split (`parse_abstract_overview`, `parse abstract overview`, `camelCase`), so both the exact symbol and its words match. The vector index stays the source of truth: lexical hits that no longer have a vector record are purged at query time. Set `OPENVIKING_LEXICAL_INDEX_PATH` to relocate the database.
+
 ### grep
 
 Grep engine configuration for content pattern search. These settings are server-side only and cannot be overridden per-request.

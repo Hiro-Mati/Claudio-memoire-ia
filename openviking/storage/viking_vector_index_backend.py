@@ -181,9 +181,7 @@ class _AsyncVectorAdapter:
             index_meta = collection.get_index_meta_data(index_name) or {}
             current_scalar_index = index_meta.get("ScalarIndex", [])
             indexed_fields = set(current_scalar_index)
-            missing_scalar_fields = [
-                field for field in scalar_index if field not in indexed_fields
-            ]
+            missing_scalar_fields = [field for field in scalar_index if field not in indexed_fields]
             if missing_scalar_fields:
                 collection.update_index(
                     index_name,
@@ -389,9 +387,7 @@ class _SingleAccountBackend:
     async def update_collection_schema(
         self, fields: List[Dict[str, Any]], scalar_index: List[str]
     ) -> None:
-        await self._async_adapter.update_collection_schema(
-            fields, scalar_index, self._index_name
-        )
+        await self._async_adapter.update_collection_schema(fields, scalar_index, self._index_name)
         await self._refresh_meta_data_async()
 
     # =========================================================================
@@ -1045,6 +1041,30 @@ class VikingVectorIndexBackend:
     # 公开数据操作 API（强制要求 ctx）
     # =========================================================================
 
+    # ---- lexical mirror (best-effort, see openviking/retrieve/lexical_index.py) ----
+
+    @staticmethod
+    def _lexical_index_or_none():
+        try:
+            from openviking.retrieve.lexical_index import get_lexical_index, lexical_index_enabled
+
+            if not lexical_index_enabled():
+                return None
+            return get_lexical_index()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("lexical index unavailable: %s", exc)
+            return None
+
+    async def _lexical_mirror(self, action: str, *args: Any) -> None:
+        """Mirror a vector write into the lexical index without ever raising."""
+        index = self._lexical_index_or_none()
+        if index is None:
+            return
+        try:
+            await asyncio.to_thread(getattr(index, action), *args)
+        except Exception as exc:
+            logger.debug("lexical mirror %s failed: %s", action, exc)
+
     async def upsert(
         self,
         data: Dict[str, Any],
@@ -1077,6 +1097,8 @@ class VikingVectorIndexBackend:
             data,
             options=options,
         )
+        if not options.partial_update:
+            await self._lexical_mirror("upsert", data)
         logger.debug(
             "[VikingVectorIndexBackend.upsert] Completed with partial_update=%s, "
             "search_tag_mode=%s, result=%s",
@@ -1120,7 +1142,9 @@ class VikingVectorIndexBackend:
         self, data_list: List[Dict[str, Any]], *, ctx: RequestContext
     ) -> List[str]:
         """Write records whose ACL fields have already been materialized."""
-        return await self._get_backend_for_context(ctx).upsert_many(data_list)
+        result = await self._get_backend_for_context(ctx).upsert_many(data_list)
+        await self._lexical_mirror("upsert_many", data_list)
+        return result
 
     async def _materialize_acl_fields(
         self, records: List[Dict[str, Any]], ctx: RequestContext
@@ -1183,7 +1207,9 @@ class VikingVectorIndexBackend:
 
     async def delete(self, ids: List[str], *, ctx: RequestContext) -> int:
         backend = self._get_backend_for_context(ctx)
-        return await backend.delete(ids)
+        deleted = await backend.delete(ids)
+        await self._lexical_mirror("delete_ids", ids)
+        return deleted
 
     async def exists(self, id: str, *, ctx: RequestContext) -> bool:
         backend = self._get_backend_for_context(ctx)
@@ -1704,6 +1730,11 @@ class VikingVectorIndexBackend:
 
             backend = self._get_backend_for_context(ctx)
             await backend.delete_by_filter(And(conds))
+        await self._lexical_mirror(
+            "delete_uris",
+            ctx.account_id,
+            list(uris),
+        )
 
     def _uri_transfer_filter(self, ctx: RequestContext, uri: str, *, recursive: bool) -> FilterExpr:
         scopes: List[FilterExpr] = [Eq("uri", uri)]
@@ -2019,6 +2050,7 @@ class VikingVectorIndexBackend:
                     residual_count=len(source_records),
                 ) from transfer_error
             raise
+        await self._lexical_mirror("move_uri", ctx.account_id, source_uri, target_uri)
         return result
 
     async def increment_active_count(self, ctx: RequestContext, uris: List[str]) -> int:

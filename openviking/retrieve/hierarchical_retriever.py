@@ -19,11 +19,16 @@ from openviking.core.context import ContextLevel
 from openviking.core.retrieval_targets import default_target_directories
 from openviking.models.embedder.base import EmbedResult, embed_compat
 from openviking.models.rerank import RerankClient
+from openviking.retrieve.lexical_index import (
+    LexicalHit,
+    get_lexical_index,
+    lexical_index_enabled,
+)
 from openviking.retrieve.memory_lifecycle import hotness_score
 from openviking.retrieve.retrieval_stats import get_stats_collector
-from openviking.server.identity import RequestContext
+from openviking.server.identity import RequestContext, Role
 from openviking.storage.abstract_overview import body_for_preview
-from openviking.storage.expr import FilterExpr
+from openviking.storage.expr import And, Eq, FilterExpr, PathScope
 from openviking.storage.vikingdb_manager import VikingDBManager, VikingDBManagerProxy
 from openviking.telemetry import get_current_telemetry
 from openviking.utils.tags import normalize_search_tags
@@ -81,6 +86,14 @@ class HierarchicalRetriever:
         self.retrieval_config = retrieval_config or RetrievalConfig()
         self.hotness_alpha = self.retrieval_config.hotness_alpha
         self.score_propagation_alpha = self.retrieval_config.score_propagation_alpha
+        self.lexical_boost = float(getattr(self.retrieval_config, "lexical_boost", 0.0) or 0.0)
+        self.lexical_limit = int(getattr(self.retrieval_config, "lexical_limit", 20) or 20)
+        self._lexical_index = None
+        if self.lexical_boost > 0 and lexical_index_enabled():
+            try:
+                self._lexical_index = get_lexical_index()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("[HierarchicalRetriever] lexical index unavailable: %s", exc)
 
         # Use rerank threshold if available, otherwise use a default
         self.threshold = rerank_config.threshold if rerank_config else 0
@@ -97,6 +110,197 @@ class HierarchicalRetriever:
             logger.info(
                 f"[HierarchicalRetriever] Rerank not configured, using vector search only with threshold={self.threshold}"
             )
+
+    # ---- lexical fusion (BM25 boost, see openviking/retrieve/lexical_index.py) ----
+
+    _lexical_rebuild_scheduled: set = set()
+
+    def _lexical_ready(self) -> bool:
+        return self.lexical_boost > 0 and self._lexical_index is not None
+
+    async def _lexical_hits(
+        self,
+        query_text: str,
+        ctx: RequestContext,
+        *,
+        parent_uri: Optional[str] = None,
+        target_dirs: Optional[List[str]] = None,
+        context_type: Optional[str] = None,
+        level: Optional[List[int]] = None,
+    ) -> List[LexicalHit]:
+        if not self._lexical_ready() or not query_text:
+            return []
+        visible_user = None if ctx.role == Role.ROOT or ctx.bypass_acl else ctx.user.user_id
+        try:
+            return await asyncio.to_thread(
+                self._lexical_index.search,
+                query_text,
+                ctx.account_id,
+                parent_uri=parent_uri,
+                target_directories=target_dirs,
+                context_type=context_type,
+                level=level,
+                visible_user_id=visible_user,
+                limit=self.lexical_limit,
+            )
+        except Exception as exc:
+            logger.debug("[HierarchicalRetriever] lexical search skipped: %s", exc)
+            return []
+
+    _LEXICAL_LOOKUP_FIELDS = [
+        "id",
+        "uri",
+        "parent_uri",
+        "context_type",
+        "level",
+        "name",
+        "abstract",
+        "category",
+        "search_tags",
+        "active_count",
+        "updated_at",
+        "account_id",
+    ]
+
+    async def _lookup_record(
+        self, ctx: RequestContext, uri: str, level: int
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch one full vector record for a lexical hit (None when it no longer exists)."""
+        filter_fn = getattr(self.vector_store, "filter", None)
+        if filter_fn is None:
+            return None
+        records = await filter_fn(
+            filter=And(
+                [
+                    Eq("account_id", ctx.account_id),
+                    PathScope("uri", uri, depth=0),
+                    Eq("level", int(level)),
+                ]
+            ),
+            limit=1,
+            output_fields=self._LEXICAL_LOOKUP_FIELDS,
+            ctx=ctx,
+        )
+        return dict(records[0]) if records else None
+
+    async def _apply_lexical_hits(
+        self,
+        results: List[Dict[str, Any]],
+        hits: List[LexicalHit],
+        ctx: RequestContext,
+        *,
+        level: Optional[List[int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Boost dense ``results`` (key ``_score``) and append validated lexical-only hits.
+
+        Dense candidates that also match lexically get ``_score`` raised by
+        ``lexical_boost * bm25`` (capped at 1). Lexical hits absent from the
+        dense results are looked up in the vector index; found records join the
+        pool with ``_score = lexical_boost * bm25``, missing ones are purged
+        from the lexical index (the vector index is the source of truth).
+        """
+        if not hits:
+            return results
+        by_uri: Dict[str, Dict[str, Any]] = {}
+        for record in results:
+            uri = record.get("uri", "")
+            if uri and uri not in by_uri:
+                by_uri[uri] = record
+        extra: List[Dict[str, Any]] = []
+        stale_ids: List[str] = []
+        telemetry = get_current_telemetry()
+        for hit in hits:
+            bonus = self.lexical_boost * hit.score
+            existing = by_uri.get(hit.uri)
+            if existing is not None:
+                dense = self._finite_score(existing.get("_score", 0.0))
+                existing["_score"] = min(1.0, dense + bonus)
+                existing["_lexical"] = hit.score
+                telemetry.count("lexical.boosted", 1)
+                continue
+            if level is not None and hit.level not in level:
+                continue
+            try:
+                record = await self._lookup_record(ctx, hit.uri, hit.level)
+            except Exception as exc:
+                logger.debug("[HierarchicalRetriever] lexical lookup failed: %s", exc)
+                record = None
+            if record is None:
+                stale_ids.append(hit.doc_id)
+                continue
+            record["_score"] = bonus
+            record["_lexical"] = hit.score
+            by_uri[hit.uri] = record
+            extra.append(record)
+            telemetry.count("lexical.recovered", 1)
+        if stale_ids and self._lexical_index is not None:
+            try:
+                await asyncio.to_thread(self._lexical_index.delete_ids, stale_ids)
+            except Exception:  # pragma: no cover - defensive
+                pass
+        return results + extra
+
+    def _ensure_lexical_index_populated(self, ctx: RequestContext) -> None:
+        """Rebuild the lexical index from the vector index once when it is empty."""
+        if not self._lexical_ready():
+            return
+        account_id = ctx.account_id
+        if account_id in self._lexical_rebuild_scheduled:
+            return
+        try:
+            if self._lexical_index.count(account_id) > 0:
+                self._lexical_rebuild_scheduled.add(account_id)
+                return
+        except Exception:
+            return
+        self._lexical_rebuild_scheduled.add(account_id)
+        try:
+            asyncio.get_running_loop().create_task(self._rebuild_lexical_index(ctx))
+        except RuntimeError:  # pragma: no cover - no running loop
+            self._lexical_rebuild_scheduled.discard(account_id)
+
+    async def _rebuild_lexical_index(self, ctx: RequestContext) -> int:
+        """Scroll the account's vector records into the lexical index."""
+        index = self._lexical_index
+        scroll = getattr(self.vector_store, "scroll", None)
+        if index is None or scroll is None:
+            return 0
+        fields = [
+            "id",
+            "account_id",
+            "uri",
+            "parent_uri",
+            "context_type",
+            "level",
+            "name",
+            "abstract",
+            "content",
+        ]
+        total = 0
+        cursor: Optional[str] = None
+        try:
+            while True:
+                records, cursor = await scroll(
+                    filter=Eq("account_id", ctx.account_id),
+                    limit=200,
+                    cursor=cursor,
+                    output_fields=fields,
+                    ctx=ctx,
+                )
+                if records:
+                    total += await asyncio.to_thread(index.upsert_many, records)
+                if not cursor or not records:
+                    break
+        except Exception as exc:
+            logger.warning("[HierarchicalRetriever] lexical rebuild stopped: %s", exc)
+            self._lexical_rebuild_scheduled.discard(ctx.account_id)
+            return total
+        logger.info(
+            "[HierarchicalRetriever] lexical index rebuilt for %s: %d records",
+            ctx.account_id,
+            total,
+        )
+        return total
 
     async def retrieve(
         self,
@@ -208,6 +412,26 @@ class HierarchicalRetriever:
                 if previous is None or score > previous.get("_final_score", 0.0):
                     collected_by_uri[uri] = candidate
 
+            if self._lexical_ready():
+                self._ensure_lexical_index_populated(ctx)
+                hits = await self._lexical_hits(
+                    query.query,
+                    ctx,
+                    target_dirs=target_dirs,
+                    context_type=context_type,
+                    level=level,
+                )
+                fused = await self._apply_lexical_hits(
+                    list(collected_by_uri.values()), hits, ctx, level=level
+                )
+                collected_by_uri = {}
+                for candidate in fused:
+                    score = self._finite_score(candidate.get("_score", 0.0))
+                    if not self._passes_threshold(score, effective_threshold, score_gte):
+                        continue
+                    candidate["_final_score"] = score
+                    collected_by_uri[candidate.get("uri", "")] = candidate
+
             candidates = sorted(
                 collected_by_uri.values(),
                 key=lambda x: x.get("_final_score", 0.0),
@@ -307,6 +531,8 @@ class HierarchicalRetriever:
                     initial_candidates.append(candidate)
 
             # Step 4: Recursive search
+            if self._lexical_ready():
+                self._ensure_lexical_index_populated(ctx)
             with telemetry.measure("search.vector_retrieval"):
                 candidates = await self._recursive_search(
                     vector_proxy=vector_proxy,
@@ -482,7 +708,7 @@ class HierarchicalRetriever:
             heapq.heappush(dir_queue, (-score, uri))
 
         async def search_children(current_uri: str) -> List[Dict[str, Any]]:
-            return await vector_proxy.search_children_in_tenant(
+            dense = await vector_proxy.search_children_in_tenant(
                 parent_uri=current_uri,
                 query_vector=query_vector,
                 sparse_query_vector=sparse_query_vector,  # Pass sparse vector
@@ -491,6 +717,16 @@ class HierarchicalRetriever:
                 extra_filter=scope_dsl,
                 limit=max(limit * 2, 20),
             )
+            if not self._lexical_ready():
+                return dense
+            hits = await self._lexical_hits(
+                query,
+                vector_proxy._ctx,
+                parent_uri=current_uri,
+                target_dirs=target_dirs,
+                context_type=context_type,
+            )
+            return await self._apply_lexical_hits(list(dense), hits, vector_proxy._ctx)
 
         parallelism = max(1, self.MAX_PARALLEL_CHILD_SEARCHES)
 
@@ -647,9 +883,7 @@ class HierarchicalRetriever:
                     abstract=abstract,
                     category=c.get("category", ""),
                     score=final_score,
-                    search_tags=normalize_search_tags(
-                        c.get("search_tags"), discard_invalid=True
-                    ),
+                    search_tags=normalize_search_tags(c.get("search_tags"), discard_invalid=True),
                 )
             )
 
