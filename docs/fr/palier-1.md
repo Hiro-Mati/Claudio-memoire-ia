@@ -103,3 +103,43 @@ Code : `openviking/retrieve/lexical_index.py`, miroir dans
 `HierarchicalRetriever` (`_lexical_hits`, `_apply_lexical_hits`,
 `_rebuild_lexical_index`). Tests : `tests/retrieve/test_lexical_index.py`,
 `tests/retrieve/test_lexical_fusion.py`.
+
+## 4. Installation sans compilation et palier « CPU seul »
+
+### Installation de développement sans chaîne native
+
+Compiler depuis les sources demande Rust (CLI `ov`, `ragfs-python`) et un
+compilateur C++17 avec CMake (moteur vectoriel). Le script
+`scripts/dev_install_prebuilt.py` réutilise les binaires de la roue officielle
+de la plateforme et fait pointer l'environnement virtuel vers le code source :
+
+```
+python -m venv .venv
+.venv\Scriptsctivate            # Windows ; source .venv/bin/activate ailleurs
+python scripts/dev_install_prebuilt.py
+openviking-server doctor
+```
+
+Il télécharge la roue (ou prend `--wheel CHEMIN`), l'installe, copie
+`openviking/bin/ov*`, `openviking/lib/ragfs_python*`,
+`openviking/storage/vectordb/engine/_*` et `openviking/web_studio/dist` dans
+l'arbre source (tous ignorés par git), retire les paquets Python de
+site-packages en gardant les scripts console et les dépendances, puis écrit
+`openviking-dev.pth`. À rejouer après un `git pull` qui touche `crates/` ou
+`src/`, avec `--version` égal à la version de la roue correspondante.
+
+### Palier CPU seul dans l'assistant
+
+`openviking-server init` détecte désormais l'accélérateur : Apple Silicon, GPU
+NVIDIA visible par `nvidia-smi`, ou variable `OPENVIKING_ASSUME_GPU=1|0`. Sans
+accélérateur, le profil « CPU seul » remplace les paliers RAM :
+
+- embedding `qwen3-embedding:0.6b` et VLM `qwen3.5:4b` quelle que soit la RAM
+  (plus petit, le VLM échoue l'extraction de mémoire) ;
+- `file_summarizer` sur `qwen3.5:0.8b` (résumés par étages, section 2) ;
+- `semantic.parent_refresh_mode = debounced` (section 1) ;
+- `retrieval.lexical_index_enabled = true`, `lexical_boost = 0.3` (section 3).
+
+Code : `_has_gpu_accelerator`, `_get_recommended_indices(ram_gb, gpu=...)`,
+`_build_cpu_only_extras` dans `openviking_cli/setup_wizard.py`. Tests :
+`tests/cli/test_setup_wizard_cpu_profile.py`.

@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import platform
 import re
 import secrets
 import select
@@ -713,12 +714,66 @@ _RAM_DEFAULT_EMBED = 2  # ≥64 GB: qwen3-embedding:8b
 _RAM_DEFAULT_VLM = 2  # ≥64 GB: qwen3.6:27b
 
 
-def _get_recommended_indices(ram_gb: int) -> tuple[int, int]:
-    """Return (embedding_index, vlm_index) for the RAM tier (0-based)."""
+# CPU-only profile: without a GPU (or Apple Silicon unified memory) a 9B VLM
+# takes minutes per document, so RAM alone must not pick it. The smallest
+# recommended pair stays, and per-file summaries move to a sub-1B model.
+_CPU_ONLY_EMBED = 0  # qwen3-embedding:0.6b
+_CPU_ONLY_VLM = 0  # qwen3.5:4b
+FILE_SUMMARIZER_PRESET = VLMPreset(
+    "Qwen 3.5 0.8B", "qwen3.5:0.8b", "ollama/qwen3.5:0.8b", "~1.0 GB", 2
+)
+
+
+def _has_gpu_accelerator() -> bool:
+    """Best-effort: Apple Silicon, an NVIDIA GPU reachable by nvidia-smi, or an override."""
+    override = os.environ.get("OPENVIKING_ASSUME_GPU")
+    if override is not None:
+        return override.strip().lower() in {"1", "true", "yes"}
+    if sys.platform == "darwin" and platform.machine().lower() in {"arm64", "aarch64"}:
+        return True
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi:
+        try:
+            result = subprocess.run([nvidia_smi, "-L"], capture_output=True, text=True, timeout=5)
+            return result.returncode == 0 and "GPU" in result.stdout
+        except Exception:
+            return False
+    return False
+
+
+def _get_recommended_indices(ram_gb: int, gpu: bool = True) -> tuple[int, int]:
+    """Return (embedding_index, vlm_index) for the RAM tier (0-based).
+
+    ``gpu=False`` selects the CPU-only profile regardless of RAM.
+    """
+    if not gpu:
+        return _CPU_ONLY_EMBED, _CPU_ONLY_VLM
     for max_ram, emb_idx, vlm_idx in _RAM_TIERS:
         if ram_gb <= max_ram:
             return emb_idx, vlm_idx
     return _RAM_DEFAULT_EMBED, _RAM_DEFAULT_VLM
+
+
+def _build_cpu_only_extras(file_summarizer: VLMPreset = FILE_SUMMARIZER_PRESET) -> dict[str, Any]:
+    """Config blocks that make a CPU-only laptop practical.
+
+    Tiered summaries (small model per file), coalesced parent refreshes and
+    the local BM25 index; see docs/en/guides/01-configuration.md.
+    """
+    return {
+        "file_summarizer": {
+            "provider": "litellm",
+            "model": file_summarizer.litellm_model,
+            "api_key": "no-key",
+            "api_base": "http://localhost:11434",
+            "temperature": 0.0,
+            "max_retries": 2,
+            "timeout": 180,
+            "extra_request_body": {"num_ctx": 8192, "think": False},
+        },
+        "semantic": {"parent_refresh_mode": "debounced", "parent_refresh_debounce_s": 60},
+        "retrieval": {"lexical_index_enabled": True, "lexical_boost": 0.3},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1729,11 +1784,18 @@ def _wizard_ollama() -> tuple[dict[str, Any] | None, bool | None]:
 
     available_models = get_ollama_models() if ollama_running else []
 
-    # System RAM
+    # System RAM and accelerator
     ram_gb = _get_system_ram_gb()
-    rec_embed_idx, rec_vlm_idx = _get_recommended_indices(ram_gb)
+    gpu = _has_gpu_accelerator()
+    rec_embed_idx, rec_vlm_idx = _get_recommended_indices(ram_gb, gpu=gpu)
     if ram_gb > 0:
         print(f"\n  {_dim(f'Detected {ram_gb} GB RAM')}")
+    if not gpu:
+        cpu_note = _dim(
+            "No GPU accelerator detected: using the CPU-only profile "
+            "(small models, tiered summaries, coalesced refreshes, local BM25)"
+        )
+        print(f"  {cpu_note}")
 
     # --- Recommended one-shot setup ---
     rec_embed = EMBEDDING_PRESETS[rec_embed_idx]
@@ -1743,12 +1805,18 @@ def _wizard_ollama() -> tuple[dict[str, Any] | None, bool | None]:
         _parse_size_gb(rec_embed.size_hint)
         + _parse_size_gb(rec_vlm.size_hint)
         + _QUERY_PLANNER_DOWNLOAD_GB
+        + (_parse_size_gb(FILE_SUMMARIZER_PRESET.size_hint) if not gpu else 0.0)
     )
 
-    ram_note = f" (for {ram_gb} GB RAM)" if ram_gb > 0 else ""
+    ram_note = f" (for {ram_gb} GB RAM{', CPU only' if not gpu else ''})" if ram_gb > 0 else ""
     print(f"\n  {_bold('Recommended local setup' + ram_note)}")
     print(f"    Embedding      {rec_embed.model}  {_dim('(' + rec_embed.size_hint + ')')}")
     print(f"    VLM            {rec_vlm.ollama_model}  {_dim('(' + rec_vlm.size_hint + ')')}")
+    if not gpu:
+        print(
+            f"    File summaries {FILE_SUMMARIZER_PRESET.ollama_model}  "
+            f"{_dim('(' + FILE_SUMMARIZER_PRESET.size_hint + ')')}"
+        )
     print(f"    Query planner  {rec_planner.ollama_model}  {_dim('(~0.9 GB)')}")
     print(
         f"    {_dim(f'Total download ~{total_gb:.0f} GB — already-downloaded models are skipped')}"
@@ -1764,6 +1832,15 @@ def _wizard_ollama() -> tuple[dict[str, Any] | None, bool | None]:
                 _ensure_model_pulled(model, hint, ollama_running, available_models, ask=False)
             config = _build_ollama_config(rec_embed, rec_vlm, _workspace_path())
             config["query_planner"] = _build_query_planner_config(rec_planner)
+            if not gpu:
+                _ensure_model_pulled(
+                    FILE_SUMMARIZER_PRESET.ollama_model,
+                    FILE_SUMMARIZER_PRESET.size_hint,
+                    ollama_running,
+                    available_models,
+                    ask=False,
+                )
+                config.update(_build_cpu_only_extras())
             return config, ollama_running
         print(f"  {_dim('Pick smaller models below instead.')}")
 

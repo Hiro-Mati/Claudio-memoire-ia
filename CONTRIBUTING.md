@@ -142,6 +142,20 @@ uv run openviking-server doctor
 Configuration details and provider examples are in the
 [configuration guide](https://docs.openviking.ai/en/guides/01-configuration).
 
+If you only work on the Python code and do not have (or want) the native
+toolchain, reuse the prebuilt artifacts of the official wheel instead:
+
+```bash
+python -m venv .venv && source .venv/bin/activate   # .venv\Scriptsctivate on Windows
+python scripts/dev_install_prebuilt.py
+openviking-server doctor
+```
+
+The script installs the wheel for your platform, copies its native artifacts
+(`ov` CLI, `ragfs_python`, vector engine variants, Studio bundle) into the
+checkout and points the environment at the source tree. Re-run it after
+pulling changes to `crates/` or `src/`.
+
 If you modify the RAGFS Rust binding, bundled Rust CLI, or C++ extensions, rebuild
 the native components:
 
