@@ -6,6 +6,7 @@ import {
   BarChart3Icon,
   BrainCircuitIcon,
   ClipboardIcon,
+  ExternalLinkIcon,
   FileTextIcon,
   GitBranchIcon,
   LoaderCircleIcon,
@@ -92,7 +93,11 @@ function ExperienceDetailRoute() {
   const outcomeQuery = useQuery({
     enabled: activeTab === 'impact',
     queryFn: ({ signal }) =>
-      fetchOutcomeDistribution({ experienceUri, signal, timeRange }),
+      fetchOutcomeDistribution({
+        experienceUri,
+        signal,
+        timeRange,
+      }),
     queryKey: [
       'agent-experience-outcomes',
       identityScopeKey,
@@ -101,6 +106,7 @@ function ExperienceDetailRoute() {
       timeRange.startDate,
       timeRange.endDate,
     ],
+    retry: false,
   })
 
   const trajectoriesQuery = useInfiniteQuery<
@@ -129,6 +135,7 @@ function ExperienceDetailRoute() {
       timeRange.startDate,
       timeRange.endDate,
     ],
+    retry: false,
   })
 
   const trajectories =
@@ -138,6 +145,12 @@ function ExperienceDetailRoute() {
     trajectoriesQuery.hasNextPage && !trajectoriesQuery.isFetchingNextPage,
   )
   const experienceName = getExperienceDisplayName(experienceUri)
+  const outcomeErrorMessage = outcomeQuery.error
+    ? getErrorMessage(outcomeQuery.error)
+    : undefined
+  const trajectoryErrorMessage = trajectoriesQuery.error
+    ? getErrorMessage(trajectoriesQuery.error)
+    : undefined
 
   const handleCopyUri = () => {
     void copyTextToClipboard(experienceUri)
@@ -190,6 +203,23 @@ function ExperienceDetailRoute() {
                 onClick={handleCopyUri}
               >
                 <ClipboardIcon className="size-3.5" />
+              </Button>
+              <Button
+                render={
+                  <Link
+                    rel="noreferrer noopener"
+                    search={{ file: experienceUri }}
+                    target="_blank"
+                    to="/playground"
+                  />
+                }
+                nativeButton={false}
+                aria-label={t('detail.openPlayground')}
+                title={t('detail.openPlayground')}
+                size="icon-xs"
+                variant="ghost"
+              >
+                <ExternalLinkIcon className="size-3.5" />
               </Button>
             </div>
           </div>
@@ -318,7 +348,7 @@ function ExperienceDetailRoute() {
                   ) : outcomeQuery.isError ? (
                     <div className="grid min-h-16 place-items-center gap-2 text-center">
                       <p className="text-sm text-muted-foreground">
-                        {getErrorMessage(outcomeQuery.error)}
+                        {outcomeErrorMessage}
                       </p>
                       <Button
                         type="button"
@@ -346,7 +376,7 @@ function ExperienceDetailRoute() {
                     </span>
                   </div>
                   <TrajectoryList
-                    error={trajectoriesQuery.error}
+                    errorMessage={trajectoryErrorMessage}
                     hasMore={hasMoreTrajectories}
                     isLoading={trajectoriesQuery.isLoading}
                     isLoadingMore={trajectoriesQuery.isFetchingNextPage}
@@ -360,7 +390,10 @@ function ExperienceDetailRoute() {
                 </section>
               </>
             ) : (
-              <SourceTracePanel experienceUri={experienceUri} />
+              <SourceTracePanel
+                experienceUri={experienceUri}
+                onSelect={setSelectedTrajectory}
+              />
             )}
           </CardContent>
         </Card>

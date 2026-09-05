@@ -226,11 +226,17 @@ const workspace = {
     updated: '更新于 {{time}}',
     updatedBadge: '有更新',
     columnFile: '经验文件',
-    columnApplied: '应用情况',
     columnUpdated: '更新时间',
     columnActions: '操作',
     viewAnalysis: '应用效果',
     openDetail: '查看 {{name}} 的应用效果',
+    pagination: {
+      summary: '共 {{total}} 条，第 {{page}} / {{pageCount}} 页',
+      pageSize: '每页条数',
+      pageSizeValue: '{{count}} 条/页',
+      previous: '上一页',
+      next: '下一页',
+    },
     help: {
       title: '一直无经验产生？请检查：',
       reasonConnected: 'Agent 是否已接入 OpenViking',
@@ -256,6 +262,7 @@ const workspace = {
     detail: {
       back: '返回',
       copyUri: '复制 URI',
+      openPlayground: '在工作台中打开',
       copied: '已复制',
       copyFailed: '复制失败',
       contentTitle: '经验内容',

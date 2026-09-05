@@ -74,7 +74,7 @@ function TrajectoryRows({
  * Clicking a row (or its name button) opens the trajectory content preview.
  */
 export function TrajectoryList({
-  error,
+  errorMessage,
   hasMore,
   isLoading,
   isLoadingMore,
@@ -85,7 +85,7 @@ export function TrajectoryList({
   onSelect,
   total,
 }: {
-  error: unknown
+  errorMessage?: string
   hasMore: boolean
   isLoading: boolean
   isLoadingMore: boolean
@@ -107,11 +107,14 @@ export function TrajectoryList({
     )
   }
 
-  if (items.length === 0 && error) {
+  if (items.length === 0 && errorMessage) {
     return (
       <div className="grid min-h-24 place-items-center gap-2 text-center text-sm">
         <p className="text-muted-foreground">
           {t('detail.trajectoriesLoadFailed')}
+        </p>
+        <p className="max-w-md text-xs leading-5 text-muted-foreground/80">
+          {errorMessage}
         </p>
         <Button type="button" size="xs" variant="outline" onClick={onRetry}>
           {t('refresh')}

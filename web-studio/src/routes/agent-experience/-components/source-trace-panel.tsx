@@ -6,11 +6,18 @@ import { Button } from '#/components/ui/button'
 import { useAppConnection } from '#/hooks/use-app-connection'
 
 import { fetchSourceTrajectories } from '../-lib/api'
+import type { TrajectoryItem } from '../-lib/types'
 
 /**
  * Source lineage: `derived_from` links stored in the Experience memory attrs.
  */
-export function SourceTracePanel({ experienceUri }: { experienceUri: string }) {
+export function SourceTracePanel({
+  experienceUri,
+  onSelect,
+}: {
+  experienceUri: string
+  onSelect: (trajectory: TrajectoryItem) => void
+}) {
   const { t } = useTranslation('agentExperiencePage')
   const { identityScopeKey } = useAppConnection()
   const sourceQuery = useQuery({
@@ -56,33 +63,43 @@ export function SourceTracePanel({ experienceUri }: { experienceUri: string }) {
           {links.map((link) => {
             const name = link.uri.split('/').pop() ?? link.uri
             return (
-              <li
-                key={`${link.uri}:${link.reason ?? ''}`}
-                className="grid gap-1 rounded-lg border px-3 py-2.5"
-              >
-                <div className="flex min-w-0 items-center gap-2">
-                  <RouteIcon className="size-3.5 shrink-0 text-muted-foreground" />
-                  <span className="truncate text-sm font-medium" title={name}>
-                    {name}
+              <li key={`${link.uri}:${link.reason ?? ''}`}>
+                <button
+                  type="button"
+                  aria-label={t('detail.trajectoryView', { name })}
+                  className="grid w-full gap-1 rounded-lg border px-3 py-2.5 text-left transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+                  onClick={() =>
+                    onSelect({
+                      description: link.reason,
+                      name,
+                      uri: link.uri,
+                    })
+                  }
+                >
+                  <span className="flex min-w-0 items-center gap-2">
+                    <RouteIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                    <span className="truncate text-sm font-medium" title={name}>
+                      {name}
+                    </span>
                   </span>
-                </div>
-                <div className="flex min-w-0 items-center gap-1.5 pl-5.5">
-                  <LinkIcon className="size-3 shrink-0 text-muted-foreground/70" />
-                  <code
-                    className="min-w-0 truncate text-xs text-muted-foreground"
-                    title={link.uri}
-                  >
-                    {link.uri}
-                  </code>
-                </div>
-                {link.reason ? (
-                  <p
-                    className="truncate pl-5.5 text-xs text-muted-foreground/80"
-                    title={link.reason}
-                  >
-                    {link.reason}
-                  </p>
-                ) : null}
+                  <span className="flex min-w-0 items-center gap-1.5 pl-5.5">
+                    <LinkIcon className="size-3 shrink-0 text-muted-foreground/70" />
+                    <code
+                      className="min-w-0 truncate text-xs text-muted-foreground"
+                      title={link.uri}
+                    >
+                      {link.uri}
+                    </code>
+                  </span>
+                  {link.reason ? (
+                    <span
+                      className="truncate pl-5.5 text-xs text-muted-foreground/80"
+                      title={link.reason}
+                    >
+                      {link.reason}
+                    </span>
+                  ) : null}
+                </button>
               </li>
             )
           })}

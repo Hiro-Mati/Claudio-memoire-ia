@@ -9,12 +9,15 @@ export type ExperienceFileItem = {
   size?: number
 }
 
+export type ExperiencePage = {
+  items: ExperienceFileItem[]
+  total: number
+  page: number
+  pageSize: number
+}
+
 export type TrajectoryOutcome =
-  | 'success'
-  | 'failure'
-  | 'partial'
-  | 'unknown'
-  | 'unfinished'
+  'success' | 'failure' | 'partial' | 'unknown' | 'unfinished'
 
 export type OutcomeCount = {
   outcome: TrajectoryOutcome

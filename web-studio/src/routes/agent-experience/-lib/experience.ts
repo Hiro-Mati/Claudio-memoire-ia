@@ -50,18 +50,15 @@ function readString(value: unknown): string | undefined {
   return typeof value === 'string' && value ? value : undefined
 }
 
-/** Normalize `GET /api/v1/fs/ls` output into experience file items. */
 export function normalizeExperienceFiles(value: unknown): ExperienceFileItem[] {
   if (!Array.isArray(value)) return []
 
   return value.flatMap((raw) => {
     const entry = isRecord(raw) ? raw : null
     if (!entry || entry.isDir === true) return []
-
     const name = readString(entry.name)
     const uri = readString(entry.uri)
     if (!name || !uri) return []
-
     return [
       {
         name,
@@ -99,8 +96,8 @@ export function normalizeTrajectoryPage(
   })
 
   const total = typeof result.total === 'number' ? result.total : items.length
-  const offset = typeof result.offset === 'number' ? result.offset : 0
   const limit = typeof result.limit === 'number' ? result.limit : items.length
+  const offset = typeof result.offset === 'number' ? result.offset : 0
 
   return {
     experienceUri: readString(result.experience_uri) ?? experienceUri,
@@ -213,13 +210,6 @@ export type SourceTrajectoryLink = {
   reason?: string
 }
 
-/**
- * Normalize Experience `memory.links` returned by `GET /api/v1/fs/attrs`.
- *
- * Experience source trajectories are stored as forward `derived_from` links
- * (`experience -> trajectory`). Other memory relations are intentionally not
- * shown in the source trace panel.
- */
 export function normalizeSourceTrajectoryLinks(
   value: unknown,
 ): SourceTrajectoryLink[] {
@@ -233,9 +223,7 @@ export function normalizeSourceTrajectoryLinks(
     const link = isRecord(raw) ? raw : null
     const uri = link ? readString(link.to_uri) : undefined
     const linkType = link ? readString(link.link_type) : undefined
-
     if (
-      !link ||
       !uri ||
       linkType !== 'derived_from' ||
       !uri.includes('/memories/trajectories/') ||
@@ -243,9 +231,8 @@ export function normalizeSourceTrajectoryLinks(
     ) {
       return []
     }
-
     seen.add(uri)
-    const reason = readString(link.description) ?? readString(link.match_text)
+    const reason = readString(link?.description) ?? readString(link?.match_text)
     return [{ uri, reason } satisfies SourceTrajectoryLink]
   })
 }

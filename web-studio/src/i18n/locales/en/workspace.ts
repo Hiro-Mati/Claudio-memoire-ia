@@ -229,11 +229,17 @@ const workspace = {
     updated: 'Updated {{time}}',
     updatedBadge: 'Updated',
     columnFile: 'Experience file',
-    columnApplied: 'Applied',
     columnUpdated: 'Updated',
     columnActions: 'Actions',
     viewAnalysis: 'Impact',
     openDetail: 'View impact for {{name}}',
+    pagination: {
+      summary: '{{total}} total, page {{page}} of {{pageCount}}',
+      pageSize: 'Rows per page',
+      pageSizeValue: '{{count}} / page',
+      previous: 'Previous',
+      next: 'Next',
+    },
     help: {
       title: 'No experiences yet? Check:',
       reasonConnected: 'Whether the Agent is connected to OpenViking',
@@ -260,6 +266,7 @@ const workspace = {
     detail: {
       back: 'Back',
       copyUri: 'Copy URI',
+      openPlayground: 'Open in Workbench',
       copied: 'Copied',
       copyFailed: 'Copy failed',
       contentTitle: 'Experience content',

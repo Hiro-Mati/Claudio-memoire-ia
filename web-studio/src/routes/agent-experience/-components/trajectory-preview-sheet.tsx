@@ -12,7 +12,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from '#/components/ui/sheet'
-import { fetchContent } from '../-lib/api'
+import { fetchTrajectoryContent } from '../-lib/api'
 import { formatTimestamp } from '../-lib/experience'
 import type { TrajectoryItem } from '../-lib/types'
 
@@ -29,7 +29,8 @@ export function TrajectoryPreviewSheet({
   const { t } = useTranslation('agentExperiencePage')
   const contentQuery = useQuery({
     enabled: Boolean(trajectory),
-    queryFn: ({ signal }) => fetchContent(trajectory?.uri ?? '', signal),
+    queryFn: ({ signal }) =>
+      fetchTrajectoryContent(trajectory?.uri ?? '', signal),
     queryKey: ['agent-experience-trajectory-content', trajectory?.uri],
     staleTime: 60_000,
   })

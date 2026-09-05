@@ -11,18 +11,15 @@ import type { SourceTrajectoryLink } from './experience'
 import type {
   AgentEvolutionStatus,
   ExperienceFileItem,
+  ExperiencePage,
   OutcomeDistribution,
   TimeRange,
   TrajectoryPage,
 } from './types'
 
-/**
- * List experience memory files under `viking://user/<userId>/memories/experiences`.
- *
- * A 404 means the directory has not been created yet (no experience has ever
- * been extracted), which is surfaced as an empty list instead of an error.
- */
-export async function fetchExperiences(
+const EXPERIENCE_LIST_LIMIT = 1000
+
+async function fetchExperienceFiles(
   experiencesUri: string,
   signal?: AbortSignal,
 ): Promise<ExperienceFileItem[]> {
@@ -30,7 +27,7 @@ export async function fetchExperiences(
     const result = await getOvResult<unknown>(
       ovClient.client.get({
         query: {
-          node_limit: 1000,
+          node_limit: EXPERIENCE_LIST_LIMIT,
           output: 'original',
           sort_by: 'mtime',
           sort_order: 'desc',
@@ -42,25 +39,45 @@ export async function fetchExperiences(
     )
     return normalizeExperienceFiles(result)
   } catch (error) {
-    if (isOvClientError(error) && error.statusCode === 404) {
-      return []
-    }
+    if (isOvClientError(error) && error.statusCode === 404) return []
     throw error
   }
 }
 
-/** Read the markdown content of an experience or trajectory file. */
+/** List and page Experience files from a self-hosted OpenViking server. */
+export async function fetchExperiences(options: {
+  experiencesUri: string
+  keyword: string
+  page: number
+  pageSize: number
+  signal?: AbortSignal
+}): Promise<ExperiencePage> {
+  const { experiencesUri, keyword, page, pageSize, signal } = options
+  const allItems = await fetchExperienceFiles(experiencesUri, signal)
+  const normalizedKeyword = keyword.trim().toLocaleLowerCase()
+  const filteredItems = normalizedKeyword
+    ? allItems.filter(
+        (item) =>
+          item.name.toLocaleLowerCase().includes(normalizedKeyword) ||
+          item.uri.toLocaleLowerCase().includes(normalizedKeyword),
+      )
+    : allItems
+  const offset = (page - 1) * pageSize
+  return {
+    items: filteredItems.slice(offset, offset + pageSize),
+    total: filteredItems.length,
+    page,
+    pageSize,
+  }
+}
+
 export async function fetchContent(
   uri: string,
   signal?: AbortSignal,
 ): Promise<string> {
   const result = await getOvResult<unknown>(
     ovClient.client.get({
-      query: {
-        limit: -1,
-        offset: 0,
-        uri,
-      },
+      query: { limit: -1, offset: 0, uri },
       signal,
       url: '/api/v1/content/read',
     }),
@@ -74,10 +91,6 @@ export async function fetchContent(
   return ''
 }
 
-/**
- * Query trajectories produced by commits that read the experience
- * (`GET /api/v1/agent-evolution/experiences/trajectories`).
- */
 export async function fetchTrajectories(options: {
   experienceUri: string
   limit?: number
@@ -92,7 +105,6 @@ export async function fetchTrajectories(options: {
     timeRange,
     signal,
   } = options
-
   const result = await getOvResult<unknown>(
     ovClient.client.get({
       query: {
@@ -118,17 +130,12 @@ export async function fetchTrajectories(options: {
   )
 }
 
-/**
- * Query the outcome distribution of trajectories that applied the experience
- * (`GET /api/v1/agent-evolution/experiences/outcomes`).
- */
 export async function fetchOutcomeDistribution(options: {
   experienceUri: string
   timeRange?: TimeRange
   signal?: AbortSignal
 }): Promise<OutcomeDistribution> {
   const { experienceUri, timeRange, signal } = options
-
   const result = await getOvResult<unknown>(
     ovClient.client.get({
       query: {
@@ -143,10 +150,6 @@ export async function fetchOutcomeDistribution(options: {
   return normalizeOutcomeDistribution(result, experienceUri)
 }
 
-/**
- * Read the Experience memory attributes and return the trajectories from
- * which it was derived.
- */
 export async function fetchSourceTrajectories(
   uri: string,
   signal?: AbortSignal,
@@ -161,18 +164,11 @@ export async function fetchSourceTrajectories(
   return normalizeSourceTrajectoryLinks(result)
 }
 
-/**
- * Read the deployment/account Agent Evolution switch
- * (`GET /api/v1/admin/agent-evolution`). Requires an admin or root API key.
- */
 export async function fetchAgentEvolutionStatus(
   signal?: AbortSignal,
 ): Promise<AgentEvolutionStatus> {
   const result = await getOvResult<unknown>(
-    ovClient.client.get({
-      signal,
-      url: '/api/v1/admin/agent-evolution',
-    }),
+    ovClient.client.get({ signal, url: '/api/v1/admin/agent-evolution' }),
   )
   const record =
     result && typeof result === 'object'
@@ -185,10 +181,6 @@ export async function fetchAgentEvolutionStatus(
   }
 }
 
-/**
- * Toggle the Agent Evolution switch
- * (`PUT /api/v1/admin/agent-evolution`). Requires an admin or root API key.
- */
 export async function setAgentEvolutionEnabled(
   enabled: boolean,
 ): Promise<AgentEvolutionStatus> {
@@ -208,3 +200,5 @@ export async function setAgentEvolutionEnabled(
       typeof record.account_id === 'string' ? record.account_id : undefined,
   }
 }
+
+export const fetchTrajectoryContent = fetchContent

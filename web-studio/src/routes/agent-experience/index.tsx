@@ -7,7 +7,6 @@ import {
   LoaderCircleIcon,
   MessageSquareTextIcon,
   RefreshCwIcon,
-  RouteIcon,
   SearchIcon,
   XIcon,
 } from 'lucide-react'
@@ -18,6 +17,21 @@ import { Button } from '#/components/ui/button'
 import { Card } from '#/components/ui/card'
 import { Input } from '#/components/ui/input'
 import {
+  Pagination,
+  PaginationContent,
+  PaginationItem,
+  PaginationLink,
+  PaginationNext,
+  PaginationPrevious,
+} from '#/components/ui/pagination'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '#/components/ui/select'
+import {
   Table,
   TableBody,
   TableCell,
@@ -27,10 +41,10 @@ import {
 } from '#/components/ui/table'
 import { useAppConnection } from '#/hooks/use-app-connection'
 import { isOvClientError } from '#/lib/ov-client'
+import { cn } from '#/lib/utils'
 
 import { EvolutionSettingsPopover } from './-components/evolution-settings-popover'
 import { ExperiencePreviewSheet } from './-components/experience-preview-sheet'
-import { useExperienceTrajectoryTotal } from './-hooks/use-experience-trajectory-total'
 import { fetchExperiences } from './-lib/api'
 import {
   buildExperiencesUri,
@@ -107,35 +121,100 @@ function EmptyHelpChecklist() {
   )
 }
 
-function TrajectoryTotalCell({
-  experienceUri,
-  identityScopeKey,
+const EXPERIENCE_PAGE_SIZE_OPTIONS = [20, 50, 100] as const
+
+function ExperiencePagination({
+  onPageChange,
+  onPageSizeChange,
+  page,
+  pageCount,
+  pageSize,
+  total,
 }: {
-  experienceUri: string
-  identityScopeKey: string
+  onPageChange: (page: number) => void
+  onPageSizeChange: (pageSize: number) => void
+  page: number
+  pageCount: number
+  pageSize: number
+  total: number
 }) {
   const { t } = useTranslation('agentExperiencePage')
-  const { isPending, total } = useExperienceTrajectoryTotal(
-    experienceUri,
-    identityScopeKey,
+  const start = Math.max(1, Math.min(page - 2, pageCount - 4))
+  const end = Math.min(pageCount, start + 4)
+  const pages = Array.from(
+    { length: Math.max(0, end - start + 1) },
+    (_, index) => start + index,
   )
 
-  if (isPending) {
-    return (
-      <span className="flex items-center gap-1 text-xs text-muted-foreground">
-        <LoaderCircleIcon className="size-3 animate-spin" />
-      </span>
-    )
-  }
-  if (total === undefined) return <span className="text-xs">-</span>
-  if (total === 0)
-    return <span className="text-xs text-muted-foreground">0</span>
-
   return (
-    <span className="inline-flex items-center gap-1 text-xs font-medium text-primary">
-      <RouteIcon className="size-3" />
-      {t('detail.totalApplied', { count: total })}
-    </span>
+    <div className="flex flex-col gap-3 border-t px-5 py-3 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex flex-wrap items-center justify-center gap-3 sm:justify-start">
+        <p className="text-sm text-muted-foreground">
+          {t('pagination.summary', { page, pageCount, total })}
+        </p>
+        <Select
+          value={String(pageSize)}
+          onValueChange={(value) => onPageSizeChange(Number(value))}
+        >
+          <SelectTrigger size="sm" aria-label={t('pagination.pageSize')}>
+            <SelectValue>
+              {t('pagination.pageSizeValue', { count: pageSize })}
+            </SelectValue>
+          </SelectTrigger>
+          <SelectContent>
+            {EXPERIENCE_PAGE_SIZE_OPTIONS.map((option) => (
+              <SelectItem key={option} value={String(option)}>
+                {t('pagination.pageSizeValue', { count: option })}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+      <Pagination className="mx-0 w-auto justify-center sm:justify-end">
+        <PaginationContent>
+          <PaginationItem>
+            <PaginationPrevious
+              href="#"
+              text={t('pagination.previous')}
+              aria-disabled={page <= 1}
+              className={cn(page <= 1 && 'pointer-events-none opacity-50')}
+              onClick={(event) => {
+                event.preventDefault()
+                if (page > 1) onPageChange(page - 1)
+              }}
+            />
+          </PaginationItem>
+          {pages.map((item) => (
+            <PaginationItem key={item}>
+              <PaginationLink
+                href="#"
+                isActive={item === page}
+                onClick={(event) => {
+                  event.preventDefault()
+                  onPageChange(item)
+                }}
+              >
+                {item}
+              </PaginationLink>
+            </PaginationItem>
+          ))}
+          <PaginationItem>
+            <PaginationNext
+              href="#"
+              text={t('pagination.next')}
+              aria-disabled={page >= pageCount}
+              className={cn(
+                page >= pageCount && 'pointer-events-none opacity-50',
+              )}
+              onClick={(event) => {
+                event.preventDefault()
+                if (page < pageCount) onPageChange(page + 1)
+              }}
+            />
+          </PaginationItem>
+        </PaginationContent>
+      </Pagination>
+    </div>
   )
 }
 
@@ -143,26 +222,41 @@ function AgentExperienceRoute() {
   const { t, i18n } = useTranslation('agentExperiencePage')
   const { connection, identityScopeKey } = useAppConnection()
   const [keyword, setKeyword] = React.useState('')
+  const [page, setPage] = React.useState(1)
+  const [pageSize, setPageSize] = React.useState(50)
   const [previewExperience, setPreviewExperience] =
     React.useState<ExperienceFileItem | null>(null)
 
   const experiencesUri = buildExperiencesUri(connection.userId)
   const experiencesQuery = useQuery({
-    queryFn: ({ signal }) => fetchExperiences(experiencesUri, signal),
-    queryKey: ['agent-experience-list', identityScopeKey, experiencesUri],
+    placeholderData: (previousData) => previousData,
+    queryFn: ({ signal }) =>
+      fetchExperiences({
+        experiencesUri,
+        keyword: keyword.trim(),
+        page,
+        pageSize,
+        signal,
+      }),
+    queryKey: [
+      'agent-experience-list',
+      identityScopeKey,
+      experiencesUri,
+      keyword.trim(),
+      page,
+      pageSize,
+    ],
     staleTime: 30_000,
   })
 
-  const experiences = experiencesQuery.data ?? []
+  const experiences = experiencesQuery.data?.items ?? []
+  const total = experiencesQuery.data?.total ?? 0
+  const pageCount = Math.max(1, Math.ceil(total / pageSize))
   const normalizedKeyword = keyword.trim().toLocaleLowerCase()
-  const visibleExperiences = React.useMemo(() => {
-    if (!normalizedKeyword) return experiences
-    return experiences.filter(
-      (experience) =>
-        experience.name.toLocaleLowerCase().includes(normalizedKeyword) ||
-        experience.uri.toLocaleLowerCase().includes(normalizedKeyword),
-    )
-  }, [experiences, normalizedKeyword])
+
+  React.useEffect(() => {
+    if (page > pageCount) setPage(pageCount)
+  }, [page, pageCount])
 
   // Snapshot "updated since last visit" badges when the list settles, then
   // mark the whole list as seen. Comparing against the pre-visit snapshot
@@ -210,9 +304,9 @@ function AgentExperienceRoute() {
             <h1 className="text-2xl font-semibold tracking-tight">
               {t('title')}
             </h1>
-            {experiences.length > 0 ? (
+            {total > 0 ? (
               <Badge variant="outline" className="font-normal">
-                {experiences.length}
+                {total}
               </Badge>
             ) : null}
           </div>
@@ -284,7 +378,7 @@ function AgentExperienceRoute() {
             )}
           </div>
         </Card>
-      ) : experiences.length === 0 ? (
+      ) : experiences.length === 0 && !keyword.trim() ? (
         <Card className="min-h-56 items-center justify-center px-6 text-center">
           <div className="flex size-10 items-center justify-center rounded-xl bg-primary/10 text-primary">
             <BrainCircuitIcon className="size-5" />
@@ -321,14 +415,20 @@ function AgentExperienceRoute() {
                 name="agent-experience-search"
                 placeholder={t('searchPlaceholder')}
                 value={keyword}
-                onChange={(event) => setKeyword(event.target.value)}
+                onChange={(event) => {
+                  setKeyword(event.target.value)
+                  setPage(1)
+                }}
               />
               {keyword ? (
                 <button
                   type="button"
                   aria-label={t('searchClear')}
                   className="absolute top-1/2 right-2 flex size-6 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                  onClick={() => setKeyword('')}
+                  onClick={() => {
+                    setKeyword('')
+                    setPage(1)
+                  }}
                 >
                   <XIcon className="size-3.5" />
                 </button>
@@ -340,7 +440,7 @@ function AgentExperienceRoute() {
           </div>
 
           <Card size="sm" className="px-0">
-            {visibleExperiences.length === 0 ? (
+            {experiences.length === 0 ? (
               <div className="grid min-h-40 place-items-center px-6 py-8 text-center">
                 <div className="grid max-w-md gap-1">
                   <p className="font-medium">{t('searchNoResults')}</p>
@@ -354,7 +454,6 @@ function AgentExperienceRoute() {
                 <TableHeader>
                   <TableRow>
                     <TableHead className="pl-5">{t('columnFile')}</TableHead>
-                    <TableHead className="w-36">{t('columnApplied')}</TableHead>
                     <TableHead className="w-44">{t('columnUpdated')}</TableHead>
                     <TableHead className="w-28 pr-5 text-right">
                       {t('columnActions')}
@@ -362,7 +461,7 @@ function AgentExperienceRoute() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {visibleExperiences.map((experience) => {
+                  {experiences.map((experience) => {
                     const updated = formatTimestamp(
                       experience.modTime,
                       i18n.language,
@@ -408,12 +507,6 @@ function AgentExperienceRoute() {
                             </span>
                           </div>
                         </TableCell>
-                        <TableCell className="w-36">
-                          <TrajectoryTotalCell
-                            experienceUri={experience.uri}
-                            identityScopeKey={identityScopeKey}
-                          />
-                        </TableCell>
                         <TableCell className="w-44 text-sm text-muted-foreground">
                           {updated ? t('updated', { time: updated }) : '-'}
                         </TableCell>
@@ -445,6 +538,19 @@ function AgentExperienceRoute() {
                 </TableBody>
               </Table>
             )}
+            {total > 0 ? (
+              <ExperiencePagination
+                page={page}
+                pageCount={pageCount}
+                pageSize={pageSize}
+                total={total}
+                onPageChange={setPage}
+                onPageSizeChange={(nextPageSize) => {
+                  setPageSize(nextPageSize)
+                  setPage(1)
+                }}
+              />
+            ) : null}
           </Card>
         </>
       )}

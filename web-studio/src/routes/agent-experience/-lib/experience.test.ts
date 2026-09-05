@@ -10,9 +10,7 @@ import {
   getExperienceDisplayName,
   isExperienceUpdatedSinceLastSeen,
   markExperiencesSeen,
-  normalizeExperienceFiles,
   normalizeOutcomeDistribution,
-  normalizeSourceTrajectoryLinks,
   normalizeTrajectoryPage,
   resolveTimeRange,
 } from './experience'
@@ -61,40 +59,6 @@ describe('getExperienceDisplayName', () => {
     expect(
       getExperienceDisplayName('viking://user/default/memories/experiences/x'),
     ).toBe('x')
-  })
-})
-
-describe('normalizeExperienceFiles', () => {
-  it('keeps only file entries with name and uri', () => {
-    const entries = [
-      {
-        name: 'exchange.md',
-        uri: 'viking://user/u/memories/experiences/exchange.md',
-        modTime: '2026-08-05T02:00:00Z',
-      },
-      {
-        name: 'subdir',
-        uri: 'viking://user/u/memories/experiences/subdir',
-        isDir: true,
-      },
-      { name: '', uri: 'viking://user/u/memories/experiences/.md' },
-      'not-an-object',
-    ]
-
-    const result = normalizeExperienceFiles(entries)
-    expect(result).toHaveLength(1)
-    expect(result[0]).toEqual({
-      name: 'exchange.md',
-      uri: 'viking://user/u/memories/experiences/exchange.md',
-      modTime: '2026-08-05T02:00:00Z',
-      size: undefined,
-    })
-  })
-
-  it('returns an empty list for non-array payloads', () => {
-    expect(normalizeExperienceFiles(undefined)).toEqual([])
-    expect(normalizeExperienceFiles({})).toEqual([])
-    expect(normalizeExperienceFiles(null)).toEqual([])
   })
 })
 
@@ -228,56 +192,6 @@ describe('resolveTimeRange', () => {
       startDate: '2026-08-28',
       endDate: '2026-09-03',
     })
-  })
-})
-
-describe('normalizeSourceTrajectoryLinks', () => {
-  it('keeps unique derived-from trajectory links from memory attrs', () => {
-    expect(
-      normalizeSourceTrajectoryLinks({
-        attrs: {
-          memory: {
-            links: [
-              {
-                to_uri: 'viking://user/u/memories/trajectories/t1.md',
-                link_type: 'derived_from',
-                description: 'distilled',
-              },
-              {
-                to_uri: 'viking://user/u/memories/trajectories/t2.md',
-                link_type: 'derived_from',
-              },
-              {
-                to_uri: 'viking://user/u/memories/trajectories/t1.md',
-                link_type: 'derived_from',
-              },
-              {
-                to_uri: 'viking://user/u/memories/events/e1.md',
-                link_type: 'derived_from',
-              },
-              {
-                to_uri: 'viking://user/u/memories/trajectories/t3.md',
-                link_type: 'evolved_from',
-              },
-            ],
-          },
-        },
-      }),
-    ).toEqual([
-      {
-        uri: 'viking://user/u/memories/trajectories/t1.md',
-        reason: 'distilled',
-      },
-      { uri: 'viking://user/u/memories/trajectories/t2.md' },
-    ])
-  })
-
-  it('returns an empty list for malformed attrs payloads', () => {
-    expect(normalizeSourceTrajectoryLinks(undefined)).toEqual([])
-    expect(normalizeSourceTrajectoryLinks({})).toEqual([])
-    expect(
-      normalizeSourceTrajectoryLinks({ attrs: { memory: { links: {} } } }),
-    ).toEqual([])
   })
 })
 
