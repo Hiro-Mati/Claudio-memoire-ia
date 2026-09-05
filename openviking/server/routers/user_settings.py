@@ -15,10 +15,13 @@ from openviking.server.models import Response
 from openviking.server.user_config import (
     ResolvedAddTargets,
     delete_user_add_targets,
+    delete_user_context_contract,
     effective_resource_add_target,
     effective_skill_add_target,
     public_add_targets,
+    put_user_context_contract,
     read_user_add_targets,
+    read_user_context_contracts,
     write_user_add_targets,
 )
 from openviking_cli.exceptions import InvalidArgumentError, NotInitializedError
@@ -104,6 +107,35 @@ async def patch_add_locations(
     return Response(status="ok", result=await _response(request, _ctx)).model_dump(
         exclude_none=True
     )
+
+
+@router.get("/context-contracts")
+async def get_context_contracts(
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Named context contracts (recall defaults an agent declares once)."""
+    contracts = await read_user_context_contracts(_viking_fs(), _ctx)
+    return Response(status="ok", result={"contracts": contracts}).model_dump(exclude_none=True)
+
+
+@router.put("/context-contracts/{name}")
+async def put_context_contract(
+    name: str,
+    body: dict[str, Any],
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Create or replace one contract. Body: ContextContract fields (max_tokens, quotas, ...)."""
+    contracts = await put_user_context_contract(_viking_fs(), _ctx, name, body)
+    return Response(status="ok", result={"contracts": contracts}).model_dump(exclude_none=True)
+
+
+@router.delete("/context-contracts/{name}")
+async def delete_context_contract(
+    name: str,
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    contracts = await delete_user_context_contract(_viking_fs(), _ctx, name)
+    return Response(status="ok", result={"contracts": contracts}).model_dump(exclude_none=True)
 
 
 @router.delete("/add-locations")

@@ -259,6 +259,26 @@ async def _enqueue_direct_vectorization(
     )
 
 
+def _verify_archive_signature(zf: zipfile.ZipFile, base_name: str) -> Optional[dict[str, Any]]:
+    """Apply the federation policy (signature required / trusted signers) to one package."""
+    from openviking.storage.ovpack import signing
+
+    settings = signing.federation_settings()
+    manifest_bytes = zf.read(f"{base_name}/{OVPACK_MANIFEST_ZIP_LEAF}")
+    signer = signing.verify_package_signature(
+        zf,
+        base_name,
+        manifest_bytes,
+        require_signature=bool(settings.get("require_signature", False)),
+        trusted_public_keys=list(settings.get("trusted_public_keys") or []),
+    )
+    if signer:
+        logger.info(
+            "[ovpack] verified signature of %s by %s...", base_name, signer["public_key"][:16]
+        )
+    return signer
+
+
 async def import_ovpack(
     viking_fs,
     file_path: str,
@@ -299,6 +319,7 @@ async def import_ovpack(
 
         base_name = base_name_from_entries(infolist)
         manifest = read_manifest(zf, base_name)
+        _verify_archive_signature(zf, base_name)
         validate_manifest_root_matches_zip(manifest, base_name)
         root_uri = resolve_import_root_uri(parent, base_name, manifest)
         validate_import_scope_compatibility(manifest, root_uri)
@@ -475,11 +496,29 @@ async def _write_ovpack_archive(
             manifest["index"]["dense"] = dense_manifest
             zf.writestr(internal_zip_path(base_name, dense_manifest["path"]), dense_bytes)
 
-        zf.writestr(
-            f"{base_name}/{OVPACK_MANIFEST_ZIP_LEAF}",
-            json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8"),
+        manifest_bytes = json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2).encode(
+            "utf-8"
         )
+        zf.writestr(f"{base_name}/{OVPACK_MANIFEST_ZIP_LEAF}", manifest_bytes)
+        _sign_archive(zf, base_name, manifest_bytes)
     return to
+
+
+def _sign_archive(zf: zipfile.ZipFile, base_name: str, manifest_bytes: bytes) -> None:
+    """Embed an Ed25519 manifest signature when federation.signing_key_file is set."""
+    from openviking.storage.ovpack import signing
+
+    settings = signing.federation_settings()
+    key_file = settings.get("signing_key_file")
+    if not key_file:
+        return
+    key = signing.load_private_key(key_file)
+    record = signing.sign_manifest(manifest_bytes, key, key_id=settings.get("key_id"))
+    zf.writestr(
+        signing.signature_zip_path(base_name),
+        json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8"),
+    )
+    logger.info("[ovpack] signed %s with key %s...", base_name, record["public_key"][:16])
 
 
 async def export_ovpack(

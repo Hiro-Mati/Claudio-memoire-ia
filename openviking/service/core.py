@@ -60,6 +60,16 @@ if TYPE_CHECKING:
     from openviking.session.compressor_v3 import SessionCompressorV3
 
 
+QUEUE_ROLE_ENV = "OPENVIKING_QUEUE_ROLE"
+QUEUE_ROLES = ("all", "api", "worker")
+
+
+def queue_consumers_enabled() -> bool:
+    """Whether this process should run QueueFS consumers (see server.queue_role)."""
+    role = os.environ.get(QUEUE_ROLE_ENV, "all").strip().lower() or "all"
+    return role != "api"
+
+
 class OpenVikingService:
     """
     OpenViking main service class.
@@ -219,7 +229,16 @@ class OpenVikingService:
             return
 
         # contention (see https://github.com/volcengine/OpenViking/issues/473).
-        if not self._config.storage.skip_process_lock:
+        # Split roles (api + worker processes) share one workspace on purpose:
+        # QueueFS and RAGFS path locks coordinate them, so the exclusive
+        # workspace lock only applies to the single-process "all" role.
+        split_role = os.environ.get(QUEUE_ROLE_ENV, "all").strip().lower() not in ("", "all")
+        if split_role:
+            logger.info(
+                "Workspace process lock skipped: role %s cooperates with other processes",
+                os.environ.get(QUEUE_ROLE_ENV),
+            )
+        elif not self._config.storage.skip_process_lock:
             from openviking.utils.process_lock import acquire_data_dir_lock
 
             self._data_dir_lock_path = acquire_data_dir_lock(self._config.storage.workspace)
@@ -506,8 +525,14 @@ class OpenVikingService:
             logger.info("WatchScheduler disabled by config (enable_watch_scheduler=false)")
 
         if self._queue_manager:
-            self._queue_manager.start()
-            logger.info("QueueManager workers started")
+            if queue_consumers_enabled():
+                self._queue_manager.start()
+                logger.info("QueueManager workers started")
+            else:
+                logger.info(
+                    "QueueManager consumers disabled in this process "
+                    "(OPENVIKING_QUEUE_ROLE=api); a worker process must run them"
+                )
 
         # Preflight the MinerU endpoint when it will be used, so endpoint
         # misconfiguration or a stopped service surfaces now instead of on the

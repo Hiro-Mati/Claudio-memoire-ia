@@ -147,12 +147,32 @@ class UserConfig(BaseModel):
 
     add_targets: AddTargetsConfig = Field(default_factory=AddTargetsConfig)
     memory_policy: Optional[Dict[str, Any]] = None
+    context_contracts: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     agent_evolution: DeprecatedUserAgentEvolutionConfig = Field(
         default_factory=DeprecatedUserAgentEvolutionConfig,
         exclude=True,
     )
 
     model_config = {"extra": "forbid"}
+
+    @field_validator("context_contracts", mode="before")
+    @classmethod
+    def validate_context_contracts(cls, value: Any) -> Dict[str, Dict[str, Any]]:
+        if not value:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("context_contracts must be an object")
+        from openviking.retrieve.context_assembler.contracts import (
+            ContextContract,
+            validate_contract_name,
+        )
+
+        validated: Dict[str, Dict[str, Any]] = {}
+        for name, contract in value.items():
+            validated[validate_contract_name(str(name))] = ContextContract.model_validate(
+                contract or {}
+            ).model_dump(exclude_none=True)
+        return validated
 
     @field_validator("memory_policy", mode="before")
     @classmethod
@@ -328,6 +348,11 @@ class ServerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 1933
     workers: int = 1
+    # Process role: "all" serves HTTP and consumes queues (default); "api" serves
+    # HTTP only, leaving semantic/embedding/session work to worker processes;
+    # "worker" consumes queues without binding a port. QueueFS is shared on disk,
+    # so api and worker processes cooperate on the same workspace.
+    queue_role: str = "all"
     # Seconds an idle HTTP keep-alive connection is kept open before the server
     # closes it. Defaults to 5 to match uvicorn's built-in default and preserve
     # the existing service behavior. Raise it above the idle-connection lifetime

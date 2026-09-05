@@ -1708,6 +1708,38 @@ openviking add-resource ./docs --exclude "*.tmp"
 
 See [Deployment](./03-deployment.md) for details.
 
+## federation Section
+
+Signed OVPack exchange between OpenViking servers. Exports embed an Ed25519
+signature of the package manifest (`_ovpack/manifest.sig.json`, public key
+included); imports verify any embedded signature and apply the policy below.
+
+```bash
+python -m openviking.storage.ovpack.signing --generate ~/.openviking/federation.key
+python -m openviking.storage.ovpack.signing --public-key ~/.openviking/federation.key
+```
+
+```json
+{
+  "federation": {
+    "signing_key_file": "~/.openviking/federation.key",
+    "key_id": "laptop",
+    "trusted_public_keys": ["<peer public key hex>"],
+    "require_signature": false
+  }
+}
+```
+
+| Field | Type | Description | Default |
+|-------|------|-------------|---------|
+| `signing_key_file` | str | Ed25519 private key (32 raw bytes, hex text, or PEM). When set, every exported `.ovpack` is signed. | `null` |
+| `key_id` | str | Optional label recorded next to the signature. | `null` |
+| `trusted_public_keys` | list | Accepted signer public keys (hex). Empty accepts any valid signature. | `[]` |
+| `require_signature` | bool | Reject unsigned packages on import. | `false` |
+
+A tampered manifest, a signature that does not verify, or an untrusted
+signer fails the import before any content is written.
+
 ## server Section
 
 When running OpenViking as an HTTP service, add a `server` section to `ov.conf`:
@@ -1748,6 +1780,7 @@ When running OpenViking as an HTTP service, add a `server` section to `ov.conf`:
 |-------|------|-------------|---------|
 | `host` | str | Bind address | `127.0.0.1` |
 | `port` | int | Bind port | `1933` |
+| `queue_role` | str | Process role. `"all"` serves HTTP and consumes QueueFS work (default). `"api"` serves HTTP only and leaves semantic, embedding and session-commit work to worker processes. `"worker"` (or `openviking-server --role worker`) consumes queues without binding a port. Split roles share one workspace and need a multi-process vector backend (`storage.vectordb.backend = "volcengine"`); the embedded `local` engine is single-process and the server refuses split roles with it. | `"all"` |
 | `auth_mode` | str | Authentication mode: `"api_key"` or `"trusted"`. Default is `"api_key"` | `"api_key"` |
 | `root_api_key` | str | Root API key for multi-tenant auth in `api_key` mode. In `trusted` mode it is optional on localhost, but required for any non-localhost deployment; it does not become the source of user identity | `null` |
 | `profile_enabled` | bool | Whether to allow request-scoped cProfile via `profile=1` on HTTP requests. When disabled, the server ignores that query parameter. When enabled, the CLI can display the returned `profile`, while the Python HTTP client currently triggers profiling but does not automatically attach the top-level `profile` field to most SDK return values. | `false` |

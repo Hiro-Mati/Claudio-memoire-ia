@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Bootstrap script for OpenViking HTTP Server."""
 
-import asyncio
 import argparse
+import asyncio
 import json
 import os
 import shutil
@@ -13,7 +13,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import uvicorn
 
@@ -164,6 +164,15 @@ def main():
         help="Number of uvicorn worker processes (default: 1, or server.workers in ov.conf)",
     )
     parser.add_argument(
+        "--role",
+        choices=["all", "api", "worker"],
+        default=None,
+        help=(
+            "Process role: all (HTTP + queue consumers, default), api (HTTP only), "
+            "worker (queue consumers only, no HTTP). Overrides server.queue_role."
+        ),
+    )
+    parser.add_argument(
         "--bot",
         "--with-bot",
         action="store_true",
@@ -237,6 +246,7 @@ def main():
     # 🔍 Authentication health check - CRITICAL: will exit if check fails
     try:
         from openviking.server.auth.health_check import run_startup_health_check_or_exit
+
         asyncio.run(run_startup_health_check_or_exit(config))
     except Exception as e:
         # Don't fail startup if health check itself has issues
@@ -271,6 +281,31 @@ def main():
         config.port = args.port
     if args.workers is not None:
         config.workers = args.workers
+    if args.role is not None:
+        config.queue_role = args.role
+    role = (config.queue_role or "all").strip().lower()
+    if role not in ("all", "api", "worker"):
+        print(f"Error: invalid queue_role {config.queue_role!r}", file=sys.stderr)
+        sys.exit(1)
+    os.environ["OPENVIKING_QUEUE_ROLE"] = role
+    if role != "all":
+        # The embedded vector engine is single-process; split roles need a
+        # backend both processes can open (storage.vectordb.backend = volcengine).
+        try:
+            vector_backend = OpenVikingConfigSingleton.get_instance().storage.vectordb.backend
+        except Exception:
+            vector_backend = "local"
+        if str(vector_backend).lower() == "local":
+            print(
+                f"Error: queue_role={role!r} needs a shared vector backend; "
+                "storage.vectordb.backend='local' is single-process. "
+                "Use role 'all', or configure the volcengine vector backend.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    if role == "worker":
+        _run_worker_process()
+        return
     if args.with_bot:
         config.with_bot = True
 
@@ -364,6 +399,42 @@ def _handle_vikingbot_failure(output: str, returncode: int) -> None:
 
     if output:
         print(f"\nDetailed error:\n{output}", file=sys.stderr)
+
+
+def _run_worker_process() -> None:
+    """Consume QueueFS work (semantic, embedding, session commit) without HTTP."""
+    import signal
+
+    from openviking.server.dependencies import set_service
+    from openviking.service.core import OpenVikingService
+
+    async def _main() -> None:
+        service = OpenVikingService()
+        set_service(service)
+        await service.initialize()
+        print("OpenViking worker is consuming queues (no HTTP). Press Ctrl+C to stop.")
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def _request_stop(*_args: Any) -> None:
+            loop.call_soon_threadsafe(stop.set)
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _request_stop)
+            except (NotImplementedError, RuntimeError):
+                signal.signal(sig, _request_stop)
+        try:
+            await stop.wait()
+        finally:
+            close = getattr(service, "close", None)
+            if callable(close):
+                await close()
+
+    try:
+        asyncio.run(_main())
+    except KeyboardInterrupt:
+        pass
 
 
 def _start_vikingbot_gateway(

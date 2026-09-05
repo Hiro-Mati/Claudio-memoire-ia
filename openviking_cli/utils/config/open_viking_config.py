@@ -22,6 +22,7 @@ from .consts import (
 )
 from .embedding_config import EmbeddingConfig
 from .encryption_config import EncryptionConfig
+from .federation_config import FederationConfig
 from .git_config import GitConfig
 from .grep_config import GrepConfig
 from .ingest_config import IngestConfig
@@ -199,6 +200,11 @@ class OpenVikingConfig(BaseModel):
 
     git: GitConfig = Field(
         default_factory=GitConfig, description="Git version control configuration"
+    )
+
+    federation: FederationConfig = Field(
+        default_factory=FederationConfig,
+        description="Signed OVPack exchange between OpenViking servers",
     )
 
     pdf: PDFConfig = Field(default_factory=PDFConfig, description="PDF parsing configuration")

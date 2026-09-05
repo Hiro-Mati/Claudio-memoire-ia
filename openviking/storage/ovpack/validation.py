@@ -365,8 +365,12 @@ def _validate_internal_members(
             continue
         actual_files.add(safe_zip_path)
 
+    # Optional internal members: a detached manifest signature (see signing.py).
+    from openviking.storage.ovpack.signing import SIGNATURE_ZIP_LEAF
+
+    optional_files = {internal_zip_path(base_name, SIGNATURE_ZIP_LEAF)}
     missing = sorted(expected_files - actual_files)
-    unexpected = sorted(actual_files - expected_files)
+    unexpected = sorted(actual_files - expected_files - optional_files)
     if missing or unexpected:
         raise InvalidArgumentError(
             "ovpack internal entries do not match manifest",

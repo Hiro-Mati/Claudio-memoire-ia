@@ -43,7 +43,11 @@ from openviking.utils.search_filters import (
     merge_search_filter,
 )
 from openviking.utils.tags import build_search_tags_filter
-from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
+from openviking_cli.exceptions import (
+    InvalidArgumentError,
+    NotFoundError,
+    NotInitializedError,
+)
 
 
 def _sanitize_floats(obj: Any) -> Any:
@@ -169,6 +173,7 @@ CONTEXT_ONLY_FIELDS = (
     "other_peer_penalty",
     "rewrite",
     "rewrite_max_bullets",
+    "contract",
 )
 
 
@@ -214,6 +219,11 @@ class SearchRequest(BaseModel):
     other_peer_penalty: Optional[Union[float, Dict[str, float]]] = None
     rewrite: Union[bool, Literal["auto"]] = False
     rewrite_max_bullets: int = Field(default=6, ge=1, le=20)
+    contract: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description="Name of a stored context contract whose values fill unset fields",
+    )
 
     @model_validator(mode="after")
     def _validate_mode(self) -> "SearchRequest":
@@ -292,6 +302,7 @@ class RecallRequest(BaseModel):
     exclude_uris: List[str] = Field(default_factory=list, max_length=MAX_EXCLUDE_URIS)
     rewrite: Union[bool, Literal["auto"]] = False
     rewrite_max_bullets: int = Field(default=6, ge=1, le=20)
+    contract: Optional[str] = Field(default=None, max_length=64)
 
     @model_validator(mode="after")
     def _validate_quotas(self) -> "RecallRequest":
@@ -380,6 +391,28 @@ def _context_ignored_fields(request: SearchRequest) -> List[str]:
     return ignored
 
 
+async def _apply_named_contract(
+    request: Any, ctx: RequestContext, service: Any
+) -> tuple[Any, List[str]]:
+    """Fill unset request fields from the stored contract named by ``request.contract``."""
+    name = getattr(request, "contract", None)
+    if not name:
+        return request, []
+    from openviking.retrieve.context_assembler.contracts import apply_contract
+    from openviking.server.user_config import read_user_context_contracts
+
+    viking_fs = getattr(service, "viking_fs", None)
+    if viking_fs is None:
+        raise NotInitializedError("VikingFS")
+    contracts = await read_user_context_contracts(viking_fs, ctx)
+    if name not in contracts:
+        raise NotFoundError(name, "context_contract")
+    merged, applied = apply_contract(
+        request.model_dump(), set(request.model_fields_set), contracts[name]
+    )
+    return type(request).model_validate(merged), applied
+
+
 async def _search_context(
     *,
     service: Any,
@@ -389,6 +422,9 @@ async def _search_context(
     actual_limit: int,
 ):
     """Assemble an injection-ready context block for one request."""
+    request, contract_fields = await _apply_named_contract(request, ctx, service)
+    if contract_fields and "limit" in contract_fields:
+        actual_limit = _resolve_search_limit(request.limit, request.node_limit)
     params = AssembleParams(
         query=request.query,
         image_url=_resolve_image_url(request.image_url, ctx),
@@ -417,6 +453,8 @@ async def _search_context(
     ignored = _context_ignored_fields(request)
     if ignored:
         result.stats["ignored"] = ignored
+    if contract_fields:
+        result.stats["contract"] = {"name": request.contract, "applied": contract_fields}
     return Response(
         status="ok",
         result=_sanitize_floats(result.to_dict()),
@@ -495,7 +533,10 @@ async def recall(
 ):
     """Deprecated preset over context assembly; use /search with mode="context"."""
     service = get_service()
-    params, aliases = fold_recall_request(request.model_dump(), request.model_fields_set)
+    request, contract_fields = await _apply_named_contract(request, _ctx, service)
+    params, aliases = fold_recall_request(
+        request.model_dump(exclude={"contract"}), request.model_fields_set - {"contract"}
+    )
     params.image_url = _resolve_image_url(params.image_url, _ctx)
     params.exclude_uris = _resolve_uri_list(params.exclude_uris, _ctx)
     execution = await run_operation(
@@ -505,6 +546,8 @@ async def recall(
     )
     result = execution.result
     result.stats["deprecated"] = deprecation_stats(aliases)
+    if contract_fields:
+        result.stats["contract"] = {"name": request.contract, "applied": contract_fields}
     response.headers["Deprecation"] = "true"
     response.headers["Link"] = '</api/v1/search/search>; rel="successor-version"'
     return Response(

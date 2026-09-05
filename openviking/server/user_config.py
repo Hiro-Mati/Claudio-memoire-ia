@@ -196,6 +196,51 @@ async def update_user_config(
         return result
 
 
+async def read_user_context_contracts(
+    viking_fs: VikingFS,
+    ctx: RequestContext,
+) -> dict[str, dict[str, Any]]:
+    return dict((await read_user_config(viking_fs, ctx)).context_contracts)
+
+
+async def put_user_context_contract(
+    viking_fs: VikingFS,
+    ctx: RequestContext,
+    name: str,
+    contract: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    from openviking.retrieve.context_assembler.contracts import (
+        ContextContract,
+        validate_contract_name,
+    )
+
+    try:
+        name = validate_contract_name(name)
+        body = ContextContract.model_validate(contract or {}).model_dump(exclude_none=True)
+    except Exception as exc:
+        raise InvalidArgumentError(str(exc)) from exc
+
+    def _update(current: UserConfig) -> dict[str, dict[str, Any]]:
+        current.context_contracts[name] = body
+        return dict(current.context_contracts)
+
+    return await update_user_config(viking_fs, ctx, _update)
+
+
+async def delete_user_context_contract(
+    viking_fs: VikingFS,
+    ctx: RequestContext,
+    name: str,
+) -> dict[str, dict[str, Any]]:
+    def _update(current: UserConfig) -> dict[str, dict[str, Any]]:
+        if name not in current.context_contracts:
+            raise NotFoundError(name, "context_contract")
+        del current.context_contracts[name]
+        return dict(current.context_contracts)
+
+    return await update_user_config(viking_fs, ctx, _update)
+
+
 async def write_user_config(
     viking_fs: VikingFS,
     ctx: RequestContext,

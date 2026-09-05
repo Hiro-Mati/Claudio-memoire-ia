@@ -1188,3 +1188,23 @@ results = client.search(
 - [Resources](02-resources.md) - Resource management
 - [Sessions](05-sessions.md) - Session context
 - [Context Layers](../concepts/03-context-layers.md) - L0/L1/L2
+
+## Context contracts
+
+An agent can store the recall defaults it accepts once, under a name, and
+reference them from every `mode="context"` search (or legacy `/recall`):
+
+```
+GET    /api/v1/user-settings/context-contracts
+PUT    /api/v1/user-settings/context-contracts/{name}   {"max_tokens": 1500, "purpose": "coding", "dedup_turns": 5}
+DELETE /api/v1/user-settings/context-contracts/{name}
+
+POST /api/v1/search/search   {"query": "...", "mode": "context", "contract": "claude-code"}
+```
+
+Contract fields: `max_tokens`, `quotas`, `purpose`, `detail`, `dedup_turns`,
+`peer_scope`, `other_peer_penalty`, `rewrite`, `rewrite_max_bullets`,
+`query_expansion`, `score_threshold`, `exclude_uris`, `limit`, `description`.
+Fields set explicitly on the request always win; the response reports the
+fields the contract supplied in `stats.contract.applied`. An unknown contract
+name is a `NOT_FOUND` error.
