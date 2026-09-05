@@ -339,6 +339,32 @@ def check_embedding() -> tuple[bool, str, Optional[str]]:
     return _probe_embedding_provider(embedding, dense)
 
 
+def check_file_summarizer() -> tuple[bool, str, Optional[str]]:
+    """Report the optional tiered file summarizer model (falls back to vlm)."""
+    config_path = _find_config()
+    if config_path is None:
+        return False, "Cannot check (no config file)", None
+    data = _load_config_json(config_path)
+    if data is None:
+        return False, "Cannot check (config unreadable)", None
+    raw = data.get("file_summarizer") or {}
+    if not raw:
+        return True, "not configured (file summaries use vlm)", None
+    normalized = VLMConfig.sync_provider_backend(dict(raw))
+    try:
+        summarizer = VLMConfig.model_validate(
+            normalized,
+            context={"root_model": VLMConfig, "field_path": ("file_summarizer",)},
+        )
+    except Exception as exc:
+        return False, f"Invalid file_summarizer config: {exc}", "Fix file_summarizer in ov.conf"
+    _, provider = summarizer.get_provider_config()
+    model = summarizer.model or ""
+    if not provider or not model:
+        return False, "file_summarizer needs provider and model", "Fix file_summarizer in ov.conf"
+    return True, f"{provider}/{model} (tiered summaries)", None
+
+
 def check_vlm() -> tuple[bool, str, Optional[str]]:
     """Load VLM config and verify it's configured."""
     config_path = _find_config()
@@ -418,13 +444,17 @@ def check_ollama() -> tuple[bool, str, Optional[str]]:
     dense = data.get("embedding", {}).get("dense", {})
     vlm = data.get("vlm", {})
     query_planner = data.get("query_planner") or {}
+    file_summarizer = data.get("file_summarizer") or {}
     uses_embedding = dense.get("provider") == "ollama"
     uses_vlm = vlm.get("provider") == "litellm" and (vlm.get("model", "")).startswith("ollama/")
     uses_query_planner = query_planner.get("provider") == "litellm" and (
         query_planner.get("model", "")
     ).startswith("ollama/")
 
-    if not uses_embedding and not uses_vlm and not uses_query_planner:
+    uses_file_summarizer = file_summarizer.get("provider") == "litellm" and (
+        file_summarizer.get("model", "")
+    ).startswith("ollama/")
+    if not uses_embedding and not uses_vlm and not uses_query_planner and not uses_file_summarizer:
         return True, "not configured", None
 
     from openviking_cli.utils.ollama import check_ollama_running, parse_ollama_url
@@ -681,6 +711,7 @@ _CHECKS = [
     ("Authentication", check_authentication),
     ("Embedding", check_embedding),
     ("VLM", check_vlm),
+    ("File summarizer", check_file_summarizer),
     ("Ollama", check_ollama),
     ("VikingBot", check_vikingbot),
     ("Disk", check_disk),

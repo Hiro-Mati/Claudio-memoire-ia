@@ -1003,9 +1003,13 @@ class SemanticProcessor(DequeueHandlerBase):
         llm_sem: asyncio.Semaphore,
         ctx: Optional[RequestContext] = None,
     ) -> Dict[str, Any]:
-        """Generate summary for a single text file (code, documentation, or other text)."""
+        """Generate summary for a single text file (code, documentation, or other text).
+
+        Uses the tiered ``file_summarizer`` model when configured (a small local
+        model is enough for one file); falls back to ``vlm`` otherwise.
+        """
         viking_fs = get_viking_fs()
-        vlm = get_openviking_config().vlm
+        vlm = get_openviking_config().get_file_summarizer()
         active_ctx = ctx or self._default_ctx
 
         content = await viking_fs.read_file(file_path, ctx=active_ctx)

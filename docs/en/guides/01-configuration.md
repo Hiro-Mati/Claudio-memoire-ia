@@ -810,6 +810,28 @@ For `ollama/guoxuter/ov_intent_analysis_sft:v7_q8` (and `v4_q8`), OpenViking aut
 
 This lets a small model handle retrieval planning with lower latency, while keeping a stronger `vlm` for semantic extraction, memory extraction, and multimodal processing.
 
+### file_summarizer
+
+Optional lightweight model for per-file summaries during semantic processing. It uses the same configuration shape as `vlm`, but only affects the summary generated for each text file before a directory overview is built. Directory overviews (L1), memory extraction and audio/video/image understanding keep using `vlm`. If `file_summarizer` is omitted or empty, OpenViking falls back to `vlm`.
+
+This tiering is what makes CPU-only machines practical: a sub-1B local model describes one file in seconds, and the larger `vlm` is only called once per directory.
+
+```json
+{
+  "file_summarizer": {
+    "provider": "litellm",
+    "model": "ollama/qwen3.5:0.8b",
+    "api_key": "no-key",
+    "api_base": "http://127.0.0.1:11434",
+    "temperature": 0.0,
+    "timeout": 120,
+    "extra_request_body": {"num_ctx": 8192, "think": false}
+  }
+}
+```
+
+`openviking-server doctor` reports the configured file summarizer (or that summaries fall back to `vlm`).
+
 ### feishu
 
 Configuration for Feishu/Lark cloud document parsing. See [Resources](../api/02-resources.md) for supported URL patterns.

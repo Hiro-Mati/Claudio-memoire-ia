@@ -38,3 +38,33 @@ Code : `openviking/storage/queuefs/semantic_ops/parent_refresh_scheduler.py`,
 `_SemanticMixin._maybe_schedule_lazy_parent_refresh`.
 
 Tests : `tests/storage/test_parent_refresh_scheduler.py`.
+
+## 2. Résumés par étages
+
+La génération sémantique appelle le VLM deux fois par niveau : une fois par
+fichier (résumé court qui alimente la vue d'ensemble) et une fois par dossier
+(vue d'ensemble L1, dont on extrait L0). Le résumé d'un fichier ne demande pas
+un gros modèle.
+
+La section optionnelle `file_summarizer` de `ov.conf`, de même forme que
+`vlm`, désigne le modèle utilisé pour les résumés de fichiers texte. Les vues
+d'ensemble de dossiers, l'extraction de mémoire et les médias restent sur
+`vlm`. Sans cette section, tout passe par `vlm` comme en amont.
+
+```json
+{
+  "file_summarizer": {
+    "provider": "litellm",
+    "model": "ollama/qwen3.5:0.8b",
+    "api_key": "no-key",
+    "api_base": "http://127.0.0.1:11434",
+    "temperature": 0.0,
+    "extra_request_body": {"num_ctx": 8192, "think": false}
+  }
+}
+```
+
+`openviking-server doctor` affiche le modèle retenu. Code :
+`OpenVikingConfig.get_file_summarizer()` et
+`SemanticProcessor._generate_text_summary`. Tests :
+`tests/storage/test_file_summarizer_tiering.py`.

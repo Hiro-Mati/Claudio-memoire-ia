@@ -171,6 +171,15 @@ class OpenVikingConfig(BaseModel):
         ),
     )
 
+    file_summarizer: Optional[VLMConfig] = Field(
+        default=None,
+        description=(
+            "Optional lightweight model configuration for per-file summaries during semantic "
+            "processing (L1 inputs). Directory overviews, memory extraction and media keep "
+            "using vlm. Falls back to vlm when unset or empty."
+        ),
+    )
+
     rerank: RerankConfig = Field(default_factory=RerankConfig, description="Rerank configuration")
 
     retrieval: RetrievalConfig = Field(
@@ -390,9 +399,7 @@ class OpenVikingConfig(BaseModel):
                 "and storage.agfs.cachefs.backend='cache'"
             )
         queuefs = agfs_value.get("queuefs")
-        if isinstance(queuefs, dict) and (
-            queuefs.get("backend") == "redis" or "redis" in queuefs
-        ):
+        if isinstance(queuefs, dict) and (queuefs.get("backend") == "redis" or "redis" in queuefs):
             raise ValueError(
                 "storage.agfs.queuefs backend='redis' and queuefs.redis have been removed; "
                 "use backend='cache' with top-level cache.provider/cache.params"
@@ -547,6 +554,16 @@ class OpenVikingConfig(BaseModel):
         """Return the model config used for retrieval intent analysis and query planning."""
         if self.query_planner is not None and self.query_planner._has_any_config():
             return self.query_planner
+        return self.vlm
+
+    def get_file_summarizer(self) -> VLMConfig:
+        """Return the model config used for per-file text summaries (tiered summarization).
+
+        A small local model is usually enough to describe one file; the larger
+        ``vlm`` is kept for directory overviews, memory extraction and media.
+        """
+        if self.file_summarizer is not None and self.file_summarizer._has_any_config():
+            return self.file_summarizer
         return self.vlm
 
 
