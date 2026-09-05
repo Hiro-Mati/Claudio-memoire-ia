@@ -1006,6 +1006,35 @@ Grep engine configuration for content pattern search. These settings are server-
 
 For VikingDB / Volcengine FullText grep, OpenViking writes a `content` text field for BM25 recall. The source context keeps the full content, while the vector-store write payload truncates this field to **1 MB** at the final adapter boundary to stay within backend payload limits. Only VikingDB-backed backends use `content`; on all other backends (`local`, `cuvs`, `http`) the field is not written.
 
+### semantic
+
+Controls the L0/L1 generation pipeline. Most fields bound prompt sizes; the
+`parent_refresh_*` fields control how a finished child directory refreshes its
+parent summary.
+
+```json
+{
+  "semantic": {
+    "abstract_max_chars": 256,
+    "overview_max_chars": 4000,
+    "overview_sample_limit": 32,
+    "freshness_refresh_ratio": 0.10,
+    "parent_refresh_mode": "eager",
+    "parent_refresh_debounce_s": 30
+  }
+}
+```
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `parent_refresh_mode` | str | `"eager"` enqueues the parent refresh as soon as a child directory finishes. `"debounced"` merges refreshes for the same parent and enqueues once after a quiet window. `"lazy"` only records the pending change and refreshes the parent the first time its abstract or overview is read. | `"eager"` |
+| `parent_refresh_debounce_s` | float | Quiet window used by the `debounced` mode. | `30` |
+
+`debounced` and `lazy` cut VLM calls on deep or busy trees at the price of a
+parent summary that lags behind its children for up to one window (or until
+the next read). The pending counter is persisted in the parent's sidecars, so
+a process restart never loses a refresh.
+
 ### storage
 
 Storage configuration for context data, including file storage (RAGFS) and vector database storage (VectorDB).

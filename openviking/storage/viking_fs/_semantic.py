@@ -9,7 +9,11 @@ from openviking.core.context import ContextLevel
 from openviking.core.retrieval_targets import resolve_retrieval_targets
 from openviking.server.error_mapping import is_not_found_error, map_exception
 from openviking.server.identity import RequestContext
-from openviking.storage.abstract_overview import body_for_preview, render_abstract_overview
+from openviking.storage.abstract_overview import (
+    body_for_preview,
+    parse_abstract_overview,
+    render_abstract_overview,
+)
 from openviking.storage.acl import AclAction
 from openviking.storage.viking_fs._base import (
     _ensure_filter_present,
@@ -78,6 +82,114 @@ class _SemanticMixin:
                 raise
         return f"# {uri} [Directory abstract is not ready]"
 
+    @staticmethod
+    def _lazy_refresh_context_type(uri: str) -> Optional[str]:
+        """Context type for a lazily refreshed directory, or None when excluded.
+
+        Only resource and skill trees take part in parent propagation; memory
+        and session directories keep their own dedicated update path.
+        """
+        normalized = uri.rstrip("/")
+        if normalized in {"viking://", "viking:", "viking://user", "viking://agent"}:
+            return None
+        if normalized.startswith("viking://resources"):
+            return "resource"
+        if normalized.startswith("viking://agent/skills"):
+            return "skill"
+        if normalized.startswith("viking://user/"):
+            rest = normalized[len("viking://user/") :]
+            parts = rest.split("/")
+            if len(parts) >= 2 and parts[1] == "resources":
+                return "resource"
+            if len(parts) >= 2 and parts[1] == "skills":
+                return "skill"
+        return None
+
+    async def _maybe_schedule_lazy_parent_refresh(
+        self,
+        uri: str,
+        path: str,
+        ctx: RequestContext,
+    ) -> None:
+        """In ``lazy`` parent refresh mode, refresh a directory whose summary is stale.
+
+        Called from the abstract/overview read path. A directory is stale when
+        its sidecar is missing, legacy, or carries ``pending_child_changes > 0``.
+        Scheduling goes through the coalescing scheduler so bursts of reads
+        enqueue a single refresh. Never raises: a scheduling problem must not
+        turn a read into an error.
+        """
+        try:
+            from openviking.storage.queuefs.semantic_ops.parent_refresh_scheduler import (
+                get_parent_refresh_scheduler,
+                resolve_parent_refresh_mode,
+            )
+            from openviking_cli.utils.config import get_openviking_config
+
+            semantic_config = get_openviking_config().semantic
+            if resolve_parent_refresh_mode(semantic_config) != "lazy":
+                return
+            context_type = self._lazy_refresh_context_type(uri)
+            if context_type is None:
+                return
+            stale = False
+            try:
+                raw = self._handle_agfs_read(await self._async_agfs.read(f"{path}/.abstract.md"))
+                document = parse_abstract_overview(self._decode_bytes(raw))
+                freshness = document.metadata.get("freshness") if not document.legacy else None
+                if document.legacy:
+                    stale = True
+                elif isinstance(freshness, dict):
+                    stale = int(freshness.get("pending_child_changes", 0)) > 0
+            except Exception as exc:
+                if is_not_found_error(exc):
+                    stale = True
+                else:
+                    logger.debug("lazy refresh: cannot inspect %s: %s", uri, exc)
+                    return
+            if not stale:
+                return
+
+            from openviking.storage.queuefs.semantic_msg import (
+                SemanticMsg,
+                build_semantic_coalesce_key,
+            )
+
+            dir_uri = uri.rstrip("/")
+            account_id = ctx.user.account_id
+            user_id = ctx.user.user_id
+            coalesce_key = build_semantic_coalesce_key(
+                context_type=context_type,
+                uri=dir_uri,
+                account_id=account_id,
+                user_id=user_id,
+            )
+
+            async def _enqueue(modified: List[str]) -> None:
+                from openviking.storage.queuefs import get_queue_manager
+
+                queue_manager = get_queue_manager()
+                semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC, allow_create=True)
+                await semantic_queue.enqueue(
+                    SemanticMsg(
+                        uri=dir_uri,
+                        context_type=context_type,
+                        recursive=False,
+                        account_id=account_id,
+                        user_id=user_id,
+                        group_ids=list(ctx.group_ids),
+                        role=str(ctx.role),
+                        changes={"modified": list(modified)},
+                        generation_trigger="parent_refresh",
+                        coalesce_key=coalesce_key,
+                    )
+                )
+                logger.info("Lazy parent semantic refresh enqueued on read: %s", dir_uri)
+
+            get_parent_refresh_scheduler().schedule(coalesce_key, dir_uri, _enqueue, 1.0)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("lazy refresh scheduling skipped for %s: %s", uri, exc)
+
     async def abstract(
         self,
         uri: str,
@@ -123,6 +235,7 @@ class _SemanticMixin:
                 parent_uri,
             )
             return await self.abstract(parent_uri, ctx=ctx)
+        await self._maybe_schedule_lazy_parent_refresh(uri, path, real_ctx)
         return await self._read_abstract_file(path, uri, ctx=ctx)
 
     async def overview(
@@ -170,6 +283,7 @@ class _SemanticMixin:
                 parent_uri,
             )
             return await self.overview(parent_uri, ctx=ctx)
+        await self._maybe_schedule_lazy_parent_refresh(uri, path, real_ctx)
         file_path = f"{path}/.overview.md"
         try:
             content_bytes = self._handle_agfs_read(await self._async_agfs.read(file_path))

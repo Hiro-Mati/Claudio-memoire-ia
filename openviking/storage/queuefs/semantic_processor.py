@@ -50,6 +50,11 @@ from openviking.storage.queuefs.semantic_dag import DagStats, SemanticDagExecuto
 from openviking.storage.queuefs.semantic_lock import SemanticLockScope
 from openviking.storage.queuefs.semantic_msg import SemanticMsg, build_semantic_coalesce_key
 from openviking.storage.queuefs.semantic_ops.freshness_policy import FreshnessAction
+from openviking.storage.queuefs.semantic_ops.parent_refresh_scheduler import (
+    get_parent_refresh_scheduler,
+    resolve_parent_refresh_delay,
+    resolve_parent_refresh_mode,
+)
 from openviking.storage.queuefs.semantic_queue import is_semantic_msg_stale
 from openviking.storage.viking_fs import LS_ALL_NODES, SyncDiff, get_viking_fs
 from openviking.telemetry import bind_telemetry, bind_telemetry_stage, resolve_telemetry
@@ -298,6 +303,43 @@ class SemanticProcessor(DequeueHandlerBase):
             )
             return
 
+        mode = resolve_parent_refresh_mode(semantic_config)
+        coalesce_key = build_semantic_coalesce_key(
+            context_type=msg.context_type,
+            uri=parent_uri,
+            account_id=msg.account_id,
+            user_id=msg.user_id,
+            peer_id=msg.peer_id,
+        )
+        if mode == "lazy":
+            # The pending counter is already persisted in the parent's sidecars;
+            # the read path (abstract/overview) schedules the actual refresh.
+            logger.info("Parent semantic refresh deferred until read (lazy): %s", parent_uri)
+            return
+
+        async def _enqueue(modified: List[str]) -> None:
+            await self._enqueue_parent_refresh_msg(msg, parent_uri, modified, coalesce_key)
+
+        if mode == "debounced":
+            get_parent_refresh_scheduler().schedule(
+                coalesce_key,
+                uri,
+                _enqueue,
+                resolve_parent_refresh_delay(semantic_config),
+            )
+            logger.info("Parent semantic refresh debounced: %s", parent_uri)
+            return
+
+        await _enqueue([uri])
+
+    async def _enqueue_parent_refresh_msg(
+        self,
+        msg: SemanticMsg,
+        parent_uri: str,
+        modified: List[str],
+        coalesce_key: str,
+    ) -> None:
+        """Build and enqueue one parent refresh message covering ``modified`` children."""
         from openviking.storage.queuefs import get_queue_manager
 
         queue_manager = get_queue_manager()
@@ -312,19 +354,17 @@ class SemanticProcessor(DequeueHandlerBase):
             peer_id=msg.peer_id,
             role=msg.role,
             skip_vectorization=msg.skip_vectorization,
-            changes={"modified": [uri]},
+            changes={"modified": list(modified)},
             generation_trigger="parent_refresh",
-            coalesce_key=build_semantic_coalesce_key(
-                context_type=msg.context_type,
-                uri=parent_uri,
-                account_id=msg.account_id,
-                user_id=msg.user_id,
-                peer_id=msg.peer_id,
-            ),
+            coalesce_key=coalesce_key,
         )
         with detach_task_context():
             await semantic_queue.enqueue(parent_msg)
-        logger.info("Enqueued parent semantic refresh: %s", parent_uri)
+        logger.info(
+            "Enqueued parent semantic refresh: %s (%d child change(s))",
+            parent_uri,
+            len(modified),
+        )
 
     async def on_dequeue(
         self,

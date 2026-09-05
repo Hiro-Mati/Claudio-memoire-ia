@@ -722,9 +722,25 @@ class SemanticConfig:
     memory_chunk_overlap: int = 200
     """Character overlap between adjacent memory chunks for context continuity."""
 
+    parent_refresh_mode: str = "eager"
+    """How a finished child directory triggers its parent's summary refresh.
+
+    ``eager`` enqueues the parent right away (upstream behaviour). ``debounced``
+    merges refreshes for the same parent and enqueues once after
+    ``parent_refresh_debounce_s`` seconds of quiet. ``lazy`` only records the
+    pending change and refreshes the parent the first time its abstract or
+    overview is read."""
+
+    parent_refresh_debounce_s: float = 30.0
+    """Quiet window, in seconds, used by the ``debounced`` parent refresh mode."""
+
     def __post_init__(self):
         if self.overview_sample_limit <= 0:
             raise ValueError("overview_sample_limit must be positive")
+        if self.parent_refresh_mode not in ("eager", "debounced", "lazy"):
+            raise ValueError("parent_refresh_mode must be one of: eager, debounced, lazy")
+        if self.parent_refresh_debounce_s < 0:
+            raise ValueError("parent_refresh_debounce_s must be non-negative")
         if not 0 < self.freshness_refresh_ratio <= 1:
             raise ValueError("freshness_refresh_ratio must be in the range (0, 1]")
         if self.memory_chunk_chars <= 0:
